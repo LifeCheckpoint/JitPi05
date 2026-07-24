@@ -13,9 +13,11 @@
 - [`data.py`](data.py)：单个 LIBERO episode 的读取与图像转换。
 - [`planner.py`](planner.py)：Qwen3.5 高层规划、逐 token logits 记录与调制。
 - [`pi05_pipeline.py`](pi05_pipeline.py)：显式 π₀.₅ 流水线、四组对照和动作指标。
-- [`main.py`](main.py)：顺序编排实验并保存研究产物。
+- [`main.py`](main.py)：单帧离线实验入口。
+- [`sim_eval.py`](sim_eval.py)：固定初始状态、闭环 action chunk、成功判定、视频和评测产物。
+- [`eval_sim.py`](eval_sim.py)：独立仿真评测入口。
 
-## 运行
+## 离线分析
 
 要求 NVIDIA CUDA GPU，建议至少 16 GB 显存。两个模型顺序加载，不同时驻留显存。
 
@@ -96,13 +98,39 @@ def modifier(step, input_ids, logits):
   - 固定初始噪声
   - π₀.₅ 去噪 trajectory、vector fields 与 prefix tokens
 
+## LIBERO 闭环评测
+
+闭环入口只支持 Linux。无桌面服务器建议使用 EGL：
+
+```bash
+MUJOCO_GL=egl uv run eval_sim.py
+```
+
+第一次导入 LIBERO 时，上游包会询问数据目录；直接选择默认路径即可。评测模型为当前 LeRobot 0.6 / Transformers 5 兼容的 `lerobot/pi05-libero`，与离线分析使用的 base checkpoint 分开配置。
+
+默认运行两个任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
+
+1. `libero_object` task 0：`pick up the alphabet soup and place it in the basket`。这是 π₀.₅ LIBERO 微调分布内的闭环基准，用于确认环境、processor、动作空间和 checkpoint 均正常。
+2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`。LIBERO-90 未进入该 π₀.₅ LIBERO checkpoint 的微调任务集合，因此这里把它作为任务级零样本探针，而不是宣称跨 embodiment 的通用零样本控制。
+
+高层 Qwen 只在每个 episode 的初始双相机观测上规划一次，然后释放显存。低层 π₀.₅ 显式预测 50 步 action chunk，只执行前 10 步，再用新观测重新预测。四组条件在同一 episode 的第 n 次重规划中复用相同 flow-matching 初始噪声。
+
+仿真产物保存在 `artifacts/sim_eval/`：
+
+- `summary.json`：逐条件 success rate、每个 episode 的 success/reward/steps、Qwen 文本和 token top-k。
+- `planning_logits.pt`：所有 episode 的原始/调制后完整 Qwen logits。
+- `rollouts.pt`：每次预测的完整 action chunk、实际执行动作和 reward。
+- `videos/<task>/<condition>/episode_<id>.mp4`：逐条件 rollout 视频。
+
+完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](settings.py:16)、[`SIM_ACTION_STEPS`](settings.py:17) 和 [`SIM_TASKS`](settings.py:19) 缩小实验。
+
 ## 解释限制
 
-这是**单帧离线 sanity check**，用于回答：
+[`main.py`](main.py) 仍是**单帧离线 sanity check**，用于回答：
 
 - Qwen 是否能输出可读的高层动作？
 - logits 调制是否真的改变 token 分布和最终 subtask？
 - 高层文本变化是否传导到 π₀.₅ 的低层动作？
 - π₀.₅ 输出是否有限、尺度是否正常、是否与示范动作处在相近范围？
 
-示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确。真正的机器人任务效果需要后续把同一层次化接口接入 LIBERO 闭环环境进行 rollout。
+示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 [`eval_sim.py`](eval_sim.py) 的 LIBERO rollout 为准。LIBERO-90 task 79 的结果是单任务诊断探针，不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。

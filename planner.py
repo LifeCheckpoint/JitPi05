@@ -156,7 +156,7 @@ def generate_subtask(
     }
 
 
-def run_high_level_planner(frame: dict) -> tuple[dict, dict, list[int]]:
+def load_high_level_planner():
     print(f"Loading high-level planner: {QWEN_ID}")
     processor = AutoProcessor.from_pretrained(QWEN_ID)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -164,21 +164,44 @@ def run_high_level_planner(frame: dict) -> tuple[dict, dict, list[int]]:
         dtype=torch.bfloat16,
         device_map={"": "cuda:0"},
     ).eval()
+    return model, processor
+
+
+def release_high_level_planner(model, processor) -> None:
+    del model, processor
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def generate_plan_pair(
+    model: Qwen3_5ForConditionalGeneration,
+    processor,
+    images: list[Image.Image],
+    task: str,
+    bias_phrase: str,
+    bias_value: float = BIAS_VALUE,
+) -> tuple[dict, dict, list[int]]:
+    plain = generate_subtask(model, processor, images, task)
+    modifier, target_ids = make_phrase_bias(processor.tokenizer, bias_phrase, bias_value)
+    modulated = generate_subtask(model, processor, images, task, modifier)
+    return plain, modulated, target_ids
+
+
+def run_high_level_planner(frame: dict) -> tuple[dict, dict, list[int]]:
+    model, processor = load_high_level_planner()
 
     images = [
         tensor_to_pil(frame["observation.images.image"]),
         tensor_to_pil(frame["observation.images.image2"]),
     ]
-    plain = generate_subtask(model, processor, images, frame["task"])
-    modifier, target_ids = make_phrase_bias(processor.tokenizer, BIAS_PHRASE, BIAS_VALUE)
-    modulated = generate_subtask(model, processor, images, frame["task"], modifier)
+    plain, modulated, target_ids = generate_plan_pair(
+        model, processor, images, frame["task"], BIAS_PHRASE
+    )
 
     print(f"Qwen subtask: {plain['text']}")
     print(f"Modulated Qwen subtask: {modulated['text']}")
 
-    del model, processor
-    gc.collect()
-    torch.cuda.empty_cache()
+    release_high_level_planner(model, processor)
     return plain, modulated, target_ids
 
 
