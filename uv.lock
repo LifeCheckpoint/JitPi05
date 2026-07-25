@@ -422,6 +422,22 @@ wheels = [
 ]
 
 [[package]]
+name = "bitsandbytes"
+version = "0.49.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/7d/f1fe0992334b18cd8494f89aeec1dcc674635584fcd9f115784fea3a1d05/bitsandbytes-0.49.2-py3-none-macosx_14_0_arm64.whl", hash = "sha256:87be5975edeac5396d699ecbc39dfc47cf2c026daaf2d5852a94368611a6823f", size = 131940, upload-time = "2026-02-16T21:26:04.572Z" },
+    { url = "https://files.pythonhosted.org/packages/29/71/acff7af06c818664aa87ff73e17a52c7788ad746b72aea09d3cb8e424348/bitsandbytes-0.49.2-py3-none-manylinux_2_24_aarch64.whl", hash = "sha256:2fc0830c5f7169be36e60e11f2be067c8f812dfcb829801a8703735842450750", size = 31442815, upload-time = "2026-02-16T21:26:06.783Z" },
+    { url = "https://files.pythonhosted.org/packages/19/57/3443d6f183436fbdaf5000aac332c4d5ddb056665d459244a5608e98ae92/bitsandbytes-0.49.2-py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:54b771f06e1a3c73af5c7f16ccf0fc23a846052813d4b008d10cb6e017dd1c8c", size = 60651714, upload-time = "2026-02-16T21:26:11.579Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/d4/501655842ad6771fb077f576d78cbedb5445d15b1c3c91343ed58ca46f0e/bitsandbytes-0.49.2-py3-none-win_amd64.whl", hash = "sha256:2e0ddd09cd778155388023cbe81f00afbb7c000c214caef3ce83386e7144df7d", size = 55372289, upload-time = "2026-02-16T21:26:16.267Z" },
+]
+
+[[package]]
 name = "bleach"
 version = "6.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1531,6 +1547,42 @@ wheels = [
 ]
 
 [[package]]
+name = "fla-core"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/62/99e149f19a447ce809d7f4fa64ae61c073da337505b9db7f389502470820/fla_core-0.5.1.tar.gz", hash = "sha256:7f3cf56edfbaa9115f4937d1181372e5c7b11809ad8eb2e411fffc3caf729f48", size = 498800, upload-time = "2026-06-18T18:17:15.377Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/78/a55ee7a62515dcb9220770dd99dfe59ac6599da8af84ad1d20f9f407df4d/fla_core-0.5.1-py3-none-any.whl", hash = "sha256:02150d34aa1e37f6b8ed9b2feec5d29af93680573e5077ed981238179c11fb06", size = 702955, upload-time = "2026-06-18T18:17:12.229Z" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "torch" },
+    { name = "triton" },
+]
+
+[[package]]
+name = "flash-linear-attention"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fla-core" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4c/e8/8f115be585a046795e4a1f7ade727889219bb66b8d96cc668b8c9e437c0e/flash_linear_attention-0.5.1.tar.gz", hash = "sha256:8840fd4c37de8b0612dc8fd493867f3d330672ba2f17c024a2ce37239634e247", size = 221733, upload-time = "2026-06-18T18:17:16.661Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/68/3c/5819fb19dc071302ca818616a4e64d4454e1f1193929eb8365c8d38e9052/flash_linear_attention-0.5.1-py3-none-any.whl", hash = "sha256:9022862f0a238752372c81290694b8b2ed1cb2d13fc40d340ffeeb554d6bee5c", size = 403096, upload-time = "2026-06-18T18:17:14.025Z" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "fla-core", extra = ["cuda"] },
+]
+
+[[package]]
 name = "fonttools"
 version = "4.63.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2307,13 +2359,19 @@ name = "jitpi05"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "bitsandbytes" },
+    { name = "flash-linear-attention", extra = ["cuda"] },
     { name = "lerobot", extra = ["all"] },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "bitsandbytes", specifier = ">=0.46.1" },
+    { name = "flash-linear-attention", extras = ["cuda"], specifier = ">=0.5.1" },
     { name = "lerobot", extras = ["all"], specifier = ">=0.6.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
     { name = "transformers", specifier = ">=5.5.4" },
 ]
 
