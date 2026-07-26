@@ -42,8 +42,8 @@ WARNINGS = (
     "Per method, the default design has only 1 seed-level run; sample standard "
     "deviation is 0 and the seed-level bootstrap interval collapses to the "
     "observed value, so neither supports across-seed inference.",
-    "The 50 episodes within one run are sequentially dependent through online "
-    "adaptation and must not be treated as 50 independent replicates.",
+    "The 25 episodes within one run are sequentially dependent through online "
+    "adaptation and must not be treated as 25 independent replicates.",
 )
 
 
@@ -102,7 +102,12 @@ def compute_run_metrics(
     nonzero_advantage_count = 0
     absolute_logit_shifts: list[float] = []
     neighbor_counts: list[float] = []
+    evaluator_scores: list[int] = []
     changed_count = 0
+    augmentation_changed_count = 0
+    ucb_applied_count = 0
+    memory_candidate_count = 0
+    memory_selected_count = 0
 
     for chunk in chunks:
         value_estimate = chunk.get("value_estimate", {})
@@ -121,6 +126,20 @@ def compute_run_metrics(
         absolute_logit_shifts.extend(abs(float(shift)) for shift in logit_shifts)
         neighbor_counts.append(float(value_estimate.get("neighbor_count", 0.0)))
         changed_count += bool(chunk.get("choice_changed", False))
+        augmentation_changed_count += bool(
+            chunk.get("augmentation_changed_choice", False)
+        )
+        ucb_applied_count += sum(
+            bool(candidate.get("exploration_applied", False))
+            for candidate in candidates
+        )
+        memory_candidate_count += sum(
+            candidate.get("source") == "memory"
+            for candidate in chunk.get("candidates", [])
+        )
+        memory_selected_count += chunk.get("selected_source") == "memory"
+        if "evaluator_score" in chunk:
+            evaluator_scores.append(int(chunk["evaluator_score"]))
 
     return {
         "method": method,
@@ -140,6 +159,21 @@ def compute_run_metrics(
             nonzero_advantage_count, candidate_count
         ),
         "choice_change_rate": _rate(changed_count, len(chunks)),
+        "augmentation_choice_change_rate": _rate(
+            augmentation_changed_count, len(chunks)
+        ),
+        "ucb_application_rate": _rate(ucb_applied_count, candidate_count),
+        "memory_only_candidate_rate": _rate(memory_candidate_count, candidate_count),
+        "memory_only_selection_rate": _rate(memory_selected_count, len(chunks)),
+        "mean_evaluator_score": (
+            float(np.mean(evaluator_scores)) if evaluator_scores else None
+        ),
+        "negative_evaluator_score_rate": _rate(
+            sum(score < 0 for score in evaluator_scores), len(evaluator_scores)
+        ),
+        "positive_evaluator_score_rate": _rate(
+            sum(score > 0 for score in evaluator_scores), len(evaluator_scores)
+        ),
         "mean_absolute_logit_shift": (
             float(np.mean(absolute_logit_shifts))
             if absolute_logit_shifts

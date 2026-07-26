@@ -17,23 +17,37 @@ from lerobot.envs.utils import close_envs
 from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
-from jitrl_memory import JitRLMemory, discounted_chunk_returns
-from jitrl_planner import apply_jitrl_update, load_jitrl_planner, propose_and_score
+from jitrl_memory import JitRLMemory, discounted_returns
+from jitrl_planner import (
+    apply_jitrl_update,
+    evaluate_chunk,
+    load_jitrl_planner,
+    propose_and_score,
+)
 from pi05_pipeline import conditioned_task
 from settings import (
     JITRL_BETA,
     JITRL_CANDIDATES,
     JITRL_EPISODES,
+    JITRL_EVALUATOR_RETRIES,
+    JITRL_EVALUATOR_SCORE_SCALE,
+    JITRL_EXPLORATION_RATE,
     JITRL_GAMMA,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_HISTORY_SIZE,
+    JITRL_LOGIT_CALIBRATION,
     JITRL_MAX_PLAN_TOKENS,
+    JITRL_MEMORY_BASE_LOGIT,
     JITRL_METHODS,
     JITRL_OUTPUT_DIR,
+    JITRL_PLANNER_RETRIES,
     JITRL_QWEN_ID,
+    JITRL_REWARD_VERSION,
     JITRL_TASK,
     JITRL_TEMPERATURE,
+    JITRL_TERMINAL_SUCCESS_BONUS,
     JITRL_TOP_K,
+    JITRL_UCB_ALPHA,
     SIM_ACTION_STEPS,
     SIM_PI05_ID,
 )
@@ -46,7 +60,7 @@ from sim_eval import (
     success_from_info,
 )
 
-# Stage 1 only: visual-planner candidates; no memory-only actions/UCB/evaluator.
+# Paper-aligned extension: augmented actions, stochastic UCB, and visual step rewards.
 
 
 def coordinate_seed(kind: str, seed: int, episode: int, chunk: int) -> int:
@@ -59,13 +73,24 @@ def coordinate_seed(kind: str, seed: int, episode: int, chunk: int) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=False) & ((1 << 63) - 1)
 
 
-def coordinate_uniform(seed: int, episode: int, chunk: int) -> float:
-    """Draw the paired candidate-selection uniform from a private CPU generator."""
+def coordinate_uniform(
+    seed: int, episode: int, chunk: int, kind: str = "candidate_uniform"
+) -> float:
+    """Draw one deterministic coordinate-local uniform from a private generator."""
 
     generator = torch.Generator(device="cpu").manual_seed(
-        coordinate_seed("candidate_uniform", seed, episode, chunk)
+        coordinate_seed(kind, seed, episode, chunk)
     )
     return float(torch.rand((), generator=generator, dtype=torch.float32).item())
+
+
+def coordinate_exploration_uniforms(
+    seed: int, episode: int, chunk: int, count: int
+) -> list[float]:
+    return [
+        coordinate_uniform(seed, episode, chunk, kind=f"ucb_uniform_{index}")
+        for index in range(count)
+    ]
 
 
 def coordinate_flow_noise(
@@ -117,9 +142,55 @@ def _static_value_estimate(action_keys: Sequence[str]) -> dict:
                 "normalized_advantage": 0.0,
                 "neighbor_count": 0,
                 "seen": False,
+                "exploration_uniform": None,
+                "exploration_applied": False,
+                "exploration_branch": "static",
+                "ucb_bonus": 0.0,
             }
             for action_key in action_keys
         ],
+    }
+
+
+def build_augmented_candidates(
+    generator_candidates: Sequence[dict],
+    raw_generator_logits: Sequence[float],
+    neighbors: Sequence[dict],
+    memory_base_logit: float = 0.0,
+) -> dict:
+    """Merge generator and retrieved actions after mean-centering generator logits."""
+
+    if len(generator_candidates) != len(raw_generator_logits):
+        raise ValueError("generator candidates and logits must have the same length")
+    raw_logits = [float(value) for value in raw_generator_logits]
+    mean_logit = sum(raw_logits) / len(raw_logits) if raw_logits else 0.0
+    centered_logits = [value - mean_logit for value in raw_logits]
+    augmented_candidates = [
+        {**candidate, "source": "generator"} for candidate in generator_candidates
+    ]
+    augmented_logits = list(centered_logits)
+    known_keys = {candidate["semantic_key"] for candidate in generator_candidates}
+    for neighbor in neighbors:
+        action_key = neighbor["action_key"]
+        if action_key in known_keys:
+            continue
+        augmented_candidates.append(
+            {
+                "text": neighbor["action_text"],
+                "semantic_key": action_key,
+                "source": "memory",
+                "memory_id": int(neighbor["id"]),
+                "memory_similarity": float(neighbor["similarity"]),
+            }
+        )
+        augmented_logits.append(float(memory_base_logit))
+        known_keys.add(action_key)
+    return {
+        "raw_generator_logits": raw_logits,
+        "generator_logit_mean": mean_logit,
+        "centered_generator_logits": centered_logits,
+        "candidates": augmented_candidates,
+        "base_logits": augmented_logits,
     }
 
 
@@ -204,6 +275,125 @@ def _low_level_chunks_per_high_level_plan() -> int:
     return JITRL_HIGH_LEVEL_STEPS // SIM_ACTION_STEPS
 
 
+def _propose_and_score_with_retry(
+    planner_model,
+    planner_processor,
+    images,
+    overall_task: str,
+    recent_subtasks: Sequence[str],
+    *,
+    method: str,
+    seed: int,
+    episode_index: int,
+    high_level_step_index: int,
+) -> tuple[dict, int]:
+    """Retry malformed planner generations without restarting the episode."""
+
+    for attempt in range(1, JITRL_PLANNER_RETRIES + 1):
+        try:
+            planning = propose_and_score(
+                planner_model,
+                planner_processor,
+                images,
+                overall_task,
+                recent_subtasks=recent_subtasks,
+                max_new_tokens=JITRL_MAX_PLAN_TOKENS,
+                attempt=attempt,
+            )
+            return planning, attempt
+        except ValueError as error:
+            if attempt == JITRL_PLANNER_RETRIES:
+                raise RuntimeError(
+                    f"planner failed after {JITRL_PLANNER_RETRIES} attempts: {error}"
+                ) from error
+            tqdm.write(
+                f"[planner-retry] method={method} seed={seed} "
+                f"episode={episode_index + 1} high={high_level_step_index} "
+                f"attempt={attempt}/{JITRL_PLANNER_RETRIES} error={error}"
+            )
+
+    raise RuntimeError("planner retry loop terminated unexpectedly")
+
+
+def _evaluate_episode_chunks(
+    planner_model,
+    planner_processor,
+    episode_result: dict,
+    evaluator_images: Sequence[tuple[list, list]],
+    *,
+    method: str,
+    seed: int,
+    episode_index: int,
+) -> tuple[list[float], list[float]]:
+    """Assign signed visual step rewards and convert them to discounted returns."""
+
+    chunks = episode_result["chunks"]
+    if len(chunks) != len(evaluator_images):
+        raise ValueError("chunk traces and evaluator image pairs must align")
+    scores: list[int] = []
+    for chunk_index, (chunk, (before_images, after_images)) in enumerate(
+        zip(chunks, evaluator_images)
+    ):
+        next_state_summary = (
+            chunks[chunk_index + 1]["state_summary"]
+            if chunk_index + 1 < len(chunks)
+            else (
+                "terminal task success"
+                if episode_result["success"]
+                else "terminal or time-limit state; task not completed"
+            )
+        )
+        evaluation = None
+        for attempt in range(1, JITRL_EVALUATOR_RETRIES + 1):
+            try:
+                evaluation = evaluate_chunk(
+                    planner_model,
+                    planner_processor,
+                    [*before_images, *after_images],
+                    episode_result["task"],
+                    chunk["state_summary"],
+                    chunk["selected_candidate"]["text"],
+                    next_state_summary,
+                    episode_result["success"],
+                    chunk_index,
+                    len(chunks),
+                    attempt=attempt,
+                )
+                break
+            except ValueError as error:
+                if attempt == JITRL_EVALUATOR_RETRIES:
+                    raise RuntimeError(
+                        "chunk evaluator failed after "
+                        f"{JITRL_EVALUATOR_RETRIES} attempts: {error}"
+                    ) from error
+                tqdm.write(
+                    f"[evaluator-retry] method={method} seed={seed} "
+                    f"episode={episode_index + 1} chunk={chunk_index} "
+                    f"attempt={attempt}/{JITRL_EVALUATOR_RETRIES} error={error}"
+                )
+        if evaluation is None:
+            raise RuntimeError("chunk evaluator returned no result")
+        evaluation["attempts"] = attempt
+        evaluation["next_state_summary"] = next_state_summary
+        chunk["evaluator"] = evaluation
+        scores.append(int(evaluation["score"]))
+
+    step_rewards = [score * JITRL_EVALUATOR_SCORE_SCALE for score in scores]
+    if episode_result["success"] and step_rewards:
+        step_rewards[-1] += JITRL_TERMINAL_SUCCESS_BONUS
+    returns = discounted_returns(step_rewards, gamma=JITRL_GAMMA)
+    for chunk, score, reward, return_value in zip(
+        chunks, scores, step_rewards, returns
+    ):
+        chunk["evaluator_score"] = score
+        chunk["step_reward"] = float(reward)
+        chunk["return"] = float(return_value)
+    episode_result["evaluator_scores"] = scores
+    episode_result["step_rewards"] = [float(value) for value in step_rewards]
+    episode_result["discounted_returns"] = [float(value) for value in returns]
+    return step_rewards, returns
+
+
 def _run_episode(
     *,
     method: str,
@@ -217,7 +407,7 @@ def _run_episode(
     preprocessor,
     postprocessor,
     step_progress=None,
-) -> tuple[dict, list[dict], dict[str, torch.Tensor]]:
+) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         JITRL_TASK, episode_index
     )
@@ -229,10 +419,12 @@ def _run_episode(
     actions: list[torch.Tensor] = []
     rewards: list[float] = []
     chunks: list[dict] = []
+    evaluator_images: list[tuple[list, list]] = []
     episode_records: list[dict] = []
     selected_subtasks: list[str] = []
     active_condition = ""
     active_chunk_trace: dict | None = None
+    active_before_images: list | None = None
     overall_task = ""
     success = False
     episode_done = False
@@ -271,34 +463,56 @@ def _run_episode(
 
             if high_level_replan:
                 images = planning_images(frame)
-                planning = propose_and_score(
+                active_before_images = [image.copy() for image in images]
+                planning, planner_attempts = _propose_and_score_with_retry(
                     planner_model,
                     planner_processor,
                     images,
                     overall_task,
-                    recent_subtasks=selected_subtasks[-JITRL_HISTORY_SIZE:],
-                    max_new_tokens=JITRL_MAX_PLAN_TOKENS,
+                    selected_subtasks[-JITRL_HISTORY_SIZE:],
+                    method=method,
+                    seed=seed,
+                    episode_index=episode_index,
+                    high_level_step_index=high_level_step_index,
                 )
-                candidates = planning["candidates"]
-                if len(candidates) != JITRL_CANDIDATES:
+                generator_candidates = planning["candidates"]
+                if len(generator_candidates) != JITRL_CANDIDATES:
                     raise ValueError(
-                        f"planner returned {len(candidates)} candidates; expected {JITRL_CANDIDATES}"
+                        f"planner returned {len(generator_candidates)} candidates; "
+                        f"expected {JITRL_CANDIDATES}"
                     )
-                action_keys = [
-                    candidate["semantic_key"] for candidate in candidates
-                ]
+                raw_neighbors = (
+                    memory.retrieve(planning["state_summary"])
+                    if method == "jitrl" and memory is not None
+                    else []
+                )
+                augmented = build_augmented_candidates(
+                    generator_candidates,
+                    planning["base_logits"],
+                    raw_neighbors,
+                    memory_base_logit=JITRL_MEMORY_BASE_LOGIT,
+                )
+                candidates = augmented["candidates"]
+                action_keys = [candidate["semantic_key"] for candidate in candidates]
+                retrieved_neighbors = _trace_neighbors(raw_neighbors)
 
                 if method == "jitrl":
                     if memory is None:
                         raise RuntimeError("jitrl method requires a task-local memory")
-                    retrieved_neighbors = _trace_neighbors(
-                        memory.retrieve(planning["state_summary"])
-                    )
                     value_estimate = memory.estimate_candidate_values(
-                        planning["state_summary"], action_keys
+                        planning["state_summary"],
+                        action_keys,
+                        neighbors=raw_neighbors,
+                        exploration_uniforms=coordinate_exploration_uniforms(
+                            seed,
+                            episode_index,
+                            high_level_step_index,
+                            len(candidates),
+                        ),
+                        exploration_rate=JITRL_EXPLORATION_RATE,
+                        ucb_alpha=JITRL_UCB_ALPHA,
                     )
                 else:
-                    retrieved_neighbors = []
                     value_estimate = _static_value_estimate(action_keys)
                 value_estimate = _trace_value_estimate(value_estimate)
 
@@ -310,16 +524,23 @@ def _run_episode(
                     seed, episode_index, high_level_step_index
                 )
                 update = apply_jitrl_update(
-                    planning["base_logits"],
+                    augmented["base_logits"],
                     normalized_advantages,
                     beta=JITRL_BETA,
+                    temperature=JITRL_TEMPERATURE,
+                    uniform=uniform,
+                )
+                generator_update = apply_jitrl_update(
+                    augmented["centered_generator_logits"],
+                    [0.0] * JITRL_CANDIDATES,
+                    beta=0.0,
                     temperature=JITRL_TEMPERATURE,
                     uniform=uniform,
                 )
                 selected_index = (
                     update["updated_choice_index"]
                     if method == "jitrl"
-                    else update["base_choice_index"]
+                    else generator_update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
                 active_condition = conditioned_task(
@@ -338,16 +559,30 @@ def _run_episode(
                 selected_subtasks.append(selected_candidate["text"])
                 active_chunk_trace = {
                     "chunk_index": high_level_step_index,
+                    "planner_attempts": planner_attempts,
                     "proposal_prompt": planning["prompt"],
                     "selection_prompt": planning["selection_prompt"],
                     "state_summary": planning["state_summary"],
+                    "generator_candidates": generator_candidates,
                     "candidates": candidates,
                     "candidate_token_ids": planning["candidate_token_ids"],
+                    "raw_generator_logits": augmented["raw_generator_logits"],
+                    "generator_logit_mean": augmented["generator_logit_mean"],
+                    "centered_generator_logits": augmented[
+                        "centered_generator_logits"
+                    ],
+                    "generator_choice_index": generator_update["base_choice_index"],
+                    "augmented_base_choice_index": update["base_choice_index"],
+                    "augmentation_changed_choice": (
+                        update["base_choice_index"]
+                        != generator_update["base_choice_index"]
+                    ),
                     "value_estimate": value_estimate,
                     "retrieved_neighbors": retrieved_neighbors,
                     **update,
                     "selected_candidate_index": selected_index,
                     "selected_candidate": selected_candidate,
+                    "selected_source": selected_candidate["source"],
                     "condition": active_condition,
                     "return": None,
                     "action_start_step": action_start_step,
@@ -401,6 +636,23 @@ def _run_episode(
                     "action_end_step": len(actions),
                 }
             )
+            if (
+                len(active_chunk_trace["low_level_chunks"])
+                == low_level_chunks_per_plan
+                or episode_done
+                or success
+                or len(actions) >= max_steps
+            ):
+                if active_before_images is None:
+                    raise RuntimeError("completed high-level chunk has no before images")
+                after_frame = policy_frame(observation, overall_task, env_preprocessor)
+                evaluator_images.append(
+                    (
+                        active_before_images,
+                        [image.copy() for image in planning_images(after_frame)],
+                    )
+                )
+                active_before_images = None
     finally:
         video_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -438,7 +690,7 @@ def _run_episode(
         "video_path": str(video_path),
         "chunks": chunks,
     }
-    return episode_result, episode_records, tensors
+    return episode_result, episode_records, tensors, evaluator_images
 
 
 def summarize_run(
@@ -471,9 +723,16 @@ def summarize_run(
         "episodes": len(episodes),
         "high_level_steps_before_replan": JITRL_HIGH_LEVEL_STEPS,
         "action_steps_before_replan": SIM_ACTION_STEPS,
+        "planner_max_attempts": JITRL_PLANNER_RETRIES,
+        "evaluator_max_attempts": JITRL_EVALUATOR_RETRIES,
         "gamma": JITRL_GAMMA,
         "beta": JITRL_BETA,
         "temperature": JITRL_TEMPERATURE,
+        "exploration_rate": JITRL_EXPLORATION_RATE,
+        "ucb_alpha": JITRL_UCB_ALPHA,
+        "memory_base_logit": JITRL_MEMORY_BASE_LOGIT,
+        "logit_calibration": JITRL_LOGIT_CALIBRATION,
+        "reward_version": JITRL_REWARD_VERSION,
         "episode_results": episode_rows,
         "successes": [row["success"] for row in episode_rows],
         "steps": [row["steps"] for row in episode_rows],
@@ -552,7 +811,12 @@ def run_jitrl_experiment(
                 leave=False,
             )
             try:
-                episode_result, episode_records, tensors = _run_episode(
+                (
+                    episode_result,
+                    episode_records,
+                    tensors,
+                    evaluator_images,
+                ) = _run_episode(
                     method=method,
                     seed=int(seed),
                     episode_index=episode_index,
@@ -567,11 +831,22 @@ def run_jitrl_experiment(
                 )
             finally:
                 step_progress.close()
-            returns = discounted_chunk_returns(
-                len(episode_records), episode_result["success"], gamma=JITRL_GAMMA
-            )
-            for chunk, return_value in zip(episode_result["chunks"], returns):
-                chunk["return"] = float(return_value)
+            if method == "jitrl":
+                _step_rewards, returns = _evaluate_episode_chunks(
+                    planner_model,
+                    planner_processor,
+                    episode_result,
+                    evaluator_images,
+                    method=method,
+                    seed=int(seed),
+                    episode_index=episode_index,
+                )
+            else:
+                returns = discounted_returns(
+                    [0.0] * len(episode_records), gamma=JITRL_GAMMA
+                )
+                for chunk, return_value in zip(episode_result["chunks"], returns):
+                    chunk["return"] = float(return_value)
 
             if method == "jitrl":
                 if memory is None:

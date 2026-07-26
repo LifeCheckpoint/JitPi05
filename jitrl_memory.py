@@ -54,6 +54,10 @@ class CandidateValue(TypedDict):
     normalized_advantage: float
     neighbor_count: int
     seen: bool
+    exploration_uniform: float | None
+    exploration_applied: bool
+    exploration_branch: str
+    ucb_bonus: float
 
 
 class ValueEstimate(TypedDict):
@@ -82,14 +86,28 @@ def jaccard_similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(union)
 
 
+def discounted_returns(rewards: Sequence[float], gamma: float = 0.95) -> list[float]:
+    """Compute signed reward-to-go values for one completed chunk trajectory."""
+
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    returns = [0.0] * len(rewards)
+    running = 0.0
+    for index in range(len(rewards) - 1, -1, -1):
+        running = float(rewards[index]) + gamma * running
+        returns[index] = running
+    return returns
+
+
 def discounted_chunk_returns(
     length: int, success: bool, gamma: float = 0.95
 ) -> list[float]:
-    """Assign a discounted terminal +1 to a successful chunk trajectory."""
+    """Compatibility helper for the earlier terminal-only reward definition."""
 
-    if not success:
-        return [0.0] * length
-    return [gamma ** (length - 1 - t) for t in range(length)]
+    rewards = [0.0] * length
+    if success and rewards:
+        rewards[-1] = 1.0
+    return discounted_returns(rewards, gamma=gamma)
 
 
 class JitRLMemory:
@@ -125,25 +143,60 @@ class JitRLMemory:
         state: str,
         candidate_action_keys: Sequence[str],
         k: int | None = None,
+        *,
+        neighbors: Sequence[RetrievedEntry] | None = None,
+        exploration_uniforms: Sequence[float] | None = None,
+        exploration_rate: float = 0.0,
+        ucb_alpha: float = 0.0,
     ) -> ValueEstimate:
-        """Estimate local V, Q, and normalized advantages for candidates."""
+        """Estimate local V/Q/A with the paper's stochastic unseen-action rule."""
 
-        neighbors = self.retrieve(state, k)
+        if not 0.0 <= exploration_rate <= 1.0:
+            raise ValueError("exploration_rate must be in [0, 1]")
+        if ucb_alpha < 0.0:
+            raise ValueError("ucb_alpha must be non-negative")
+        local_neighbors = list(self.retrieve(state, k) if neighbors is None else neighbors)
+        if exploration_uniforms is None:
+            uniforms: list[float | None] = [None] * len(candidate_action_keys)
+        else:
+            uniforms = [float(value) for value in exploration_uniforms]
+            if len(uniforms) != len(candidate_action_keys):
+                raise ValueError(
+                    "exploration_uniforms and candidate_action_keys must have the same length"
+                )
+            if any(not 0.0 <= value < 1.0 for value in uniforms):
+                raise ValueError("exploration uniforms must be in [0, 1)")
+
         value = (
-            sum(neighbor["return"] for neighbor in neighbors) / len(neighbors)
-            if neighbors
+            sum(neighbor["return"] for neighbor in local_neighbors)
+            / len(local_neighbors)
+            if local_neighbors
             else 0.0
         )
-
         action_returns: dict[str, list[float]] = defaultdict(list)
-        for neighbor in neighbors:
+        for neighbor in local_neighbors:
             action_returns[neighbor["action_key"]].append(neighbor["return"])
 
         candidates: list[CandidateValue] = []
-        for action_key in candidate_action_keys:
+        for action_key, exploration_uniform in zip(candidate_action_keys, uniforms):
             returns = action_returns.get(action_key, [])
             seen = bool(returns)
-            q_value = sum(returns) / len(returns) if seen else value
+            exploration_applied = False
+            exploration_branch = "known"
+            ucb_bonus = 0.0
+            if seen:
+                q_value = sum(returns) / len(returns)
+            elif not local_neighbors:
+                q_value = 0.0
+                exploration_branch = "empty_memory"
+            elif exploration_uniform is not None and exploration_uniform < exploration_rate:
+                ucb_bonus = ucb_alpha / len(local_neighbors)
+                q_value = value + ucb_bonus
+                exploration_applied = True
+                exploration_branch = "optimistic"
+            else:
+                q_value = 0.0
+                exploration_branch = "zero"
             advantage = q_value - value
             candidates.append(
                 {
@@ -153,6 +206,10 @@ class JitRLMemory:
                     "normalized_advantage": 0.0,
                     "neighbor_count": len(returns),
                     "seen": seen,
+                    "exploration_uniform": exploration_uniform,
+                    "exploration_applied": exploration_applied,
+                    "exploration_branch": exploration_branch,
+                    "ucb_bonus": ucb_bonus,
                 }
             )
 
@@ -161,10 +218,12 @@ class JitRLMemory:
             for item in candidates:
                 item["normalized_advantage"] = item["advantage"] / scale
 
-        coverage = dict(Counter(neighbor["action_key"] for neighbor in neighbors))
+        coverage = dict(
+            Counter(neighbor["action_key"] for neighbor in local_neighbors)
+        )
         return {
             "V": value,
-            "neighbor_count": len(neighbors),
+            "neighbor_count": len(local_neighbors),
             "neighbor_action_coverage": coverage,
             "candidates": candidates,
         }

@@ -15,7 +15,7 @@ from transformers import (
     Qwen3_5ForConditionalGeneration,
 )
 
-from settings import JITRL_QWEN_ID
+from settings import JITRL_MAX_EVALUATOR_TOKENS, JITRL_QWEN_ID
 
 
 _SEMANTIC_PART_WHITESPACE = re.compile(r"\s+")
@@ -55,15 +55,32 @@ def _history_text(history: Sequence[str]) -> str:
     return "\n".join(f"- {item}" for item in history)
 
 
-def proposal_prompt(task: str, recent_subtasks: Sequence[str] | None = None) -> str:
+def proposal_prompt(
+    task: str,
+    recent_subtasks: Sequence[str] | None = None,
+    attempt: int = 1,
+) -> str:
     """Build the strict three-candidate visual planning prompt."""
 
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise ValueError("attempt must be a positive integer")
     history = _recent_subtasks(recent_subtasks)
+    retry_instruction = (
+        ""
+        if attempt == 1
+        else (
+            f"This is schema-correction attempt {attempt}. A previous response was "
+            "invalid. Before finishing, count the candidates array entries and verify "
+            "that it contains exactly three complete objects named ACTION1, ACTION2, "
+            "and ACTION3. Do not omit, merge, or add candidates.\n"
+        )
+    )
     return (
         "You are the high-level planner for a Franka robot. Image 1 is the external "
         "camera and image 2 is the wrist camera. Thinking is disabled: do not emit "
         "reasoning or <think> tags.\n"
         f"Overall task: {task}\n"
+        f"{retry_instruction}"
         "Recently selected subtasks, oldest to newest:\n"
         f"{_history_text(history)}\n"
         "Infer the current manipulation state and propose exactly three distinct, "
@@ -142,6 +159,40 @@ def _strip_markdown_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def parse_evaluator_json(text: str) -> dict:
+    """Extract one strict step-reward record from evaluator output."""
+
+    cleaned = _strip_markdown_fence(text)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("evaluator response must contain one JSON object")
+    try:
+        value = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid evaluator JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("evaluator JSON root must be an object")
+    score = value.get("score")
+    if isinstance(score, bool) or not isinstance(score, int) or not -3 <= score <= 3:
+        raise ValueError("evaluator score must be an integer in [-3, 3]")
+    usefulness = value.get("usefulness")
+    if usefulness not in {"useful", "harmful", "neutral"}:
+        raise ValueError("evaluator usefulness must be useful, harmful, or neutral")
+    certainty = value.get("certainty")
+    if certainty not in {"certain", "somewhat uncertain", "very uncertain"}:
+        raise ValueError("evaluator certainty is invalid")
+    result = value.get("result")
+    if not isinstance(result, str) or not result.strip():
+        raise ValueError("evaluator result must be a non-empty string")
+    return {
+        "score": score,
+        "usefulness": usefulness,
+        "certainty": certainty,
+        "result": result.strip(),
+    }
+
+
 def parse_proposal_json(text: str) -> dict:
     """Extract and validate the first proposal JSON object."""
 
@@ -187,8 +238,8 @@ def parse_proposal_json(text: str) -> dict:
 
 
 def _validate_images(images: list[Image.Image]) -> None:
-    if len(images) != 2:
-        raise ValueError("exactly 2 camera images are required")
+    if len(images) not in {2, 4}:
+        raise ValueError("planner inputs require 2 images; evaluator inputs require 4")
     if any(not isinstance(image, Image.Image) for image in images):
         raise TypeError("images must contain PIL.Image.Image instances")
 
@@ -199,8 +250,7 @@ def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": images[0]},
-                {"type": "image", "image": images[1]},
+                *({"type": "image", "image": image} for image in images),
                 {"type": "text", "text": prompt},
             ],
         }
@@ -215,6 +265,92 @@ def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
     ).to(model.device)
 
 
+def evaluator_prompt(
+    task: str,
+    state_summary: str,
+    action_text: str,
+    next_state_summary: str,
+    success: bool,
+    chunk_index: int,
+    chunk_count: int,
+    attempt: int = 1,
+) -> str:
+    """Build a visual before/after prompt for paper-style step reward evaluation."""
+
+    retry = (
+        ""
+        if attempt == 1
+        else "A previous response was invalid. Recheck every field and emit JSON only.\n"
+    )
+    return (
+        "You are evaluating one completed high-level robot action for an experience "
+        "memory. Images 1 and 2 are the external and wrist views before the action; "
+        "images 3 and 4 are the corresponding views after it. Thinking is disabled.\n"
+        f"Overall task: {task}\n"
+        f"Chunk: {chunk_index + 1}/{chunk_count}\n"
+        f"State before: {state_summary}\n"
+        f"Selected subtask: {action_text}\n"
+        f"State after: {next_state_summary}\n"
+        f"Environment task success at episode end: {str(bool(success)).lower()}\n"
+        f"{retry}"
+        "Judge this action by its actual visual effect and full task context. Useful "
+        "progress gets a positive integer, harmful/regressive/repeated ineffective "
+        "behavior gets a negative integer, and genuinely indeterminate/no-effect "
+        "behavior gets zero. Use the full -3..+3 scale. Do not assign credit merely "
+        "because the complete episode eventually succeeded. Return exactly one JSON "
+        "object with this shape and no surrounding text: "
+        '{"result":"what changed","usefulness":"useful|harmful|neutral",'
+        '"certainty":"certain|somewhat uncertain|very uncertain","score":0}'
+    )
+
+
+@torch.inference_mode()
+def evaluate_chunk(
+    model: Qwen3_5ForConditionalGeneration,
+    processor,
+    images: list[Image.Image],
+    task: str,
+    state_summary: str,
+    action_text: str,
+    next_state_summary: str,
+    success: bool,
+    chunk_index: int,
+    chunk_count: int,
+    attempt: int = 1,
+    max_new_tokens: int = JITRL_MAX_EVALUATOR_TOKENS,
+) -> dict:
+    """Use the resident Qwen VLM to assign one auditable step-wise reward."""
+
+    if len(images) != 4:
+        raise ValueError("chunk evaluator requires four before/after images")
+    prompt = evaluator_prompt(
+        task,
+        state_summary,
+        action_text,
+        next_state_summary,
+        success,
+        chunk_index,
+        chunk_count,
+        attempt=attempt,
+    )
+    inputs = _planner_inputs(model, processor, images, prompt)
+    generated = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=processor.tokenizer.pad_token_id,
+        eos_token_id=processor.tokenizer.eos_token_id,
+    )
+    generated_ids = generated[0, inputs["input_ids"].shape[1] :]
+    output_text = processor.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return {"prompt": prompt, "raw_output": output_text, **parse_evaluator_json(output_text)}
+
+
 @torch.inference_mode()
 def generate_proposal(
     model: Qwen3_5ForConditionalGeneration,
@@ -223,10 +359,11 @@ def generate_proposal(
     task: str,
     recent_subtasks: Sequence[str] | None = None,
     max_new_tokens: int = 256,
+    attempt: int = 1,
 ) -> dict:
     """Generate and parse one state summary with exactly three candidates."""
 
-    prompt = proposal_prompt(task, recent_subtasks)
+    prompt = proposal_prompt(task, recent_subtasks, attempt=attempt)
     inputs = _planner_inputs(model, processor, images, prompt)
     generated = model.generate(
         **inputs,
@@ -299,6 +436,7 @@ def propose_and_score(
     task: str,
     recent_subtasks: Sequence[str] | None = None,
     max_new_tokens: int = 256,
+    attempt: int = 1,
 ) -> dict:
     """Generate candidates and return their JSON-safe base-logit planning record."""
 
@@ -310,6 +448,7 @@ def propose_and_score(
         task,
         recent_subtasks=history,
         max_new_tokens=max_new_tokens,
+        attempt=attempt,
     )
     score_prompt = selection_prompt(
         task,

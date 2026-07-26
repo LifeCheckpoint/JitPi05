@@ -8,6 +8,7 @@ dependencies = [
     "bitsandbytes>=0.46.1",
     "flash-linear-attention[cuda]>=0.5.1",
     "lerobot[all]>=0.6.0",
+    "pydantic-ai>=2.18.0",
     "tqdm>=4.66.0",
     "transformers>=5.5.4",
 ]

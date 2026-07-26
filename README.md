@@ -22,9 +22,9 @@
 - [`jitrl_eval.py`](jitrl_eval.py)：单个 method/seed 的在线 rollout、记忆生命周期与产物持久化。
 - [`eval_jitrl.py`](eval_jitrl.py)：JitRL 独立命令行入口、run 指标及 seed 级兼容汇总。
 
-## JitRL 第一阶段在线记忆实验
+## JitRL 在线记忆实验
 
-这是一个与原有 [`main.py`](main.py) 和 [`eval_sim.py`](eval_sim.py) 分离的在线闭环入口；两者保持原来的单帧离线与四条件闭环语义。第一阶段的目标是以尽量稳定、可审计的实现验证“历史成功经验能否通过候选级 logit 更新影响后续高层决策”，而不是冒充论文完整复现。
+这是一个与原有 [`main.py`](main.py) 和 [`eval_sim.py`](eval_sim.py) 分离的在线闭环入口；两者保持原来的单帧离线与四条件闭环语义。当前版本在第一阶段候选级 logit 原型上恢复论文式 augmented candidate、随机 UCB unseen 探索和逐步 VLM evaluator，用于研究 JitRL 在 VLM-VLA 分层控制中的适用性。
 
 ### 高层决策映射与候选 logits
 
@@ -39,24 +39,28 @@
 1. 第一次使用 greedy 解码，要求输出严格 JSON，其中包含一个 `state_summary` 和恰好 3 个候选；每个候选都含自由文本 `text` 与 `semantic_key`。
 2. 第二次 forward 将同一状态和三个候选编号后重新输入，读取下一个 token 为单 token 编号 `1`、`2`、`3` 时的三个真实 logits。后续 softmax、记忆 advantage 和采样都只在这三个候选槽上进行，**不是**把候选文本中的每个词表 token 当作 RL action。
 
-### 第一阶段记忆与 logit 更新
+### 记忆、augmented candidate 与 logit 更新
 
 JitRL memory 只包含同一 task、先前已结束 episode 的高层决策记录。对当前 `state_summary`，用小写英文/数字 token 集合的 Jaccard 相似度检索 top-k=10；不设相似度阈值，因此记忆非空时即使相似度为 0 的记录也可能进入 top-k。局部估计为：
 
 - `V(s)`：全部检索邻居 return 的均值；无邻居时为 0。
 - `Q(s,a)`：邻居中具有相同 `semantic_key` 的 return 均值。
-- 未见候选令 `Q(s,a)=V(s)`，因此 `A(s,a)=Q(s,a)-V(s)=0`，第一阶段不额外奖励 unseen action。
-- 在当前三个候选内按 advantage 最大绝对值归一化；全为 0 时归一化 advantage 仍全为 0。
+- 候选集合为 Qwen 当前 3 个候选与 top-k 邻居中去重后的历史 action 并集。memory-only action 使用最高相似度邻居保存的自由文本作为可执行 subtask。
+- Qwen 三个原始编号 logits 先减去均值；memory-only action 的基础 logit 为 0。trace 同时保留 raw、centered 与 augmented logits。
+- unseen action 使用论文随机规则：以 `lambda=0.05` 令 `Q=V+alpha/|N|`，其中 `alpha=5`；否则令 `Q=0`。空 memory 时不除零，所有 action 保持 `Q=V=A=0`。
+- 在完整 augmented candidate set 内按 advantage 最大绝对值归一化；全为 0 时归一化 advantage 仍全为 0。
 
-设第二次 forward 得到的三个基础 logits 为 `z`，更新使用 `z' = z + beta * A`，其中 `beta=1`，这里的 `A` 指上述归一化 advantage。基础分布与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时通过两个分布的 CDF，得到 counterfactual base choice 与 updated choice；这使单个状态上的选择变化可以直接归因于当前 logit shift，而不是两次独立抽样。
+更新使用 `z' = z + beta * A`，其中 `beta=0.25`，基础与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时产生原始三候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
 
 `static` 基线执行完全相同的双相机候选生成、第二次候选打分、temperature、uniform 采样和 π₀.₅ 流程，但 advantage 恒为 0，并且不读取或写入 memory。
 
-### 奖励、记忆生命周期与随机配对
+### 逐步 VLM 奖励、记忆生命周期与随机配对
 
-环境成功终局记为 `+1`，失败记为 `0`，折扣因子 `gamma=0.95`。若一个成功 episode 有 `T` 个高层决策，则第 `t` 个记录的 return 为 `gamma^(T-1-t)`；失败 episode 的所有高层记录 return 均为 0。为避免同一 episode 内的信息泄漏，rollout 期间 memory 只读，episode 结束后才批量写入全部高层决策。
+JitRL episode 结束后，常驻 Qwen3.5-9B 按高层 chunk 顺序逐个读取动作前后的外部/腕部双相机关键帧、动作前状态摘要、subtask、下一状态摘要和最终环境成功标记，严格输出 `-3..+3` 的 usefulness score。每次 evaluator 输出若格式错误会自动重试最多 3 次。局部 reward 为 `score/3`；环境成功时最后一个 chunk 再额外加 `+1`，然后按 `gamma=0.95` 计算 signed reward-to-go。这样失败轨迹中的局部进展可以为正，无效或回退动作也可以为负。Static 不执行 evaluator，避免无意义的额外推理。
 
-每个 method/seed/task run 都从独立空 memory 开始，默认不会加载旧 `memory.json`；`static` 的 memory 始终为空。默认只使用 seed 7；该 run 按 `init_state_id=0..49` 顺序运行，因此后续 episode 会依赖此前写入的经验。
+为避免同一 episode 内的信息泄漏，rollout 期间 memory 只读，episode 结束并完成逐步评价后才批量写入全部高层决策。
+
+每个 method/seed/task run 都从独立空 memory 开始，默认不会加载旧 `memory.json`；`static` 的 memory 始终为空。当前第二轮实验只使用 seed 17；该 run 按 `init_state_id=0..24` 顺序运行，因此后续 episode 会依赖此前写入的经验。
 
 候选 uniform 由 `(kind, seed, episode, high_level_step)`，π₀.₅ flow noise 由 `(kind, seed, episode, low_level_chunk)` 的稳定坐标 seed 即时重建，均不含 method。因而同一实验坐标在 `static` 与 `jitrl` 间使用相同随机数和初始 flow noise。轨迹一旦因高层选择而分叉，后续视觉状态和 Qwen 候选自然可能不同；所以 `choice_changed` 的含义是 **JitRL 当前状态**下 updated choice 与其 counterfactual base choice 的比较，不是与 Static 轨迹在同一 chunk 的直接动作比较。
 
@@ -64,20 +68,20 @@ JitRL memory 只包含同一 task、先前已结束 episode 的高层决策记�
 
 运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的 Qwen3.5-9B 与 bf16 的 π₀.₅ 同时驻留显存，显存需求明显高于原来顺序加载 Qwen3.5-4B 的离线/四条件入口。`bitsandbytes` 与 `flash-linear-attention` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。当前 RTX 4080 SUPER 实测中，9B planner 单独约占 7.35 GiB，双模型执行 action chunk 的峰值约 16.22 GiB；16 GB 级显卡余量极小，运行时不要并发占用 GPU。首次运行还会额外下载 Qwen3.5-9B 权重。
 
-默认主实验固定为 LIBERO-90 task 79：`pick up the book and place it in the left compartment of the caddy`。实验规模缩减为 `Static/JitRL × 50 episodes × seed 7 = 100 rollouts`；每个 method run 都独立从空 memory 开始，并依次使用初始状态 0 到 49。该任务仍是 π₀.₅ LIBERO checkpoint 微调任务集合之外的单任务零样本探针。高层规划频率从每 10 步降低到每 20 步后，Qwen 调用量约减半；实际总耗时仍应以新的完整 episode 实测为准。
+当前实验固定为 LIBERO-90 task 65：`put the red mug on the left plate`。实验规模为 `Static/JitRL × 25 episodes × seed 17 = 50 rollouts`；每个 method run 都独立从空 memory 开始，并依次使用初始状态 0 到 24。第一轮 task 79、seed 7 的结果保留在 `artifacts/jitrl_eval/`，先前 task65 第一阶段目录也不覆盖；当前完整版使用独立目录 `artifacts/jitrl_eval_task65_seed17_full_jitrl/`。
 
 ```bash
 # 安装锁定依赖（包括 bitsandbytes 与 flash-linear-attention）
 uv sync
 
-# 默认全量：2 methods × 1 seed × 50 episodes
+# 默认全量：2 methods × 1 seed × 25 episodes
 MUJOCO_GL=egl uv run eval_jitrl.py
 
 # 分片运行一个 method/seed
-MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 7
+MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 17
 
 # 单 episode smoke test
-MUJOCO_GL=egl uv run eval_jitrl.py --method static --seed 7 --episodes 1
+MUJOCO_GL=egl uv run eval_jitrl.py --method static --seed 17 --episodes 1
 
 # 不加载模型，只从已有 episodes.json 与 memory.json 重算并汇总
 uv run eval_jitrl.py --summarize-only
@@ -85,11 +89,11 @@ uv run eval_jitrl.py --summarize-only
 
 `--summarize-only` 可与 `--method`、`--seed`、`--output-dir` 组合；`--method` 和 `--seed` 也可重复指定，以运行或汇总选定分片。
 
-运行时终端会同时显示三层进度：总 method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
+运行时终端会同时显示三层进度：总 method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。若 Qwen 生成的 JSON 格式错误、候选缺失或候选数不是 3，当前高层决策会自动重新生成，最多尝试 3 次，并通过 `[planner-retry]` 实时播报；只有连续 3 次均失败才会终止该 run。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
 
 ### 产物与统计口径
 
-每条 run 写入 `artifacts/jitrl_eval/<method>/seed_<seed>/`：
+当前每条 run 写入 `artifacts/jitrl_eval_task65_seed17_full_jitrl/<method>/seed_<seed>/`：
 
 - `videos/`：全部 episode 视频。
 - `episodes.json`：逐 episode 结果、完整高层 trace 及其覆盖的低层 chunk 索引。
@@ -99,15 +103,15 @@ uv run eval_jitrl.py --summarize-only
 - `metrics.json`：该 method/seed 的统计指标。
 - `progress.json`：当前 episode、低层 chunk、高层决策、环境步和完成状态；用于在另一个终端直接查看最新进度。
 
-根目录 `artifacts/jitrl_eval/summary.json` 汇总全部找到的 run。为控制体积，高层 trace 不保存完整词表 logits，只保存编号 `1/2/3` 对应的三个 logits、更新前后概率、`V/Q/A`、归一化 advantage、邻居与相似度、uniform、base/updated choices、是否发生选择变化，以及该高层 subtask 覆盖的两个低层 action chunk 索引与步范围。
+根目录 `artifacts/jitrl_eval_task65_seed17_full_jitrl/summary.json` 汇总全部 run。高层 trace 保存 raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 evaluator 的 prompt、原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits。
 
 每个 method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、选择变化率、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。汇总代码仍保留 mean、sample std 和 seed-level bootstrap 字段，以兼容已有产物；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
 
-统计解释必须保守：每个方法默认只有 1 个 seed，不能进行跨 seed 稳健性判断；同一 run 内的 50 个 episode 通过在线 memory 顺序相关，也不能当作 50 个独立样本。
+统计解释必须保守：每个方法默认只有 1 个 seed，不能进行跨 seed 稳健性判断；同一 run 内的 25 个 episode 通过在线 memory 顺序相关，也不能当作 25 个独立样本。
 
-### 阶段边界
+### 论文对齐边界
 
-当前只实现“Qwen 视觉候选 + 历史 return 检索 + 候选级 logit 更新”的第一阶段稳定原理验证。第二阶段尚未实现：memory-only action 增广、论文式随机 UCB unseen 探索、Qwen chunk evaluator。报告结果时应明确这一边界，不应将当前代码描述为论文完整 JitRL 复现。
+当前已实现论文的动态非参数 memory、Jaccard top-k、augmented candidate、随机 UCB unseen exploration、逐步 VLM evaluator、discounted return 和 additive logit update。它仍不是逐字复刻：LIBERO 使用自由文本高层 subtask 驱动 π₀.₅，Qwen 编号 logits 需要先均值中心化才能与 base-logit=0 的 memory-only action 放在同一可采样尺度；成功环境标记还作为最后 chunk 的额外可靠 bonus。报告时应把这些 VLM-VLA 适配明确列为实验设计，而不是原论文默认设置。
 
 ## 离线分析
 
@@ -203,7 +207,7 @@ MUJOCO_GL=egl uv run eval_sim.py
 默认运行两个任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
 
 1. `libero_object` task 0：`pick up the alphabet soup and place it in the basket`。这是 π₀.₅ LIBERO 微调分布内的闭环基准，用于确认环境、processor、动作空间和 checkpoint 均正常。
-2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`。LIBERO-90 未进入该 π₀.₅ LIBERO checkpoint 的微调任务集合，因此这里把它作为任务级零样本探针，而不是宣称跨 embodiment 的通用零样本控制。
+2. 第一轮 `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`；第二轮 `libero_90` task 65：`put the red mug on the left plate`。这两个 LIBERO-90 任务均作为任务级零样本探针，不宣称跨 embodiment 的通用零样本控制。
 
 高层 Qwen 只在每个 episode 的初始双相机观测上规划一次，然后释放显存。低层 π₀.₅ 显式预测 50 步 action chunk，只执行前 10 步，再用新观测重新预测。四组条件在同一 episode 的第 n 次重规划中复用相同 flow-matching 初始噪声。
 
@@ -214,7 +218,7 @@ MUJOCO_GL=egl uv run eval_sim.py
 - `rollouts.pt`：每次预测的完整 action chunk、实际执行动作和 reward。
 - `videos/<task>/<condition>/episode_<id>.mp4`：逐条件 rollout 视频。
 
-完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](settings.py:17)、[`SIM_ACTION_STEPS`](settings.py:18) 和 [`SIM_TASKS`](settings.py:40) 缩小实验。
+完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](settings.py:17)、[`SIM_ACTION_STEPS`](settings.py:18) 和 [`SIM_TASKS`](settings.py:40) 缩小实验。JitRL 第二轮不使用该原有四条件入口。
 
 ## 解释限制
 
