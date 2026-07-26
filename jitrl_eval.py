@@ -17,18 +17,26 @@ from lerobot.envs.utils import close_envs
 from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
+from gemini_vlm import (
+    evaluate_chunk as evaluate_chunk_with_gemini,
+    generate_proposal as generate_proposal_with_gemini,
+    load_gemini_evaluator,
+    load_gemini_planner,
+)
 from jitrl_memory import JitRLMemory, discounted_returns
 from jitrl_planner import (
     apply_jitrl_update,
-    evaluate_chunk,
     load_jitrl_planner,
-    propose_and_score,
+    normalize_semantic_key,
+    score_proposal,
 )
 from pi05_pipeline import conditioned_task
 from settings import (
     JITRL_BETA,
     JITRL_CANDIDATES,
     JITRL_EPISODES,
+    JITRL_EVALUATOR_BACKEND,
+    JITRL_EVALUATOR_MODEL,
     JITRL_EVALUATOR_RETRIES,
     JITRL_EVALUATOR_SCORE_SCALE,
     JITRL_EXPLORATION_RATE,
@@ -278,6 +286,7 @@ def _low_level_chunks_per_high_level_plan() -> int:
 def _propose_and_score_with_retry(
     planner_model,
     planner_processor,
+    visual_planner,
     images,
     overall_task: str,
     recent_subtasks: Sequence[str],
@@ -291,17 +300,39 @@ def _propose_and_score_with_retry(
 
     for attempt in range(1, JITRL_PLANNER_RETRIES + 1):
         try:
-            planning = propose_and_score(
+            visual_proposal = generate_proposal_with_gemini(
+                visual_planner,
+                images,
+                overall_task,
+                recent_subtasks=recent_subtasks,
+                attempt=attempt,
+            )
+            proposal = {
+                "state_summary": visual_proposal["state_summary"].strip(),
+                "candidates": [
+                    {
+                        "text": candidate["text"].strip(),
+                        "semantic_key": normalize_semantic_key(
+                            candidate["semantic_key"]
+                        ),
+                    }
+                    for candidate in visual_proposal["candidates"]
+                ],
+            }
+            planning = score_proposal(
                 planner_model,
                 planner_processor,
                 images,
                 overall_task,
+                proposal,
                 recent_subtasks=recent_subtasks,
-                max_new_tokens=JITRL_MAX_PLAN_TOKENS,
-                attempt=attempt,
             )
+            planning["prompt"] = visual_proposal["prompt"]
+            planning["proposal_backend"] = visual_proposal["backend"]
+            planning["proposal_model"] = visual_proposal["model"]
+            planning["proposal_raw_output"] = visual_proposal["raw_output"]
             return planning, attempt
-        except ValueError as error:
+        except Exception as error:
             if attempt == JITRL_PLANNER_RETRIES:
                 raise RuntimeError(
                     f"planner failed after {JITRL_PLANNER_RETRIES} attempts: {error}"
@@ -316,8 +347,7 @@ def _propose_and_score_with_retry(
 
 
 def _evaluate_episode_chunks(
-    planner_model,
-    planner_processor,
+    evaluator,
     episode_result: dict,
     evaluator_images: Sequence[tuple[list, list]],
     *,
@@ -346,9 +376,8 @@ def _evaluate_episode_chunks(
         evaluation = None
         for attempt in range(1, JITRL_EVALUATOR_RETRIES + 1):
             try:
-                evaluation = evaluate_chunk(
-                    planner_model,
-                    planner_processor,
+                evaluation = evaluate_chunk_with_gemini(
+                    evaluator,
                     [*before_images, *after_images],
                     episode_result["task"],
                     chunk["state_summary"],
@@ -360,7 +389,7 @@ def _evaluate_episode_chunks(
                     attempt=attempt,
                 )
                 break
-            except ValueError as error:
+            except Exception as error:
                 if attempt == JITRL_EVALUATOR_RETRIES:
                     raise RuntimeError(
                         "chunk evaluator failed after "
@@ -403,6 +432,7 @@ def _run_episode(
     memory: JitRLMemory | None,
     planner_model,
     planner_processor,
+    visual_planner,
     policy,
     preprocessor,
     postprocessor,
@@ -456,7 +486,7 @@ def _run_episode(
             if step_progress is not None:
                 step_progress.set_postfix_str(
                     f"low={low_level_chunk_index} high={high_level_step_index} "
-                    f"qwen={'yes' if high_level_replan else 'cached'}",
+                    f"vlm={'gemini+qwen-logits' if high_level_replan else 'cached'}",
                     refresh=True,
                 )
             frame = policy_frame(observation, overall_task, env_preprocessor)
@@ -467,6 +497,7 @@ def _run_episode(
                 planning, planner_attempts = _propose_and_score_with_retry(
                     planner_model,
                     planner_processor,
+                    visual_planner,
                     images,
                     overall_task,
                     selected_subtasks[-JITRL_HISTORY_SIZE:],
@@ -561,6 +592,9 @@ def _run_episode(
                     "chunk_index": high_level_step_index,
                     "planner_attempts": planner_attempts,
                     "proposal_prompt": planning["prompt"],
+                    "proposal_backend": planning["proposal_backend"],
+                    "proposal_model": planning["proposal_model"],
+                    "proposal_raw_output": planning["proposal_raw_output"],
                     "selection_prompt": planning["selection_prompt"],
                     "state_summary": planning["state_summary"],
                     "generator_candidates": generator_candidates,
@@ -713,7 +747,12 @@ def summarize_run(
         for episode in episodes
     ]
     task_descriptions = list(dict.fromkeys(episode["task"] for episode in episodes))
-    models = {"planner": JITRL_QWEN_ID, "policy": SIM_PI05_ID}
+    models = {
+        "visual_planner": JITRL_EVALUATOR_MODEL,
+        "logit_model": JITRL_QWEN_ID,
+        "policy": SIM_PI05_ID,
+        "evaluator": JITRL_EVALUATOR_MODEL,
+    }
     return {
         "model": models,
         "models": models,
@@ -724,6 +763,7 @@ def summarize_run(
         "high_level_steps_before_replan": JITRL_HIGH_LEVEL_STEPS,
         "action_steps_before_replan": SIM_ACTION_STEPS,
         "planner_max_attempts": JITRL_PLANNER_RETRIES,
+        "evaluator_backend": JITRL_EVALUATOR_BACKEND,
         "evaluator_max_attempts": JITRL_EVALUATOR_RETRIES,
         "gamma": JITRL_GAMMA,
         "beta": JITRL_BETA,
@@ -777,6 +817,8 @@ def run_jitrl_experiment(
 
     planner_model = None
     planner_processor = None
+    visual_planner = None
+    evaluator = None
     policy = None
     preprocessor = None
     postprocessor = None
@@ -792,6 +834,17 @@ def run_jitrl_experiment(
     try:
         tqdm.write(f"[load] method={method} seed={seed}: loading Qwen planner")
         planner_model, planner_processor = load_jitrl_planner()
+        tqdm.write(
+            f"[load] method={method} seed={seed}: configuring "
+            f"{JITRL_EVALUATOR_MODEL} visual planner"
+        )
+        visual_planner = load_gemini_planner()
+        if method == "jitrl":
+            tqdm.write(
+                f"[load] method={method} seed={seed}: configuring "
+                f"{JITRL_EVALUATOR_MODEL} evaluator"
+            )
+            evaluator = load_gemini_evaluator()
         tqdm.write(f"[load] method={method} seed={seed}: loading π₀.₅ policy")
         policy, preprocessor, postprocessor = load_policy()
         tqdm.write(f"[ready] method={method} seed={seed}: models loaded")
@@ -824,6 +877,7 @@ def run_jitrl_experiment(
                     memory=memory,
                     planner_model=planner_model,
                     planner_processor=planner_processor,
+                    visual_planner=visual_planner,
                     policy=policy,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
@@ -832,9 +886,10 @@ def run_jitrl_experiment(
             finally:
                 step_progress.close()
             if method == "jitrl":
+                if evaluator is None:
+                    raise RuntimeError("jitrl method lost its Gemini evaluator")
                 _step_rewards, returns = _evaluate_episode_chunks(
-                    planner_model,
-                    planner_processor,
+                    evaluator,
                     episode_result,
                     evaluator_images,
                     method=method,
@@ -907,6 +962,8 @@ def run_jitrl_experiment(
         episode_progress.close()
         planner_model = None
         planner_processor = None
+        visual_planner = None
+        evaluator = None
         policy = None
         preprocessor = None
         postprocessor = None

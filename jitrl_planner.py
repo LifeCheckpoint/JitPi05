@@ -15,7 +15,7 @@ from transformers import (
     Qwen3_5ForConditionalGeneration,
 )
 
-from settings import JITRL_MAX_EVALUATOR_TOKENS, JITRL_QWEN_ID
+from settings import JITRL_CANDIDATES, JITRL_QWEN_ID
 
 
 _SEMANTIC_PART_WHITESPACE = re.compile(r"\s+")
@@ -60,7 +60,7 @@ def proposal_prompt(
     recent_subtasks: Sequence[str] | None = None,
     attempt: int = 1,
 ) -> str:
-    """Build the strict three-candidate visual planning prompt."""
+    """Build the legacy local visual-planning prompt with five candidates."""
 
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
         raise ValueError("attempt must be a positive integer")
@@ -70,10 +70,13 @@ def proposal_prompt(
         if attempt == 1
         else (
             f"This is schema-correction attempt {attempt}. A previous response was "
-            "invalid. Before finishing, count the candidates array entries and verify "
-            "that it contains exactly three complete objects named ACTION1, ACTION2, "
-            "and ACTION3. Do not omit, merge, or add candidates.\n"
+            f"invalid. Verify exactly {JITRL_CANDIDATES} complete candidate objects "
+            "with non-empty text and semantic_key fields.\n"
         )
+    )
+    candidate_skeleton = ",".join(
+        f'{{"text":"ACTION{index}","semantic_key":"skill|object|target"}}'
+        for index in range(1, JITRL_CANDIDATES + 1)
     )
     return (
         "You are the high-level planner for a Franka robot. Image 1 is the external "
@@ -83,22 +86,19 @@ def proposal_prompt(
         f"{retry_instruction}"
         "Recently selected subtasks, oldest to newest:\n"
         f"{_history_text(history)}\n"
-        "Infer the current manipulation state and propose exactly three distinct, "
-        "immediately executable next subtasks. Return exactly ONE valid JSON object "
-        "on one line, with no Markdown or surrounding text. The outer object MUST "
-        "contain both state_summary and candidates; do not close it after "
-        "state_summary. candidates MUST be a JSON array of exactly three objects. "
-        "Copy this skeleton exactly and replace only string contents:\n"
-        '{"state_summary":"STATE","candidates":['
-        '{"text":"ACTION1","semantic_key":"skill|object|target"},'
-        '{"text":"ACTION2","semantic_key":"skill|object|target"},'
-        '{"text":"ACTION3","semantic_key":"skill|object|target"}]}\n'
+        f"Infer the current manipulation state and propose exactly {JITRL_CANDIDATES} "
+        "distinct, immediately executable next subtasks. Prefer broad spatial, "
+        "directional, gripper-relative, and generic-object wording rather than relying "
+        "on fine color/texture attributes in every candidate. Return exactly ONE valid "
+        "JSON object on one line, with no Markdown or surrounding text. candidates MUST "
+        f"be a JSON array of exactly {JITRL_CANDIDATES} objects. Copy this skeleton and "
+        "replace only string contents:\n"
+        f'{{"state_summary":"STATE","candidates":[{candidate_skeleton}]}}\n'
         "state_summary must be concise, stable English in the structure "
         "'robot=...; gripper=...; object=...; target=...; relations=...; stage=...'. "
         "Each candidate text must be a short imperative English subtask. Each "
         "semantic_key must have exactly three lowercase fields separated by two | "
-        "characters; choose descriptive skill, object, and target fields without "
-        "using a fixed vocabulary. Output JSON only."
+        "characters. Output JSON only."
     )
 
 
@@ -111,11 +111,14 @@ def selection_prompt(
     """Build the prompt whose first token selects one numbered candidate."""
 
     history = _recent_subtasks(recent_subtasks)
-    if len(candidates) != 3:
-        raise ValueError("selection prompt requires exactly 3 candidates")
+    if len(candidates) != JITRL_CANDIDATES:
+        raise ValueError(
+            f"selection prompt requires exactly {JITRL_CANDIDATES} candidates"
+        )
     candidate_lines = "\n".join(
         f"{index}. {candidate['text']}" for index, candidate in enumerate(candidates, 1)
     )
+    candidate_labels = ", ".join(str(index) for index in range(1, JITRL_CANDIDATES + 1))
     return (
         "You are selecting the immediate high-level subtask for a Franka robot. "
         "Image 1 is the external camera and image 2 is the wrist camera. Thinking "
@@ -126,7 +129,7 @@ def selection_prompt(
         f"{_history_text(history)}\n"
         "Candidates:\n"
         f"{candidate_lines}\n"
-        "Select the best candidate now. Output exactly one digit: 1, 2, or 3. "
+        f"Select the best candidate now. Output exactly one digit: {candidate_labels}. "
         "Output no whitespace, explanation, or punctuation."
     )
 
@@ -213,8 +216,10 @@ def parse_proposal_json(text: str) -> dict:
     if not isinstance(state_summary, str) or not state_summary.strip():
         raise ValueError("planner JSON state_summary must be a non-empty string")
     candidates = proposal.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) != 3:
-        raise ValueError("planner JSON must contain exactly 3 candidates")
+    if not isinstance(candidates, list) or len(candidates) != JITRL_CANDIDATES:
+        raise ValueError(
+            f"planner JSON must contain exactly {JITRL_CANDIDATES} candidates"
+        )
 
     validated_candidates = []
     for index, candidate in enumerate(candidates):
@@ -265,92 +270,6 @@ def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
     ).to(model.device)
 
 
-def evaluator_prompt(
-    task: str,
-    state_summary: str,
-    action_text: str,
-    next_state_summary: str,
-    success: bool,
-    chunk_index: int,
-    chunk_count: int,
-    attempt: int = 1,
-) -> str:
-    """Build a visual before/after prompt for paper-style step reward evaluation."""
-
-    retry = (
-        ""
-        if attempt == 1
-        else "A previous response was invalid. Recheck every field and emit JSON only.\n"
-    )
-    return (
-        "You are evaluating one completed high-level robot action for an experience "
-        "memory. Images 1 and 2 are the external and wrist views before the action; "
-        "images 3 and 4 are the corresponding views after it. Thinking is disabled.\n"
-        f"Overall task: {task}\n"
-        f"Chunk: {chunk_index + 1}/{chunk_count}\n"
-        f"State before: {state_summary}\n"
-        f"Selected subtask: {action_text}\n"
-        f"State after: {next_state_summary}\n"
-        f"Environment task success at episode end: {str(bool(success)).lower()}\n"
-        f"{retry}"
-        "Judge this action by its actual visual effect and full task context. Useful "
-        "progress gets a positive integer, harmful/regressive/repeated ineffective "
-        "behavior gets a negative integer, and genuinely indeterminate/no-effect "
-        "behavior gets zero. Use the full -3..+3 scale. Do not assign credit merely "
-        "because the complete episode eventually succeeded. Return exactly one JSON "
-        "object with this shape and no surrounding text: "
-        '{"result":"what changed","usefulness":"useful|harmful|neutral",'
-        '"certainty":"certain|somewhat uncertain|very uncertain","score":0}'
-    )
-
-
-@torch.inference_mode()
-def evaluate_chunk(
-    model: Qwen3_5ForConditionalGeneration,
-    processor,
-    images: list[Image.Image],
-    task: str,
-    state_summary: str,
-    action_text: str,
-    next_state_summary: str,
-    success: bool,
-    chunk_index: int,
-    chunk_count: int,
-    attempt: int = 1,
-    max_new_tokens: int = JITRL_MAX_EVALUATOR_TOKENS,
-) -> dict:
-    """Use the resident Qwen VLM to assign one auditable step-wise reward."""
-
-    if len(images) != 4:
-        raise ValueError("chunk evaluator requires four before/after images")
-    prompt = evaluator_prompt(
-        task,
-        state_summary,
-        action_text,
-        next_state_summary,
-        success,
-        chunk_index,
-        chunk_count,
-        attempt=attempt,
-    )
-    inputs = _planner_inputs(model, processor, images, prompt)
-    generated = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=True,
-        pad_token_id=processor.tokenizer.pad_token_id,
-        eos_token_id=processor.tokenizer.eos_token_id,
-    )
-    generated_ids = generated[0, inputs["input_ids"].shape[1] :]
-    output_text = processor.decode(
-        generated_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-    return {"prompt": prompt, "raw_output": output_text, **parse_evaluator_json(output_text)}
-
-
 @torch.inference_mode()
 def generate_proposal(
     model: Qwen3_5ForConditionalGeneration,
@@ -361,7 +280,7 @@ def generate_proposal(
     max_new_tokens: int = 256,
     attempt: int = 1,
 ) -> dict:
-    """Generate and parse one state summary with exactly three candidates."""
+    """Generate and parse one state summary with the configured candidate count."""
 
     prompt = proposal_prompt(task, recent_subtasks, attempt=attempt)
     inputs = _planner_inputs(model, processor, images, prompt)
@@ -384,18 +303,19 @@ def generate_proposal(
 
 
 def candidate_token_ids(tokenizer) -> list[int]:
-    """Return single-token ids for the literal candidate labels 1, 2, and 3."""
+    """Return single-token ids for literal labels 1 through JITRL_CANDIDATES."""
 
+    labels = tuple(str(index) for index in range(1, JITRL_CANDIDATES + 1))
     result = []
-    for label in ("1", "2", "3"):
+    for label in labels:
         token_ids = tokenizer.encode(label, add_special_tokens=False)
         if len(token_ids) != 1:
             raise ValueError(
                 f"candidate label {label!r} must encode to exactly one token; got {token_ids}"
             )
         result.append(int(token_ids[0]))
-    if len(set(result)) != 3:
-        raise ValueError("candidate labels '1', '2', and '3' must have distinct token ids")
+    if len(set(result)) != JITRL_CANDIDATES:
+        raise ValueError(f"candidate labels {labels} must have distinct token ids")
     return result
 
 
@@ -406,7 +326,7 @@ def candidate_base_logits(
     images: list[Image.Image],
     prompt: str,
 ) -> tuple[list[int], torch.Tensor]:
-    """Read only the three next-token logits at the final valid prompt token."""
+    """Read only the configured candidate-label logits at the final valid token."""
 
     inputs = _planner_inputs(model, processor, images, prompt)
     outputs = model(**inputs)
@@ -429,6 +349,44 @@ def candidate_base_logits(
 
 
 @torch.inference_mode()
+def score_proposal(
+    model: Qwen3_5ForConditionalGeneration,
+    processor,
+    images: list[Image.Image],
+    task: str,
+    proposal: dict,
+    recent_subtasks: Sequence[str] | None = None,
+) -> dict:
+    """Use local Qwen only for the interpretable candidate-label logits."""
+
+    history = _recent_subtasks(recent_subtasks)
+    state_summary = proposal.get("state_summary")
+    candidates = proposal.get("candidates")
+    if not isinstance(state_summary, str) or not state_summary.strip():
+        raise ValueError("proposal state_summary must be a non-empty string")
+    if not isinstance(candidates, list) or len(candidates) != JITRL_CANDIDATES:
+        raise ValueError(
+            f"proposal must contain exactly {JITRL_CANDIDATES} candidates"
+        )
+    score_prompt = selection_prompt(
+        task,
+        state_summary.strip(),
+        candidates,
+        recent_subtasks=history,
+    )
+    token_ids, base_logits = candidate_base_logits(
+        model, processor, images, score_prompt
+    )
+    return {
+        "selection_prompt": score_prompt,
+        "state_summary": state_summary.strip(),
+        "candidates": candidates,
+        "candidate_token_ids": token_ids,
+        "base_logits": base_logits.tolist(),
+    }
+
+
+@torch.inference_mode()
 def propose_and_score(
     model: Qwen3_5ForConditionalGeneration,
     processor,
@@ -438,7 +396,7 @@ def propose_and_score(
     max_new_tokens: int = 256,
     attempt: int = 1,
 ) -> dict:
-    """Generate candidates and return their JSON-safe base-logit planning record."""
+    """Legacy all-local path retained for standalone compatibility."""
 
     history = _recent_subtasks(recent_subtasks)
     proposal = generate_proposal(
@@ -450,23 +408,15 @@ def propose_and_score(
         max_new_tokens=max_new_tokens,
         attempt=attempt,
     )
-    score_prompt = selection_prompt(
+    scored = score_proposal(
+        model,
+        processor,
+        images,
         task,
-        proposal["state_summary"],
-        proposal["candidates"],
+        proposal,
         recent_subtasks=history,
     )
-    token_ids, base_logits = candidate_base_logits(
-        model, processor, images, score_prompt
-    )
-    return {
-        "prompt": proposal["prompt"],
-        "selection_prompt": score_prompt,
-        "state_summary": proposal["state_summary"],
-        "candidates": proposal["candidates"],
-        "candidate_token_ids": token_ids,
-        "base_logits": base_logits.tolist(),
-    }
+    return {"prompt": proposal["prompt"], **scored}
 
 
 def _float_vector(values: Sequence[float] | torch.Tensor, name: str) -> torch.Tensor:

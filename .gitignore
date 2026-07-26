@@ -11,3 +11,6 @@ wheels/
 
 # Generated research artifacts
 artifacts/
+
+# Local API credentials
+.secrets/

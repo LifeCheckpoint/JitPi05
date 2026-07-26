@@ -6,7 +6,7 @@
 - **显式 logits 调制**：逐 token 保存原始/调制后 logits，并在 argmax 前暴露可编辑回调。
 - **LeRobot π₀.₅ LIBERO**：把总任务与 subtask 组成低层语言条件，显式执行 prefix 编码、KV cache、10 步 flow-matching 去噪和反归一化。
 - **四组对照**：原始任务、人工 subtask、Qwen subtask、调制后的 Qwen subtask。
-- **JitRL 第一阶段**：在每个闭环 action chunk 前生成三个自由文本候选，以任务内在线记忆估计 advantage 并调制候选级 logits。
+- **JitRL 第一阶段**：Gemini 3.6 Flash 负责无需 logits 的多模态状态理解、五候选生成和逐步评价；本地 Qwen3.5-9B 只负责五个候选编号的真实 logits，再以任务内在线记忆估计 advantage 并调制。
 
 代码只按研究逻辑拆成几个平铺模块，没有配置框架、服务层或实验管理系统：
 
@@ -18,7 +18,8 @@
 - [`sim_eval.py`](sim_eval.py)：固定初始状态、闭环 action chunk、成功判定、视频和评测产物。
 - [`eval_sim.py`](eval_sim.py)：独立仿真评测入口。
 - [`jitrl_memory.py`](jitrl_memory.py)：第一阶段任务内经验记忆、Jaccard 检索与回报估计。
-- [`jitrl_planner.py`](jitrl_planner.py)：三候选生成、候选编号 logits 读取及配对 JitRL 更新。
+- [`gemini_vlm.py`](gemini_vlm.py)：通过 PydanticAI 调用 Gemini 3.6 Flash，完成双相机候选生成和四帧逐步 evaluator。
+- [`jitrl_planner.py`](jitrl_planner.py)：本地 Qwen 候选编号 logits 读取及配对 JitRL 更新；保留旧的全本地兼容路径。
 - [`jitrl_eval.py`](jitrl_eval.py)：单个 method/seed 的在线 rollout、记忆生命周期与产物持久化。
 - [`eval_jitrl.py`](eval_jitrl.py)：JitRL 独立命令行入口、run 指标及 seed 级兼容汇总。
 
@@ -30,14 +31,14 @@
 
 每 20 个低层环境步视为一个高层决策步；π₀.₅ 仍每 10 步重新生成一次低层 action chunk，因此一个高层 subtask 默认复用于连续两次 π₀.₅ 重规划：
 
-- **state**：Qwen 根据高层决策点的外部相机与腕部相机生成结构化短文本，格式为 `robot=...; gripper=...; object=...; target=...; relations=...; stage=...`。
+- **state**：Gemini 3.6 Flash 根据高层决策点的外部相机与腕部相机生成结构化短文本，格式为 `robot=...; gripper=...; object=...; target=...; relations=...; stage=...`。
 - **action**：候选中的完整自由文本 subtask，而不是某个文本 token；每个 action 另有规范化的 `semantic_key=skill|object|target`，用于跨措辞聚合同类动作经验。
-- **低层执行**：选中的 subtask 与总任务共同作为 π₀.₅ 条件。π₀.₅ 在第 0、10、20、30… 个低层步读取最新视觉观测并生成新 action chunk；Qwen 只在第 0、20、40… 个低层步更新 subtask。
+- **低层执行**：选中的 subtask 与总任务共同作为 π₀.₅ 条件。π₀.₅ 在第 0、10、20、30… 个低层步读取最新视觉观测并生成新 action chunk；Gemini/Qwen 高层组合只在第 0、20、40… 个低层步更新 subtask。
 
-每个高层决策包含两次 Qwen 调用：
+每个高层决策包含两个分工明确的模型步骤：
 
-1. 第一次使用 greedy 解码，要求输出严格 JSON，其中包含一个 `state_summary` 和恰好 3 个候选；每个候选都含自由文本 `text` 与 `semantic_key`。
-2. 第二次 forward 将同一状态和三个候选编号后重新输入，读取下一个 token 为单 token 编号 `1`、`2`、`3` 时的三个真实 logits。后续 softmax、记忆 advantage 和采样都只在这三个候选槽上进行，**不是**把候选文本中的每个词表 token 当作 RL action。
+1. Gemini 3.6 Flash 通过 PydanticAI 读取双相机图像，并以 Pydantic schema 输出一个 `state_summary` 和恰好 5 个候选；每个候选都含自由文本 `text` 与 `semantic_key`。候选 prompt 明确要求至少两个使用空间/方向描述、至少一个使用“中央物体/附近杯子/手中物体”等通用短语，并限制最多两个候选复述任务中的精细颜色限定词，避免低层 VLA 必须理解“红色杯子”才能执行全部候选。
+2. 本地 4-bit Qwen3.5-9B 将 Gemini 的同一状态和五个候选编号后重新输入，只执行一次 forward，读取下一个 token 为单 token 编号 `1`、`2`、`3`、`4`、`5` 时的五个真实 logits。后续 softmax、记忆 advantage 和采样都只在这五个候选槽上进行，**不是**把候选文本中的每个词表 token 当作 RL action。
 
 ### 记忆、augmented candidate 与 logit 更新
 
@@ -45,18 +46,18 @@ JitRL memory 只包含同一 task、先前已结束 episode 的高层决策记�
 
 - `V(s)`：全部检索邻居 return 的均值；无邻居时为 0。
 - `Q(s,a)`：邻居中具有相同 `semantic_key` 的 return 均值。
-- 候选集合为 Qwen 当前 3 个候选与 top-k 邻居中去重后的历史 action 并集。memory-only action 使用最高相似度邻居保存的自由文本作为可执行 subtask。
-- Qwen 三个原始编号 logits 先减去均值；memory-only action 的基础 logit 为 0。trace 同时保留 raw、centered 与 augmented logits。
+- 候选集合为 Gemini 当前 5 个候选与 top-k 邻居中去重后的历史 action 并集。memory-only action 使用最高相似度邻居保存的自由文本作为可执行 subtask。
+- Qwen 五个原始编号 logits 先减去均值；memory-only action 的基础 logit 为 0。trace 同时保留 raw、centered 与 augmented logits。
 - unseen action 使用论文随机规则：以 `lambda=0.05` 令 `Q=V+alpha/|N|`，其中 `alpha=5`；否则令 `Q=0`。空 memory 时不除零，所有 action 保持 `Q=V=A=0`。
 - 在完整 augmented candidate set 内按 advantage 最大绝对值归一化；全为 0 时归一化 advantage 仍全为 0。
 
-更新使用 `z' = z + beta * A`，其中 `beta=0.25`，基础与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时产生原始三候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
+更新使用 `z' = z + beta * A`，其中 `beta=0.25`，基础与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时产生原始五候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
 
-`static` 基线执行完全相同的双相机候选生成、第二次候选打分、temperature、uniform 采样和 π₀.₅ 流程，但 advantage 恒为 0，并且不读取或写入 memory。
+`static` 基线执行完全相同的 Gemini 双相机候选生成、本地 Qwen 候选打分、temperature、uniform 采样和 π₀.₅ 流程，但 advantage 恒为 0，并且不读取或写入 memory。
 
 ### 逐步 VLM 奖励、记忆生命周期与随机配对
 
-JitRL episode 结束后，常驻 Qwen3.5-9B 按高层 chunk 顺序逐个读取动作前后的外部/腕部双相机关键帧、动作前状态摘要、subtask、下一状态摘要和最终环境成功标记，严格输出 `-3..+3` 的 usefulness score。每次 evaluator 输出若格式错误会自动重试最多 3 次。局部 reward 为 `score/3`；环境成功时最后一个 chunk 再额外加 `+1`，然后按 `gamma=0.95` 计算 signed reward-to-go。这样失败轨迹中的局部进展可以为正，无效或回退动作也可以为负。Static 不执行 evaluator，避免无意义的额外推理。
+JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动作前后的外部/腕部双相机关键帧、动作前状态摘要、subtask、下一状态摘要和最终环境成功标记，通过 Pydantic schema 输出 `-3..+3` 的 usefulness score。每次 API/结构化输出失败会自动重试最多 3 次。prompt 额外要求：place/release/drop 只有在正确物体已脱离夹爪、由目标容器或表面真实支撑并稳定释放时才能给正分；仅有二维重叠、悬空或错误物体靠近目标不得算成功。局部 reward 为 `score/3`；环境成功时最后一个 chunk 再额外加 `+1`，然后按 `gamma=0.95` 计算 signed reward-to-go。Static 不执行 evaluator，避免无意义的额外 API 调用。
 
 为避免同一 episode 内的信息泄漏，rollout 期间 memory 只读，episode 结束并完成逐步评价后才批量写入全部高层决策。
 
@@ -66,22 +67,24 @@ JitRL episode 结束后，常驻 Qwen3.5-9B 按高层 chunk 顺序逐个读取�
 
 ### 环境、默认实验与运行命令
 
-运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的 Qwen3.5-9B 与 bf16 的 π₀.₅ 同时驻留显存，显存需求明显高于原来顺序加载 Qwen3.5-4B 的离线/四条件入口。`bitsandbytes` 与 `flash-linear-attention` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。当前 RTX 4080 SUPER 实测中，9B planner 单独约占 7.35 GiB，双模型执行 action chunk 的峰值约 16.22 GiB；16 GB 级显卡余量极小，运行时不要并发占用 GPU。首次运行还会额外下载 Qwen3.5-9B 权重。
+运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的本地 Qwen3.5-9B（仅计算候选 logits）与 bf16 的 π₀.₅ 同时驻留显存；Gemini 通过网络 API 提供更强的多模态候选生成和 evaluator。`bitsandbytes`、`flash-linear-attention` 与 `pydantic-ai` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。当前 RTX 4080 SUPER 实测中，9B Qwen 单独约占 7.35 GiB，双本地模型执行 action chunk 的峰值约 16.22 GiB；16 GB 级显卡余量极小，运行时不要并发占用 GPU。首次运行还会额外下载 Qwen3.5-9B 权重。
 
-当前实验固定为 LIBERO-90 task 65：`put the red mug on the left plate`。实验规模为 `Static/JitRL × 25 episodes × seed 17 = 50 rollouts`；每个 method run 都独立从空 memory 开始，并依次使用初始状态 0 到 24。第一轮 task 79、seed 7 的结果保留在 `artifacts/jitrl_eval/`，先前 task65 第一阶段目录也不覆盖；当前完整版使用独立目录 `artifacts/jitrl_eval_task65_seed17_full_jitrl/`。
+Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`；API collection URL、模型名和超时配置位于 [`settings.py`](settings.py)。不要把密钥写入 README、命令行参数或提交记录。
+
+当前实验已切回成功率更适合作比较的 LIBERO-90 task 79：`pick up the book and place it in the left compartment of the caddy`。实验规模为 `Static/JitRL × 25 episodes × seed 17 = 50 rollouts`；每个 method run 都独立从空 memory 开始，并依次使用初始状态 0 到 24。第一轮 task79/seed7 的旧结果保留在 `artifacts/jitrl_eval/`，task65 的 smoke/第一阶段产物也不会覆盖；当前 Gemini 五候选完整版使用新的独立目录 `artifacts/jitrl_eval_task79_seed17_gemini5/`。
 
 ```bash
 # 安装锁定依赖（包括 bitsandbytes 与 flash-linear-attention）
 uv sync
 
-# 默认全量：2 methods × 1 seed × 25 episodes
+# 默认全量：先 JitRL（带记忆），再 Static（无记忆基线）
 MUJOCO_GL=egl uv run eval_jitrl.py
 
 # 分片运行一个 method/seed
 MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 17
 
-# 单 episode smoke test
-MUJOCO_GL=egl uv run eval_jitrl.py --method static --seed 17 --episodes 1
+# 单 episode API/rollout smoke test
+MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 17 --episodes 1
 
 # 不加载模型，只从已有 episodes.json 与 memory.json 重算并汇总
 uv run eval_jitrl.py --summarize-only
@@ -89,11 +92,11 @@ uv run eval_jitrl.py --summarize-only
 
 `--summarize-only` 可与 `--method`、`--seed`、`--output-dir` 组合；`--method` 和 `--seed` 也可重复指定，以运行或汇总选定分片。
 
-运行时终端会同时显示三层进度：总 method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。若 Qwen 生成的 JSON 格式错误、候选缺失或候选数不是 3，当前高层决策会自动重新生成，最多尝试 3 次，并通过 `[planner-retry]` 实时播报；只有连续 3 次均失败才会终止该 run。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
+运行时终端会同时显示三层进度：总 method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。默认 method 顺序是 `jitrl` 后 `static`。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。若 Gemini API、Pydantic schema、候选缺失 `text/subtask_label/label`、五候选数量/semantic key 或本地 Qwen logits 计算失败，当前高层决策会自动重试最多 7 次，并通过 `[planner-retry]` 实时播报；evaluator 仍通过 `[evaluator-retry]` 最多重试 3 次。只有高层连续 7 次或 evaluator 连续 3 次均失败才会终止该 run。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
 
 ### 产物与统计口径
 
-当前每条 run 写入 `artifacts/jitrl_eval_task65_seed17_full_jitrl/<method>/seed_<seed>/`：
+当前每条 run 写入 `artifacts/jitrl_eval_task79_seed17_gemini5/<method>/seed_<seed>/`：
 
 - `videos/`：全部 episode 视频。
 - `episodes.json`：逐 episode 结果、完整高层 trace 及其覆盖的低层 chunk 索引。
@@ -103,7 +106,7 @@ uv run eval_jitrl.py --summarize-only
 - `metrics.json`：该 method/seed 的统计指标。
 - `progress.json`：当前 episode、低层 chunk、高层决策、环境步和完成状态；用于在另一个终端直接查看最新进度。
 
-根目录 `artifacts/jitrl_eval_task65_seed17_full_jitrl/summary.json` 汇总全部 run。高层 trace 保存 raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 evaluator 的 prompt、原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits。
+根目录 `artifacts/jitrl_eval_task79_seed17_gemini5/summary.json` 汇总全部 run。高层 trace 保存 Gemini proposal 的 backend/model/prompt/结构化原始输出、本地 Qwen raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 Gemini evaluator 的 prompt、结构化原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits，也不会保存 API key。
 
 每个 method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、选择变化率、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。汇总代码仍保留 mean、sample std 和 seed-level bootstrap 字段，以兼容已有产物；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
 
@@ -207,7 +210,7 @@ MUJOCO_GL=egl uv run eval_sim.py
 默认运行两个任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
 
 1. `libero_object` task 0：`pick up the alphabet soup and place it in the basket`。这是 π₀.₅ LIBERO 微调分布内的闭环基准，用于确认环境、processor、动作空间和 checkpoint 均正常。
-2. 第一轮 `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`；第二轮 `libero_90` task 65：`put the red mug on the left plate`。这两个 LIBERO-90 任务均作为任务级零样本探针，不宣称跨 embodiment 的通用零样本控制。
+2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`；曾使用 task 65：`put the red mug on the left plate` 做过机制 smoke test，但因成功率过低，正式 JitRL/Static 对比已切回 task 79。这两个 LIBERO-90 任务均作为任务级零样本探针，不宣称跨 embodiment 的通用零样本控制。
 
 高层 Qwen 只在每个 episode 的初始双相机观测上规划一次，然后释放显存。低层 π₀.₅ 显式预测 50 步 action chunk，只执行前 10 步，再用新观测重新预测。四组条件在同一 episode 的第 n 次重规划中复用相同 flow-matching 初始噪声。
 
