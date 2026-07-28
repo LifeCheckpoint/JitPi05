@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from eval_jitrl import build_summary, compute_run_metrics, resolve_tasks, run_dir_for
 from jitrl_eval import (
     _low_level_chunks_per_high_level_plan,
     build_augmented_candidates,
@@ -13,11 +16,15 @@ from gemini_vlm import (
 from jitrl_memory import JitRLMemory, discounted_returns
 from jitrl_planner import candidate_token_ids, parse_evaluator_json, selection_prompt
 from settings import (
+    JITRL_BETA,
     JITRL_CANDIDATES,
+    JITRL_EPISODES,
+    JITRL_HIGH_LEVEL_STEPS,
     JITRL_METHODS,
     JITRL_OUTPUT_DIR,
     JITRL_PLANNER_RETRIES,
-    JITRL_TASK,
+    JITRL_QWEN_ID,
+    JITRL_TASKS,
 )
 
 
@@ -189,11 +196,31 @@ def test_five_candidate_selection_prompt_and_token_ids() -> None:
     assert candidate_token_ids(Tokenizer()) == [101, 102, 103, 104, 105]
 
 
-def test_task79_experiment_configuration() -> None:
-    assert JITRL_TASK["suite"] == "libero_90"
-    assert JITRL_TASK["task_id"] == 79
-    assert JITRL_TASK["name"] == "libero_90_task79"
-    assert str(JITRL_OUTPUT_DIR) == "artifacts/jitrl_eval_task79_seed17_gemini5"
+def test_five_task_experiment_configuration() -> None:
+    assert JITRL_QWEN_ID == "Qwen/Qwen3.5-4B"
+    assert JITRL_EPISODES == 15
+    assert JITRL_HIGH_LEVEL_STEPS == 30
+    assert JITRL_BETA == 0.40
+    assert [task["task_id"] for task in JITRL_TASKS] == [19, 27, 60, 62, 79]
+    assert all(task["suite"] == "libero_90" for task in JITRL_TASKS)
+    assert [task["name"] for task in JITRL_TASKS] == [
+        "libero_90_task19",
+        "libero_90_task27",
+        "libero_90_task60",
+        "libero_90_task62",
+        "libero_90_task79",
+    ]
+    assert [task["description"] for task in JITRL_TASKS] == [
+        "put the moka pot on the stove",
+        "put the wine bottle on the wine rack",
+        "pick up the black bowl on the left and put it in the tray",
+        "pick up the salad dressing and put it in the tray",
+        "pick up the book and place it in the left compartment of the caddy",
+    ]
+    assert 65 not in {task["task_id"] for task in JITRL_TASKS}
+    assert str(JITRL_OUTPUT_DIR) == (
+        "artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040"
+    )
 
 
 def test_gemini_base_url_and_method_order() -> None:
@@ -205,4 +232,65 @@ def test_gemini_base_url_and_method_order() -> None:
 
 
 def test_high_to_low_planning_ratio() -> None:
-    assert _low_level_chunks_per_high_level_plan() == 2
+    assert _low_level_chunks_per_high_level_plan() == 3
+
+
+def test_task_resolution_and_run_paths_are_isolated() -> None:
+    selected = resolve_tasks(["libero_90_task79", "libero_90_task19"])
+    assert [task["task_id"] for task in selected] == [79, 19]
+    first = run_dir_for(Path("artifacts/test"), selected[0], "jitrl", 17)
+    second = run_dir_for(Path("artifacts/test"), selected[1], "jitrl", 17)
+    assert first == Path("artifacts/test/libero_90_task79/jitrl/seed_17")
+    assert second == Path("artifacts/test/libero_90_task19/jitrl/seed_17")
+    assert first != second
+
+
+def test_multitask_summary_keeps_task_pairs_and_macro_average() -> None:
+    tasks = [dict(task) for task in JITRL_TASKS[:2]]
+    rows = []
+    outcomes = {
+        (tasks[0]["name"], "jitrl"): True,
+        (tasks[0]["name"], "static"): False,
+        (tasks[1]["name"], "jitrl"): False,
+        (tasks[1]["name"], "static"): False,
+    }
+    for task in tasks:
+        for method in JITRL_METHODS:
+            rows.append(
+                compute_run_metrics(
+                    [
+                        {
+                            "success": outcomes[(task["name"], method)],
+                            "steps": 400,
+                            "chunks": [],
+                        }
+                    ],
+                    [],
+                    task_spec=task,
+                    method=method,
+                    seed=17,
+                )
+            )
+
+    summary = build_summary(
+        rows,
+        requested_tasks=tasks,
+        requested_methods=JITRL_METHODS,
+        requested_seeds=(17,),
+        requested_episodes=15,
+        output_dir=Path("artifacts/test"),
+    )
+    assert summary["configuration"]["requested_runs"] == 4
+    assert summary["configuration"]["requested_rollouts"] == 60
+    assert summary["configuration"]["run_order"] == "task_then_method_then_seed"
+    assert set(summary["tasks"]) == {task["name"] for task in tasks}
+    assert (
+        summary["tasks"][tasks[0]["name"]]["paired_differences"]
+        ["success_rate"]["mean"]
+        == 1.0
+    )
+    assert summary["task_macro"]["methods"]["jitrl"]["success_rate"]["mean"] == 0.5
+    assert (
+        summary["task_macro"]["paired_differences"]["success_rate"]["mean"]
+        == 0.5
+    )

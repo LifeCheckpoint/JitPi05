@@ -6,7 +6,7 @@
 - **显式 logits 调制**：逐 token 保存原始/调制后 logits，并在 argmax 前暴露可编辑回调。
 - **LeRobot π₀.₅ LIBERO**：把总任务与 subtask 组成低层语言条件，显式执行 prefix 编码、KV cache、10 步 flow-matching 去噪和反归一化。
 - **四组对照**：原始任务、人工 subtask、Qwen subtask、调制后的 Qwen subtask。
-- **JitRL 第一阶段**：Gemini 3.6 Flash 负责无需 logits 的多模态状态理解、五候选生成和逐步评价；本地 Qwen3.5-9B 只负责五个候选编号的真实 logits，再以任务内在线记忆估计 advantage 并调制。
+- **JitRL 第一阶段**：Gemini 3.6 Flash 负责无需 logits 的多模态状态理解、五候选生成和逐步评价；本地 Qwen3.5-4B 只负责五个候选编号的真实 logits，再以任务内在线记忆估计 advantage 并调制。
 
 代码只按研究逻辑拆成几个平铺模块，没有配置框架、服务层或实验管理系统：
 
@@ -20,8 +20,8 @@
 - [`jitrl_memory.py`](jitrl_memory.py)：第一阶段任务内经验记忆、Jaccard 检索与回报估计。
 - [`gemini_vlm.py`](gemini_vlm.py)：通过 PydanticAI 调用 Gemini 3.6 Flash，完成双相机候选生成和四帧逐步 evaluator。
 - [`jitrl_planner.py`](jitrl_planner.py)：本地 Qwen 候选编号 logits 读取及配对 JitRL 更新；保留旧的全本地兼容路径。
-- [`jitrl_eval.py`](jitrl_eval.py)：单个 method/seed 的在线 rollout、记忆生命周期与产物持久化。
-- [`eval_jitrl.py`](eval_jitrl.py)：JitRL 独立命令行入口、run 指标及 seed 级兼容汇总。
+- [`jitrl_eval.py`](jitrl_eval.py)：单个 task/method/seed 的在线 rollout、独立记忆生命周期与产物持久化。
+- [`eval_jitrl.py`](eval_jitrl.py)：JitRL 多任务命令行入口、任务级配对指标及跨任务描述性汇总。
 
 ## JitRL 在线记忆实验
 
@@ -29,16 +29,16 @@
 
 ### 高层决策映射与候选 logits
 
-每 20 个低层环境步视为一个高层决策步；π₀.₅ 仍每 10 步重新生成一次低层 action chunk，因此一个高层 subtask 默认复用于连续两次 π₀.₅ 重规划：
+每 30 个低层环境步视为一个高层决策步；π₀.₅ 仍每 10 步重新生成一次低层 action chunk，因此一个高层 subtask 默认复用于连续三次 π₀.₅ 重规划：
 
 - **state**：Gemini 3.6 Flash 根据高层决策点的外部相机与腕部相机生成结构化短文本，格式为 `robot=...; gripper=...; object=...; target=...; relations=...; stage=...`。
 - **action**：候选中的完整自由文本 subtask，而不是某个文本 token；每个 action 另有规范化的 `semantic_key=skill|object|target`，用于跨措辞聚合同类动作经验。
-- **低层执行**：选中的 subtask 与总任务共同作为 π₀.₅ 条件。π₀.₅ 在第 0、10、20、30… 个低层步读取最新视觉观测并生成新 action chunk；Gemini/Qwen 高层组合只在第 0、20、40… 个低层步更新 subtask。
+- **低层执行**：选中的 subtask 与总任务共同作为 π₀.₅ 条件。π₀.₅ 在第 0、10、20、30… 个低层步读取最新视觉观测并生成新 action chunk；Gemini/Qwen 高层组合只在第 0、30、60… 个低层步更新 subtask。
 
 每个高层决策包含两个分工明确的模型步骤：
 
 1. Gemini 3.6 Flash 通过 PydanticAI 读取双相机图像，并以 Pydantic schema 输出一个 `state_summary` 和恰好 5 个候选；每个候选都含自由文本 `text` 与 `semantic_key`。候选 prompt 明确要求至少两个使用空间/方向描述、至少一个使用“中央物体/附近杯子/手中物体”等通用短语，并限制最多两个候选复述任务中的精细颜色限定词，避免低层 VLA 必须理解“红色杯子”才能执行全部候选。
-2. 本地 4-bit Qwen3.5-9B 将 Gemini 的同一状态和五个候选编号后重新输入，只执行一次 forward，读取下一个 token 为单 token 编号 `1`、`2`、`3`、`4`、`5` 时的五个真实 logits。后续 softmax、记忆 advantage 和采样都只在这五个候选槽上进行，**不是**把候选文本中的每个词表 token 当作 RL action。
+2. 本地 4-bit Qwen3.5-4B 将 Gemini 的同一状态和五个候选编号后重新输入，只执行一次 forward，读取下一个 token 为单 token 编号 `1`、`2`、`3`、`4`、`5` 时的五个真实 logits。Qwen 不再承担复杂 JSON 候选生成，因此回归 4B 以降低显存和推理开销。后续 softmax、记忆 advantage 和采样都只在这五个候选槽上进行，**不是**把候选文本中的每个词表 token 当作 RL action。
 
 ### 记忆、augmented candidate 与 logit 更新
 
@@ -51,7 +51,7 @@ JitRL memory 只包含同一 task、先前已结束 episode 的高层决策记�
 - unseen action 使用论文随机规则：以 `lambda=0.05` 令 `Q=V+alpha/|N|`，其中 `alpha=5`；否则令 `Q=0`。空 memory 时不除零，所有 action 保持 `Q=V=A=0`。
 - 在完整 augmented candidate set 内按 advantage 最大绝对值归一化；全为 0 时归一化 advantage 仍全为 0。
 
-更新使用 `z' = z + beta * A`，其中 `beta=0.25`，基础与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时产生原始五候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
+更新使用 `z' = z + beta * A`，其中 `beta=0.40`，基础与更新分布都使用 `temperature=0.8`。相较上一轮的 0.25，此处适度提高 memory advantage 的调制力度。同一个 `[0, 1)` uniform 同时产生原始五候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
 
 `static` 基线执行完全相同的 Gemini 双相机候选生成、本地 Qwen 候选打分、temperature、uniform 采样和 π₀.₅ 流程，但 advantage 恒为 0，并且不读取或写入 memory。
 
@@ -61,42 +61,52 @@ JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动
 
 为避免同一 episode 内的信息泄漏，rollout 期间 memory 只读，episode 结束并完成逐步评价后才批量写入全部高层决策。
 
-每个 method/seed/task run 都从独立空 memory 开始，默认不会加载旧 `memory.json`；`static` 的 memory 始终为空。当前第二轮实验只使用 seed 17；该 run 按 `init_state_id=0..24` 顺序运行，因此后续 episode 会依赖此前写入的经验。
+每个 task/method/seed run 都从独立空 memory 开始，默认不会加载旧 `memory.json`；`static` 的 memory 始终为空，不同任务之间也不会共享经验。当前多任务实验只使用 seed 17；每条 run 按 `init_state_id=0..14` 顺序运行，因此同一 JitRL run 的后续 episode 会依赖此前写入的经验。
 
 候选 uniform 由 `(kind, seed, episode, high_level_step)`，π₀.₅ flow noise 由 `(kind, seed, episode, low_level_chunk)` 的稳定坐标 seed 即时重建，均不含 method。因而同一实验坐标在 `static` 与 `jitrl` 间使用相同随机数和初始 flow noise。轨迹一旦因高层选择而分叉，后续视觉状态和 Qwen 候选自然可能不同；所以 `choice_changed` 的含义是 **JitRL 当前状态**下 updated choice 与其 counterfactual base choice 的比较，不是与 Static 轨迹在同一 chunk 的直接动作比较。
 
 ### 环境、默认实验与运行命令
 
-运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的本地 Qwen3.5-9B（仅计算候选 logits）与 bf16 的 π₀.₅ 同时驻留显存；Gemini 通过网络 API 提供更强的多模态候选生成和 evaluator。`bitsandbytes`、`flash-linear-attention` 与 `pydantic-ai` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。当前 RTX 4080 SUPER 实测中，9B Qwen 单独约占 7.35 GiB，双本地模型执行 action chunk 的峰值约 16.22 GiB；16 GB 级显卡余量极小，运行时不要并发占用 GPU。首次运行还会额外下载 Qwen3.5-9B 权重。
+运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的本地 Qwen3.5-4B（仅计算候选 logits）与 bf16 的 π₀.₅ 同时驻留显存；Gemini 通过网络 API 提供更强的多模态候选生成和 evaluator。`bitsandbytes`、`flash-linear-attention` 与 `pydantic-ai` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。4B 相比上一轮 9B 显著降低了显存与候选打分开销，但本地 Qwen 和 π₀.₅ 仍会同时驻留显存，运行时不要并发占用 GPU。
 
 Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`；API collection URL、模型名和超时配置位于 [`settings.py`](settings.py)。不要把密钥写入 README、命令行参数或提交记录。
 
-当前实验已切回成功率更适合作比较的 LIBERO-90 task 79：`pick up the book and place it in the left compartment of the caddy`。实验规模为 `Static/JitRL × 25 episodes × seed 17 = 50 rollouts`；每个 method run 都独立从空 memory 开始，并依次使用初始状态 0 到 24。第一轮 task79/seed7 的旧结果保留在 `artifacts/jitrl_eval/`，task65 的 smoke/第一阶段产物也不会覆盖；当前 Gemini 五候选完整版使用新的独立目录 `artifacts/jitrl_eval_task79_seed17_gemini5/`。
+当前实验固定 seed 17，并从 LIBERO-90 中选择 5 个操纵物体互不重复的单物体放置任务：
+
+| task ID | 准确任务描述 | 主要物体 |
+|---:|---|---|
+| 19 | `put the moka pot on the stove` | moka pot |
+| 27 | `put the wine bottle on the wine rack` | wine bottle |
+| 60 | `pick up the black bowl on the left and put it in the tray` | black bowl |
+| 62 | `pick up the salad dressing and put it in the tray` | salad dressing |
+| 79 | `pick up the book and place it in the left compartment of the caddy` | book |
+
+已知成功率过低的 task 65 不进入本轮面板。实验规模为 `5 tasks × 2 methods × 15 episodes × 1 seed = 150 rollouts`，共 10 条独立 run。默认循环顺序为 task 19→27→60→62→79，并在每个任务内部依次运行 JitRL→Static；每个 task/method run 使用独立目录，其中 JitRL 从新的空 memory 冷启动。旧 task79、task65 产物不会被覆盖；新产物根目录为 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/`。
 
 ```bash
 # 安装锁定依赖（包括 bitsandbytes 与 flash-linear-attention）
 uv sync
 
-# 默认全量：先 JitRL（带记忆），再 Static（无记忆基线）
+# 默认全量：5 个任务；每个任务内先 JitRL，再 Static
 MUJOCO_GL=egl uv run eval_jitrl.py
 
-# 分片运行一个 method/seed
-MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 17
+# 分片运行一个 task/method/seed
+MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task19 --method jitrl --seed 17
 
 # 单 episode API/rollout smoke test
-MUJOCO_GL=egl uv run eval_jitrl.py --method jitrl --seed 17 --episodes 1
+MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task19 --method jitrl --seed 17 --episodes 1
 
 # 不加载模型，只从已有 episodes.json 与 memory.json 重算并汇总
 uv run eval_jitrl.py --summarize-only
 ```
 
-`--summarize-only` 可与 `--method`、`--seed`、`--output-dir` 组合；`--method` 和 `--seed` 也可重复指定，以运行或汇总选定分片。
+`--summarize-only` 可与 `--task`、`--method`、`--seed`、`--output-dir` 组合；`--task`、`--method` 和 `--seed` 均可重复指定，以运行或汇总选定分片。
 
-运行时终端会同时显示三层进度：总 method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。默认 method 顺序是 `jitrl` 后 `static`。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。若 Gemini API、Pydantic schema、候选缺失 `text/subtask_label/label`、五候选数量/semantic key 或本地 Qwen logits 计算失败，当前高层决策会自动重试最多 7 次，并通过 `[planner-retry]` 实时播报；evaluator 仍通过 `[evaluator-retry]` 最多重试 3 次。只有高层连续 7 次或 evaluator 连续 3 次均失败才会终止该 run。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
+运行时终端会同时显示三层进度：总 task/method/seed run、当前 run 的 episode、当前 episode 的低层环境步，并由 `tqdm` 根据实测速度给出 elapsed/ETA。默认顺序是 task→method→seed，每个 task 内 method 顺序为 `jitrl` 后 `static`。默认配置会在启动信息中打印 5 tasks、10 runs 和 150 rollouts。每个 episode 结束后还会立即输出一条 `[episode]` 结果，包含 task、SUCCESS/FAIL、完成步数、高层/低层重规划次数、累计成功率、最近 10 个 episode 成功率和当前 memory 大小。若 Gemini API、Pydantic schema、候选缺失 `text/subtask_label/label`、五候选数量/semantic key 或本地 Qwen logits 计算失败，当前高层决策会自动重试最多 7 次，并通过 `[planner-retry]` 实时播报；evaluator 仍通过 `[evaluator-retry]` 最多重试 3 次。只有高层连续 7 次或 evaluator 连续 3 次均失败才会终止该 run。模型加载阶段显示 `[load]`/`[ready]`；即使终端被断开，最新 task、method、episode、低层 chunk、高层决策和环境步仍持续写入 `progress.json`。
 
 ### 产物与统计口径
 
-当前每条 run 写入 `artifacts/jitrl_eval_task79_seed17_gemini5/<method>/seed_<seed>/`：
+当前每条 run 写入 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/<task>/<method>/seed_<seed>/`：
 
 - `videos/`：全部 episode 视频。
 - `episodes.json`：逐 episode 结果、完整高层 trace 及其覆盖的低层 chunk 索引。
@@ -106,11 +116,11 @@ uv run eval_jitrl.py --summarize-only
 - `metrics.json`：该 method/seed 的统计指标。
 - `progress.json`：当前 episode、低层 chunk、高层决策、环境步和完成状态；用于在另一个终端直接查看最新进度。
 
-根目录 `artifacts/jitrl_eval_task79_seed17_gemini5/summary.json` 汇总全部 run。高层 trace 保存 Gemini proposal 的 backend/model/prompt/结构化原始输出、本地 Qwen raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 Gemini evaluator 的 prompt、结构化原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits，也不会保存 API key。
+根目录 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/summary.json` 汇总全部 run。`tasks.<task_name>` 保留每个任务的 JitRL/Static 指标及相同 seed 的配对差值，`task_macro` 报告 5 个任务上的描述性 macro 均值。高层 trace 保存 Gemini proposal 的 backend/model/prompt/结构化原始输出、本地 Qwen raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 Gemini evaluator 的 prompt、结构化原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits，也不会保存 API key。
 
-每个 method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、选择变化率、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。汇总代码仍保留 mean、sample std 和 seed-level bootstrap 字段，以兼容已有产物；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
+每个 task/method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、候选增广/advantage 选择变化率、UCB 比例、memory-only 候选与选择率、evaluator 分布、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。任务内部仍保留 seed-level mean、sample std 和 bootstrap 字段；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
 
-统计解释必须保守：每个方法默认只有 1 个 seed，不能进行跨 seed 稳健性判断；同一 run 内的 25 个 episode 通过在线 memory 顺序相关，也不能当作 25 个独立样本。
+统计解释必须保守：每个 task/method 默认只有 1 个 seed，不能进行跨 seed 稳健性判断；同一 JitRL run 内的 15 个 episode 通过在线 memory 顺序相关，也不能当作 15 个独立样本。5 个任务是按物体与结构有意筛选而非从 LIBERO-90 随机抽样，因此 task-macro 均值和 task-level bootstrap 区间只描述当前面板，不构成整个 suite 的总体推断。
 
 ### 论文对齐边界
 
@@ -210,7 +220,7 @@ MUJOCO_GL=egl uv run eval_sim.py
 默认运行两个任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
 
 1. `libero_object` task 0：`pick up the alphabet soup and place it in the basket`。这是 π₀.₅ LIBERO 微调分布内的闭环基准，用于确认环境、processor、动作空间和 checkpoint 均正常。
-2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`；曾使用 task 65：`put the red mug on the left plate` 做过机制 smoke test，但因成功率过低，正式 JitRL/Static 对比已切回 task 79。这两个 LIBERO-90 任务均作为任务级零样本探针，不宣称跨 embodiment 的通用零样本控制。
+2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`。这一原有四条件入口仍只把 task 79 作为任务级零样本探针；独立的 JitRL 入口则使用前文列出的 5-task 面板。两种入口都不宣称跨 embodiment 的通用零样本控制。
 
 高层 Qwen 只在每个 episode 的初始双相机观测上规划一次，然后释放显存。低层 π₀.₅ 显式预测 50 步 action chunk，只执行前 10 步，再用新观测重新预测。四组条件在同一 episode 的第 n 次重规划中复用相同 flow-matching 初始噪声。
 
@@ -232,4 +242,4 @@ MUJOCO_GL=egl uv run eval_sim.py
 - 高层文本变化是否传导到 π₀.₅ 的低层动作？
 - π₀.₅ 输出是否有限、尺度是否正常、是否与示范动作处在相近范围？
 
-示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 [`eval_sim.py`](eval_sim.py) 的 LIBERO rollout 为准。LIBERO-90 task 79 的结果是单任务诊断探针，不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。
+示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 [`eval_sim.py`](eval_sim.py) 或 [`eval_jitrl.py`](eval_jitrl.py) 的 LIBERO rollout 为准。原有 task 79 结果是单任务诊断探针；新的 5-task JitRL 面板扩大了任务覆盖，但任务经过有意筛选且只有一个 seed，仍不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。

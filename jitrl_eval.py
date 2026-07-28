@@ -51,7 +51,6 @@ from settings import (
     JITRL_PLANNER_RETRIES,
     JITRL_QWEN_ID,
     JITRL_REWARD_VERSION,
-    JITRL_TASK,
     JITRL_TEMPERATURE,
     JITRL_TERMINAL_SUCCESS_BONUS,
     JITRL_TOP_K,
@@ -425,6 +424,7 @@ def _evaluate_episode_chunks(
 
 def _run_episode(
     *,
+    task_spec: dict[str, Any],
     method: str,
     seed: int,
     episode_index: int,
@@ -439,7 +439,7 @@ def _run_episode(
     step_progress=None,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
-        JITRL_TASK, episode_index
+        task_spec, episode_index
     )
     episode_seed = int(seed) + episode_index
 
@@ -472,6 +472,7 @@ def _run_episode(
             high_level_step_index = low_level_chunk_index // low_level_chunks_per_plan
             high_level_replan = low_level_chunk_index % low_level_chunks_per_plan == 0
             progress = {
+                "task": task_spec["name"],
                 "method": method,
                 "seed": int(seed),
                 "episode_index": episode_index,
@@ -698,6 +699,7 @@ def _run_episode(
     _atomic_write_json(
         run_dir / "progress.json",
         {
+            "task": task_spec["name"],
             "method": method,
             "seed": int(seed),
             "episode_index": episode_index,
@@ -731,6 +733,7 @@ def summarize_run(
     episodes: Sequence[dict],
     memory_size: int,
     *,
+    task_spec: dict[str, Any],
     method: str,
     seed: int,
     run_dir: Path,
@@ -756,7 +759,7 @@ def summarize_run(
     return {
         "model": models,
         "models": models,
-        "task": {**JITRL_TASK, "descriptions": task_descriptions},
+        "task": {**task_spec, "descriptions": task_descriptions},
         "method": method,
         "seed": int(seed),
         "episodes": len(episodes),
@@ -789,19 +792,26 @@ def summarize_run(
 
 
 def run_jitrl_experiment(
+    task_spec: dict[str, Any],
     method: str,
     seed: int,
     episodes: int = JITRL_EPISODES,
     output_dir: Path = JITRL_OUTPUT_DIR,
 ) -> dict:
-    """Run one method/seed pairing from empty task-local memory and persist artifacts."""
+    """Run one task/method/seed pairing from an independent empty memory."""
 
     if method not in JITRL_METHODS:
         raise ValueError(f"method must be one of {JITRL_METHODS}; got {method!r}")
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
         raise ValueError("episodes must be a positive integer")
+    task_name = str(task_spec.get("name", "")).strip()
+    if not task_name:
+        raise ValueError("task_spec must contain a non-empty name")
+    for field in ("suite", "task_id", "max_steps"):
+        if field not in task_spec:
+            raise ValueError(f"task_spec must contain {field!r}")
 
-    run_dir = Path(output_dir) / method / f"seed_{int(seed)}"
+    run_dir = Path(output_dir) / task_name / method / f"seed_{int(seed)}"
     if run_dir.exists():
         shutil.rmtree(run_dir)
     video_dir = run_dir / "videos"
@@ -825,37 +835,45 @@ def run_jitrl_experiment(
     current_episode = None
     episode_progress = tqdm(
         total=episodes,
-        desc=f"{method} seed={seed} episodes",
+        desc=f"{task_name} {method} seed={seed} episodes",
         unit="ep",
         dynamic_ncols=True,
         position=1,
         leave=True,
     )
     try:
-        tqdm.write(f"[load] method={method} seed={seed}: loading Qwen planner")
+        tqdm.write(
+            f"[load] task={task_name} method={method} seed={seed}: "
+            "loading Qwen planner"
+        )
         planner_model, planner_processor = load_jitrl_planner()
         tqdm.write(
-            f"[load] method={method} seed={seed}: configuring "
+            f"[load] task={task_name} method={method} seed={seed}: configuring "
             f"{JITRL_EVALUATOR_MODEL} visual planner"
         )
         visual_planner = load_gemini_planner()
         if method == "jitrl":
             tqdm.write(
-                f"[load] method={method} seed={seed}: configuring "
-                f"{JITRL_EVALUATOR_MODEL} evaluator"
+                f"[load] task={task_name} method={method} seed={seed}: "
+                f"configuring {JITRL_EVALUATOR_MODEL} evaluator"
             )
             evaluator = load_gemini_evaluator()
-        tqdm.write(f"[load] method={method} seed={seed}: loading π₀.₅ policy")
+        tqdm.write(
+            f"[load] task={task_name} method={method} seed={seed}: "
+            "loading π₀.₅ policy"
+        )
         policy, preprocessor, postprocessor = load_policy()
-        tqdm.write(f"[ready] method={method} seed={seed}: models loaded")
+        tqdm.write(
+            f"[ready] task={task_name} method={method} seed={seed}: models loaded"
+        )
 
         for episode_index in range(episodes):
             current_episode = episode_index
-            max_steps = int(JITRL_TASK["max_steps"])
+            max_steps = int(task_spec["max_steps"])
             step_progress = tqdm(
                 total=max_steps,
                 desc=(
-                    f"{method} seed={seed} episode "
+                    f"{task_name} {method} seed={seed} episode "
                     f"{episode_index + 1}/{episodes} steps"
                 ),
                 unit="step",
@@ -870,6 +888,7 @@ def run_jitrl_experiment(
                     tensors,
                     evaluator_images,
                 ) = _run_episode(
+                    task_spec=task_spec,
                     method=method,
                     seed=int(seed),
                     episode_index=episode_index,
@@ -935,7 +954,7 @@ def run_jitrl_experiment(
                 refresh=True,
             )
             tqdm.write(
-                f"[episode] method={method} seed={seed} "
+                f"[episode] task={task_name} method={method} seed={seed} "
                 f"episode={episode_index + 1}/{episodes} "
                 f"result={'SUCCESS' if episode_result['success'] else 'FAIL'} "
                 f"steps={episode_result['steps']} "
@@ -950,6 +969,7 @@ def run_jitrl_experiment(
         _atomic_write_json(
             run_dir / "failure.json",
             {
+                "task": task_name,
                 "method": method,
                 "seed": int(seed),
                 "episode_index": current_episode,
@@ -974,6 +994,7 @@ def run_jitrl_experiment(
     summary = summarize_run(
         episode_results,
         memory_size,
+        task_spec=task_spec,
         method=method,
         seed=int(seed),
         run_dir=run_dir,
