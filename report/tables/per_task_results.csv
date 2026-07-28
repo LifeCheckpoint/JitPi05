@@ -1,0 +1,6 @@
+task,description,jitrl_successes,static_successes,jitrl_success_rate,static_success_rate,delta,jitrl_first_5,static_first_5,jitrl_final_10,static_final_10,jitrl_mean_success_steps,static_mean_success_steps,both_success,jitrl_only,static_only,neither_success,exact_mcnemar_p,jitrl_sequence,static_sequence
+libero_90_task19,put the moka pot on the stove,14,14,0.9333333333333333,0.9333333333333333,0.0,0.8,0.8,1.0,1.0,236.14285714285714,241.92857142857142,14,0,0,1,1.0,011111111111111,011111111111111
+libero_90_task27,put the wine bottle on the wine rack,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,,,0,0,0,15,1.0,000000000000000,000000000000000
+libero_90_task60,pick up the black bowl on the left and put it in the tray,13,14,0.8666666666666667,0.9333333333333333,-0.06666666666666665,0.8,1.0,0.9,0.9,113.76923076923077,116.92857142857143,13,0,1,1,1.0,101111111101111,111111111101111
+libero_90_task62,pick up the salad dressing and put it in the tray,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,,,0,0,0,15,1.0,000000000000000,000000000000000
+libero_90_task79,pick up the book and place it in the left compartment of the caddy,4,3,0.26666666666666666,0.2,0.06666666666666665,0.8,0.2,0.0,0.2,352,302,1,3,2,9,1.0,101110000000000,001000000010001

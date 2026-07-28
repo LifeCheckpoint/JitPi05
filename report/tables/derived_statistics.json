@@ -1,0 +1,233 @@
+{
+  "configuration": {
+    "requested_tasks": [
+      {
+        "name": "libero_90_task19",
+        "suite": "libero_90",
+        "task_id": 19,
+        "description": "put the moka pot on the stove",
+        "max_steps": 400,
+        "zero_shot": true
+      },
+      {
+        "name": "libero_90_task27",
+        "suite": "libero_90",
+        "task_id": 27,
+        "description": "put the wine bottle on the wine rack",
+        "max_steps": 400,
+        "zero_shot": true
+      },
+      {
+        "name": "libero_90_task60",
+        "suite": "libero_90",
+        "task_id": 60,
+        "description": "pick up the black bowl on the left and put it in the tray",
+        "max_steps": 400,
+        "zero_shot": true
+      },
+      {
+        "name": "libero_90_task62",
+        "suite": "libero_90",
+        "task_id": 62,
+        "description": "pick up the salad dressing and put it in the tray",
+        "max_steps": 400,
+        "zero_shot": true
+      },
+      {
+        "name": "libero_90_task79",
+        "suite": "libero_90",
+        "task_id": 79,
+        "description": "pick up the book and place it in the left compartment of the caddy",
+        "max_steps": 400,
+        "zero_shot": true
+      }
+    ],
+    "requested_methods": [
+      "jitrl",
+      "static"
+    ],
+    "requested_seeds": [
+      17
+    ],
+    "requested_episodes_per_run": 15,
+    "requested_runs": 10,
+    "requested_rollouts": 150,
+    "run_order": "task_then_method_then_seed",
+    "bootstrap_samples": 10000,
+    "bootstrap_confidence": 0.95
+  },
+  "per_task": [
+    {
+      "task": "libero_90_task19",
+      "task_label": "T19 Moka pot",
+      "description": "put the moka pot on the stove",
+      "jitrl": {
+        "success_count": 14,
+        "success_rate": 0.9333333333333333,
+        "first_5_success_rate": 0.8,
+        "final_10_success_rate": 1.0,
+        "mean_success_steps": 236.14285714285714,
+        "success_sequence": "011111111111111"
+      },
+      "static": {
+        "success_count": 14,
+        "success_rate": 0.9333333333333333,
+        "first_5_success_rate": 0.8,
+        "final_10_success_rate": 1.0,
+        "mean_success_steps": 241.92857142857142,
+        "success_sequence": "011111111111111"
+      },
+      "success_rate_delta": 0.0,
+      "paired": {
+        "both_success": 14,
+        "jitrl_only": 0,
+        "static_only": 0,
+        "neither_success": 1,
+        "exact_mcnemar_p": 1.0
+      }
+    },
+    {
+      "task": "libero_90_task27",
+      "task_label": "T27 Wine bottle",
+      "description": "put the wine bottle on the wine rack",
+      "jitrl": {
+        "success_count": 0,
+        "success_rate": 0.0,
+        "first_5_success_rate": 0.0,
+        "final_10_success_rate": 0.0,
+        "mean_success_steps": null,
+        "success_sequence": "000000000000000"
+      },
+      "static": {
+        "success_count": 0,
+        "success_rate": 0.0,
+        "first_5_success_rate": 0.0,
+        "final_10_success_rate": 0.0,
+        "mean_success_steps": null,
+        "success_sequence": "000000000000000"
+      },
+      "success_rate_delta": 0.0,
+      "paired": {
+        "both_success": 0,
+        "jitrl_only": 0,
+        "static_only": 0,
+        "neither_success": 15,
+        "exact_mcnemar_p": 1.0
+      }
+    },
+    {
+      "task": "libero_90_task60",
+      "task_label": "T60 Black bowl",
+      "description": "pick up the black bowl on the left and put it in the tray",
+      "jitrl": {
+        "success_count": 13,
+        "success_rate": 0.8666666666666667,
+        "first_5_success_rate": 0.8,
+        "final_10_success_rate": 0.9,
+        "mean_success_steps": 113.76923076923077,
+        "success_sequence": "101111111101111"
+      },
+      "static": {
+        "success_count": 14,
+        "success_rate": 0.9333333333333333,
+        "first_5_success_rate": 1.0,
+        "final_10_success_rate": 0.9,
+        "mean_success_steps": 116.92857142857143,
+        "success_sequence": "111111111101111"
+      },
+      "success_rate_delta": -0.06666666666666665,
+      "paired": {
+        "both_success": 13,
+        "jitrl_only": 0,
+        "static_only": 1,
+        "neither_success": 1,
+        "exact_mcnemar_p": 1.0
+      }
+    },
+    {
+      "task": "libero_90_task62",
+      "task_label": "T62 Salad dressing",
+      "description": "pick up the salad dressing and put it in the tray",
+      "jitrl": {
+        "success_count": 0,
+        "success_rate": 0.0,
+        "first_5_success_rate": 0.0,
+        "final_10_success_rate": 0.0,
+        "mean_success_steps": null,
+        "success_sequence": "000000000000000"
+      },
+      "static": {
+        "success_count": 0,
+        "success_rate": 0.0,
+        "first_5_success_rate": 0.0,
+        "final_10_success_rate": 0.0,
+        "mean_success_steps": null,
+        "success_sequence": "000000000000000"
+      },
+      "success_rate_delta": 0.0,
+      "paired": {
+        "both_success": 0,
+        "jitrl_only": 0,
+        "static_only": 0,
+        "neither_success": 15,
+        "exact_mcnemar_p": 1.0
+      }
+    },
+    {
+      "task": "libero_90_task79",
+      "task_label": "T79 Book",
+      "description": "pick up the book and place it in the left compartment of the caddy",
+      "jitrl": {
+        "success_count": 4,
+        "success_rate": 0.26666666666666666,
+        "first_5_success_rate": 0.8,
+        "final_10_success_rate": 0.0,
+        "mean_success_steps": 352,
+        "success_sequence": "101110000000000"
+      },
+      "static": {
+        "success_count": 3,
+        "success_rate": 0.2,
+        "first_5_success_rate": 0.2,
+        "final_10_success_rate": 0.2,
+        "mean_success_steps": 302,
+        "success_sequence": "001000000010001"
+      },
+      "success_rate_delta": 0.06666666666666665,
+      "paired": {
+        "both_success": 1,
+        "jitrl_only": 3,
+        "static_only": 2,
+        "neither_success": 9,
+        "exact_mcnemar_p": 1.0
+      }
+    }
+  ],
+  "aggregate": {
+    "episodes_per_method": 75,
+    "jitrl_success_count": 31,
+    "static_success_count": 31,
+    "jitrl_success_rate": 0.41333333333333333,
+    "static_success_rate": 0.41333333333333333,
+    "success_rate_delta": 0.0,
+    "jitrl_mean_success_steps": 199.7741935483871,
+    "static_mean_success_steps": 191.29032258064515,
+    "paired": {
+      "both_success": 28,
+      "jitrl_only": 3,
+      "static_only": 3,
+      "neither_success": 41,
+      "exact_mcnemar_p": 1.0
+    },
+    "task_macro_delta": 0.0,
+    "task_macro_delta_ci": [
+      -0.039999999999999994,
+      0.039999999999999994
+    ],
+    "final_10_task_macro_delta": -0.04,
+    "final_10_task_macro_delta_ci": [
+      -0.12000000000000002,
+      0.0
+    ]
+  }
+}
