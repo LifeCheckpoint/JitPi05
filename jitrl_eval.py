@@ -354,7 +354,7 @@ def _evaluate_episode_chunks(
     seed: int,
     episode_index: int,
 ) -> tuple[list[float], list[float]]:
-    """Assign signed visual step rewards and convert them to discounted returns."""
+    """Assign positive-only visual step rewards and discounted returns."""
 
     chunks = episode_result["chunks"]
     if len(chunks) != len(evaluator_images):
@@ -404,7 +404,10 @@ def _evaluate_episode_chunks(
         evaluation["attempts"] = attempt
         evaluation["next_state_summary"] = next_state_summary
         chunk["evaluator"] = evaluation
-        scores.append(int(evaluation["score"]))
+        score = int(evaluation["score"])
+        if not 0 <= score <= 3:
+            raise ValueError("positive-only evaluator score must be in [0, 3]")
+        scores.append(score)
 
     step_rewards = [score * JITRL_EVALUATOR_SCORE_SCALE for score in scores]
     if episode_result["success"] and step_rewards:

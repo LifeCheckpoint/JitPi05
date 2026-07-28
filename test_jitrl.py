@@ -24,6 +24,7 @@ from settings import (
     JITRL_OUTPUT_DIR,
     JITRL_PLANNER_RETRIES,
     JITRL_QWEN_ID,
+    JITRL_REWARD_VERSION,
     JITRL_TASKS,
 )
 
@@ -116,7 +117,7 @@ def test_ucb_known_optimistic_zero_and_empty_branches() -> None:
     assert empty["candidates"][0]["advantage"] == 0.0
 
 
-def test_evaluator_schema() -> None:
+def test_positive_only_evaluator_schema_and_parser() -> None:
     parsed = parse_evaluator_json(
         '{"result":"mug moved closer","usefulness":"useful",'
         '"certainty":"certain","score":2}'
@@ -124,6 +125,40 @@ def test_evaluator_schema() -> None:
     assert parsed["score"] == 2
     structured = ChunkEvaluation.model_validate(parsed)
     assert structured.score == 2
+    assert structured.normalized_usefulness() == "useful"
+
+    neutral = ChunkEvaluation(
+        result="no useful progress",
+        usefulness="neutral",
+        certainty="somewhat uncertain",
+        score=0,
+    )
+    assert neutral.normalized_usefulness() == "neutral"
+
+    for invalid in (
+        '{"result":"regressed","usefulness":"harmful",'
+        '"certainty":"certain","score":-1}',
+        '{"result":"no effect","usefulness":"useful",'
+        '"certainty":"certain","score":0}',
+    ):
+        try:
+            parse_evaluator_json(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("strict positive-only parser must reject invalid reward")
+
+    try:
+        ChunkEvaluation(
+            result="regressed",
+            usefulness="neutral",
+            certainty="certain",
+            score=-1,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("strict positive-only schema must reject negative scores")
 
 
 def test_gemini_structured_proposal_and_physical_support_prompt() -> None:
@@ -155,15 +190,10 @@ def test_gemini_structured_proposal_and_physical_support_prompt() -> None:
     )
     assert "supported by" in prompt
     assert "no longer held" in prompt
-    assert (
-        ChunkEvaluation(
-            result="failed placement",
-            usefulness="neutral",
-            certainty="somewhat uncertain",
-            score=-1,
-        ).normalized_usefulness()
-        == "harmful"
-    )
+    assert "STRICT POSITIVE-ONLY" in prompt
+    assert "must never be negative" in prompt
+    assert "wrong receptacle/region/compartment" in prompt
+    assert "assign score 0" in prompt
 
 
 def test_missing_candidate_text_is_retried_by_outer_planner_loop() -> None:
@@ -196,30 +226,32 @@ def test_five_candidate_selection_prompt_and_token_ids() -> None:
     assert candidate_token_ids(Tokenizer()) == [101, 102, 103, 104, 105]
 
 
-def test_five_task_experiment_configuration() -> None:
+def test_five_task_positive_only_experiment_configuration() -> None:
     assert JITRL_QWEN_ID == "Qwen/Qwen3.5-4B"
     assert JITRL_EPISODES == 15
     assert JITRL_HIGH_LEVEL_STEPS == 30
     assert JITRL_BETA == 0.40
-    assert [task["task_id"] for task in JITRL_TASKS] == [19, 27, 60, 62, 79]
+    assert [task["task_id"] for task in JITRL_TASKS] == [18, 53, 59, 69, 79]
     assert all(task["suite"] == "libero_90" for task in JITRL_TASKS)
     assert [task["name"] for task in JITRL_TASKS] == [
-        "libero_90_task19",
-        "libero_90_task27",
-        "libero_90_task60",
-        "libero_90_task62",
+        "libero_90_task18",
+        "libero_90_task53",
+        "libero_90_task59",
+        "libero_90_task69",
         "libero_90_task79",
     ]
     assert [task["description"] for task in JITRL_TASKS] == [
-        "put the moka pot on the stove",
-        "put the wine bottle on the wine rack",
-        "pick up the black bowl on the left and put it in the tray",
-        "pick up the salad dressing and put it in the tray",
+        "put the frying pan on the stove",
+        "pick up the orange juice and put it in the basket",
+        "pick up the tomato sauce and put it in the tray",
+        "put the chocolate pudding to the left of the plate",
         "pick up the book and place it in the left compartment of the caddy",
     ]
-    assert 65 not in {task["task_id"] for task in JITRL_TASKS}
+    assert JITRL_REWARD_VERSION == (
+        "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
+    )
     assert str(JITRL_OUTPUT_DIR) == (
-        "artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040"
+        "artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3"
     )
 
 
@@ -236,12 +268,12 @@ def test_high_to_low_planning_ratio() -> None:
 
 
 def test_task_resolution_and_run_paths_are_isolated() -> None:
-    selected = resolve_tasks(["libero_90_task79", "libero_90_task19"])
-    assert [task["task_id"] for task in selected] == [79, 19]
+    selected = resolve_tasks(["libero_90_task79", "libero_90_task18"])
+    assert [task["task_id"] for task in selected] == [79, 18]
     first = run_dir_for(Path("artifacts/test"), selected[0], "jitrl", 17)
     second = run_dir_for(Path("artifacts/test"), selected[1], "jitrl", 17)
     assert first == Path("artifacts/test/libero_90_task79/jitrl/seed_17")
-    assert second == Path("artifacts/test/libero_90_task19/jitrl/seed_17")
+    assert second == Path("artifacts/test/libero_90_task18/jitrl/seed_17")
     assert first != second
 
 
@@ -294,3 +326,41 @@ def test_multitask_summary_keeps_task_pairs_and_macro_average() -> None:
         summary["task_macro"]["paired_differences"]["success_rate"]["mean"]
         == 0.5
     )
+
+
+def test_zero_evaluator_score_rate() -> None:
+    metrics = compute_run_metrics(
+        [
+            {
+                "success": False,
+                "steps": 400,
+                "chunks": [
+                    {
+                        "value_estimate": {"candidates": [{}]},
+                        "logit_shifts": [0.0],
+                        "choice_changed": False,
+                        "augmentation_changed_choice": False,
+                        "candidates": [{"source": "generator"}],
+                        "selected_source": "generator",
+                        "evaluator_score": 0,
+                    },
+                    {
+                        "value_estimate": {"candidates": [{}]},
+                        "logit_shifts": [0.0],
+                        "choice_changed": False,
+                        "augmentation_changed_choice": False,
+                        "candidates": [{"source": "generator"}],
+                        "selected_source": "generator",
+                        "evaluator_score": 2,
+                    },
+                ],
+            }
+        ],
+        [],
+        task_spec=dict(JITRL_TASKS[0]),
+        method="jitrl",
+        seed=17,
+    )
+    assert metrics["negative_evaluator_score_rate"] == 0.0
+    assert metrics["zero_evaluator_score_rate"] == 0.5
+    assert metrics["positive_evaluator_score_rate"] == 0.5

@@ -10,7 +10,7 @@ PI05_TOKENIZER_ID = "nnh-pbbb/paligemma-3b-pt-224"
 
 OUTPUT_DIR = Path("artifacts")
 SIM_OUTPUT_DIR = OUTPUT_DIR / "sim_eval"
-JITRL_OUTPUT_DIR = OUTPUT_DIR / "jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040"
+JITRL_OUTPUT_DIR = OUTPUT_DIR / "jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3"
 MAX_PLAN_TOKENS = 20
 TOP_K = 5
 SEED = 7
@@ -42,39 +42,39 @@ JITRL_GEMINI_BASE_URL = "https://api.ikuncode.cc/v1beta/models"
 JITRL_GEMINI_CREDENTIALS_PATH = Path(".secrets/gemini.json")
 JITRL_GEMINI_TIMEOUT_SECONDS = 120.0
 JITRL_LOGIT_CALIBRATION = "mean_center_v1"
-JITRL_REWARD_VERSION = "gemini36flash_step_score_div3_terminal_plus1_v2"
+JITRL_REWARD_VERSION = "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
 JITRL_BOOTSTRAP_SAMPLES = 10_000
 JITRL_BOOTSTRAP_CONFIDENCE = 0.95
 JITRL_TASKS = (
     {
-        "name": "libero_90_task19",
+        "name": "libero_90_task18",
         "suite": "libero_90",
-        "task_id": 19,
-        "description": "put the moka pot on the stove",
+        "task_id": 18,
+        "description": "put the frying pan on the stove",
         "max_steps": 400,
         "zero_shot": True,
     },
     {
-        "name": "libero_90_task27",
+        "name": "libero_90_task53",
         "suite": "libero_90",
-        "task_id": 27,
-        "description": "put the wine bottle on the wine rack",
+        "task_id": 53,
+        "description": "pick up the orange juice and put it in the basket",
         "max_steps": 400,
         "zero_shot": True,
     },
     {
-        "name": "libero_90_task60",
+        "name": "libero_90_task59",
         "suite": "libero_90",
-        "task_id": 60,
-        "description": "pick up the black bowl on the left and put it in the tray",
+        "task_id": 59,
+        "description": "pick up the tomato sauce and put it in the tray",
         "max_steps": 400,
         "zero_shot": True,
     },
     {
-        "name": "libero_90_task62",
+        "name": "libero_90_task69",
         "suite": "libero_90",
-        "task_id": 62,
-        "description": "pick up the salad dressing and put it in the tray",
+        "task_id": 69,
+        "description": "put the chocolate pudding to the left of the plate",
         "max_steps": 400,
         "zero_shot": True,
     },

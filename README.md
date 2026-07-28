@@ -51,13 +51,13 @@ JitRL memory 只包含同一 task、先前已结束 episode 的高层决策记�
 - unseen action 使用论文随机规则：以 `lambda=0.05` 令 `Q=V+alpha/|N|`，其中 `alpha=5`；否则令 `Q=0`。空 memory 时不除零，所有 action 保持 `Q=V=A=0`。
 - 在完整 augmented candidate set 内按 advantage 最大绝对值归一化；全为 0 时归一化 advantage 仍全为 0。
 
-更新使用 `z' = z + beta * A`，其中 `beta=0.40`，基础与更新分布都使用 `temperature=0.8`。相较上一轮的 0.25，此处适度提高 memory advantage 的调制力度。同一个 `[0, 1)` uniform 同时产生原始五候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。
+更新使用 `z' = z + beta * A`，其中 `beta=0.40`，基础与更新分布都使用 `temperature=0.8`。同一个 `[0, 1)` uniform 同时产生原始五候选、augmented base 和 JitRL updated 三种 counterfactual choice，便于拆分候选增广与 advantage 调制的影响。需要注意：evaluator reward 已改为非负，但相对 advantage 仍可为负；当某动作的 `Q(s,a)<V(s)` 时，其 logit 仍会被压低。
 
 `static` 基线执行完全相同的 Gemini 双相机候选生成、本地 Qwen 候选打分、temperature、uniform 采样和 π₀.₅ 流程，但 advantage 恒为 0，并且不读取或写入 memory。
 
-### 逐步 VLM 奖励、记忆生命周期与随机配对
+### 正奖励-only VLM evaluator、记忆生命周期与随机配对
 
-JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动作前后的外部/腕部双相机关键帧、动作前状态摘要、subtask、下一状态摘要和最终环境成功标记，通过 Pydantic schema 输出 `-3..+3` 的 usefulness score。每次 API/结构化输出失败会自动重试最多 3 次。prompt 额外要求：place/release/drop 只有在正确物体已脱离夹爪、由目标容器或表面真实支撑并稳定释放时才能给正分；仅有二维重叠、悬空或错误物体靠近目标不得算成功。局部 reward 为 `score/3`；环境成功时最后一个 chunk 再额外加 `+1`，然后按 `gamma=0.95` 计算 signed reward-to-go。Static 不执行 evaluator，避免无意义的额外 API 调用。
+JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动作前后的外部/腕部双相机关键帧、动作前状态摘要、subtask、下一状态摘要和最终环境成功标记。当前 Pydantic schema 严格限制 `score∈[0,3]`：只有视觉上明确、有益且与总体任务相关的进展可得 `1..3`；错误对象、错误目标、回退、重复、无效果、视觉不确定或无法确认的动作全部记为 `0`，不再允许负奖励。`score>0` 必须对应 `usefulness=useful`，`score=0` 必须对应 `usefulness=neutral`，不一致输出会触发最多 3 次 evaluator 重试。place/release/drop 只有在正确物体已脱离夹爪、由明确指定的容器、表面、方向区域或 compartment 真实支撑并稳定释放时才能给正分；二维重叠、悬空、错误物体或错误 compartment 一律为 0。局部 reward 为 `score/3`；失败 episode 不增加 terminal penalty，环境成功时最后一个 chunk 额外加 `+1`，随后按 `gamma=0.95` 计算非负 reward-to-go。Static 不执行 evaluator，避免无意义的额外 API 调用。
 
 为避免同一 episode 内的信息泄漏，rollout 期间 memory 只读，episode 结束并完成逐步评价后才批量写入全部高层决策。
 
@@ -71,17 +71,19 @@ JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动
 
 Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`；API collection URL、模型名和超时配置位于 [`settings.py`](settings.py)。不要把密钥写入 README、命令行参数或提交记录。
 
-当前实验固定 seed 17，并从 LIBERO-90 中选择 5 个操纵物体互不重复的单物体放置任务：
+当前实验固定 seed 17。根据上一轮的成功率上限/下限结果，保留中等难度的 task 79，并将过易的 task 19/60 与过难的 task 27/62 替换为四个结构上更可能位于中间成功区间的任务：
 
-| task ID | 准确任务描述 | 主要物体 |
+| task ID | 准确任务描述 | 主要难点 |
 |---:|---|---|
-| 19 | `put the moka pot on the stove` | moka pot |
-| 27 | `put the wine bottle on the wine rack` | wine bottle |
-| 60 | `pick up the black bowl on the left and put it in the tray` | black bowl |
-| 62 | `pick up the salad dressing and put it in the tray` | salad dressing |
-| 79 | `pick up the book and place it in the left compartment of the caddy` | book |
+| 18 | `put the frying pan on the stove` | 非对称长柄物体抓取，开放 stove 目标 |
+| 53 | `pick up the orange juice and put it in the basket` | 多包装物干扰，纸盒抓取与宽容 basket |
+| 59 | `pick up the tomato sauce and put it in the tray` | 拥挤场景对象消歧，宽容 tray |
+| 69 | `put the chocolate pudding to the left of the plate` | 开放空间关系与左右方向理解 |
+| 79 | `pick up the book and place it in the left compartment of the caddy` | 细粒度 compartment 对准与稳定释放 |
 
-已知成功率过低的 task 65 不进入本轮面板。实验规模为 `5 tasks × 2 methods × 15 episodes × 1 seed = 150 rollouts`，共 10 条独立 run。默认循环顺序为 task 19→27→60→62→79，并在每个任务内部依次运行 JitRL→Static；每个 task/method run 使用独立目录，其中 JitRL 从新的空 memory 冷启动。旧 task79、task65 产物不会被覆盖；新产物根目录为 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/`。
+实验规模仍为 `5 tasks × 2 methods × 15 episodes × 1 seed = 150 rollouts`，共 10 条独立 run。默认循环顺序为 task 18→53→59→69→79，并在每个任务内部依次运行 JitRL→Static；每个 task/method run 使用独立目录，其中 JitRL 从新的空 memory 冷启动。新产物根目录为 `artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3/`。
+
+上一轮 task 19/27/60/62/79 的 signed-reward 结果仍保留在 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/`，完整分析见 [`experiment_report.md`](report/experiment_report.md)；新一轮不会覆盖旧 artifact 或报告。
 
 ```bash
 # 安装锁定依赖（包括 bitsandbytes 与 flash-linear-attention）
@@ -91,10 +93,10 @@ uv sync
 MUJOCO_GL=egl uv run eval_jitrl.py
 
 # 分片运行一个 task/method/seed
-MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task19 --method jitrl --seed 17
+MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task18 --method jitrl --seed 17
 
 # 单 episode API/rollout smoke test
-MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task19 --method jitrl --seed 17 --episodes 1
+MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task18 --method jitrl --seed 17 --episodes 1
 
 # 不加载模型，只从已有 episodes.json 与 memory.json 重算并汇总
 uv run eval_jitrl.py --summarize-only
@@ -106,7 +108,7 @@ uv run eval_jitrl.py --summarize-only
 
 ### 产物与统计口径
 
-当前每条 run 写入 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/<task>/<method>/seed_<seed>/`：
+当前每条 run 写入 `artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3/<task>/<method>/seed_<seed>/`：
 
 - `videos/`：全部 episode 视频。
 - `episodes.json`：逐 episode 结果、完整高层 trace 及其覆盖的低层 chunk 索引。
@@ -116,9 +118,9 @@ uv run eval_jitrl.py --summarize-only
 - `metrics.json`：该 method/seed 的统计指标。
 - `progress.json`：当前 episode、低层 chunk、高层决策、环境步和完成状态；用于在另一个终端直接查看最新进度。
 
-根目录 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/summary.json` 汇总全部 run。`tasks.<task_name>` 保留每个任务的 JitRL/Static 指标及相同 seed 的配对差值，`task_macro` 报告 5 个任务上的描述性 macro 均值。高层 trace 保存 Gemini proposal 的 backend/model/prompt/结构化原始输出、本地 Qwen raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 Gemini evaluator 的 prompt、结构化原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits，也不会保存 API key。
+根目录 `artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3/summary.json` 汇总全部 run。`tasks.<task_name>` 保留每个任务的 JitRL/Static 指标及相同 seed 的配对差值，`task_macro` 报告 5 个任务上的描述性 macro 均值。高层 trace 保存 Gemini proposal 的 backend/model/prompt/结构化原始输出、本地 Qwen raw/centered/augmented/updated logits、候选来源、UCB uniform 与分支、`V/Q/A`、三种 counterfactual choice、memory-only 选择信息，以及 Gemini evaluator 的 prompt、结构化原始输出、分数、certainty、局部 reward 和 discounted return；仍不保存完整词表 logits，也不会保存 API key。
 
-每个 task/method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、候选增广/advantage 选择变化率、UCB 比例、memory-only 候选与选择率、evaluator 分布、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。任务内部仍保留 seed-level mean、sample std 和 bootstrap 字段；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
+每个 task/method/seed run 分别报告 overall success rate、final-10 success rate、长度为 10 的 moving success rate、成功 episode 的平均步数，以及候选覆盖率、非零 advantage 比例、候选增广/advantage 选择变化率、UCB 比例、memory-only 候选与选择率、evaluator 正分/零分比例、平均绝对 logit shift、平均邻居数和 memory size 等辅助指标。`negative_evaluator_score_rate` 仅为兼容旧 signed-reward artifact 而保留；在新实验中应恒为 0。任务内部仍保留 seed-level mean、sample std 和 bootstrap 字段；默认只有一个 seed 时 sample std 为 0，bootstrap 区间退化为该单个观测值。
 
 统计解释必须保守：每个 task/method 默认只有 1 个 seed，不能进行跨 seed 稳健性判断；同一 JitRL run 内的 15 个 episode 通过在线 memory 顺序相关，也不能当作 15 个独立样本。5 个任务是按物体与结构有意筛选而非从 LIBERO-90 随机抽样，因此 task-macro 均值和 task-level bootstrap 区间只描述当前面板，不构成整个 suite 的总体推断。
 

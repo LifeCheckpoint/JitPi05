@@ -36,6 +36,7 @@ SCALAR_METRICS = (
     "memory_only_selection_rate",
     "mean_evaluator_score",
     "negative_evaluator_score_rate",
+    "zero_evaluator_score_rate",
     "positive_evaluator_score_rate",
     "mean_absolute_logit_shift",
     "mean_neighbor_count",
@@ -182,8 +183,12 @@ def compute_run_metrics(
         "mean_evaluator_score": (
             float(np.mean(evaluator_scores)) if evaluator_scores else None
         ),
+        # Retained for backward-compatible summaries of signed-reward artifacts.
         "negative_evaluator_score_rate": _rate(
             sum(score < 0 for score in evaluator_scores), len(evaluator_scores)
+        ),
+        "zero_evaluator_score_rate": _rate(
+            sum(score == 0 for score in evaluator_scores), len(evaluator_scores)
         ),
         "positive_evaluator_score_rate": _rate(
             sum(score > 0 for score in evaluator_scores), len(evaluator_scores)

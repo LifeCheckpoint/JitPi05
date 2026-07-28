@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from PIL import Image
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
@@ -68,21 +68,26 @@ class VisualProposal(BaseModel):
 
 
 class ChunkEvaluation(BaseModel):
-    """Structured, schema-validated reward record returned by Gemini."""
+    """Structured, schema-validated positive-only reward from Gemini."""
 
     model_config = ConfigDict(extra="ignore")
 
     result: str = Field(min_length=1)
-    usefulness: Literal["useful", "harmful", "neutral"]
+    usefulness: Literal["useful", "neutral"]
     certainty: Literal["certain", "somewhat uncertain", "very uncertain"]
-    score: int = Field(ge=-3, le=3)
+    score: int = Field(ge=0, le=3)
 
-    def normalized_usefulness(self) -> Literal["useful", "harmful", "neutral"]:
-        if self.score > 0:
-            return "useful"
-        if self.score < 0:
-            return "harmful"
-        return "neutral"
+    @model_validator(mode="after")
+    def validate_positive_only_consistency(self) -> "ChunkEvaluation":
+        expected = "useful" if self.score > 0 else "neutral"
+        if self.usefulness != expected:
+            raise ValueError(
+                f"usefulness must be {expected!r} when score is {self.score}"
+            )
+        return self
+
+    def normalized_usefulness(self) -> Literal["useful", "neutral"]:
+        return "useful" if self.score > 0 else "neutral"
 
 
 def load_gemini_api_key(path: Path = JITRL_GEMINI_CREDENTIALS_PATH) -> str:
@@ -240,7 +245,7 @@ def evaluator_prompt(
     chunk_count: int,
     attempt: int = 1,
 ) -> str:
-    """Build the evaluator prompt with explicit physical-support safeguards."""
+    """Build the strict positive-only evaluator prompt with physical safeguards."""
 
     retry = (
         ""
@@ -261,19 +266,23 @@ def evaluator_prompt(
         f"State after: {next_state_summary}\n"
         f"Environment task success at episode end: {str(bool(success)).lower()}\n"
         f"{retry}"
-        "Judge only the action's actual visual effect in the full task context. Useful "
-        "progress gets a positive integer, harmful/regressive/repeated ineffective "
-        "behavior gets a negative integer, and genuinely indeterminate/no-effect "
-        "behavior gets zero. Use the full -3..+3 scale. Do not assign credit merely "
-        "because the complete episode eventually succeeded.\n"
+        "Judge only the action's actual visual effect in the full task context. This is "
+        "a STRICT POSITIVE-ONLY evaluator: score must be an integer from 0 to 3 and must "
+        "never be negative. Assign 1, 2, or 3 only for visually clear, task-relevant "
+        "progress of increasing significance. Assign 0 to every harmful, regressive, "
+        "wrong-object, wrong-target, repeated, ineffective, no-effect, ambiguous, or "
+        "uncertain action. usefulness must be 'useful' exactly when score is positive "
+        "and 'neutral' exactly when score is zero. Do not assign credit merely because "
+        "the complete episode eventually succeeded.\n"
         "For placement/release/drop actions, distinguish 2D overlap or proximity from "
-        "physical completion. A positive placement score requires visual evidence that "
-        "the correct target object is no longer held by the gripper, is supported by "
-        "the requested receptacle/surface rather than hovering above it, and is stable "
-        "after release. If the gripper is still holding it, it moves with the gripper, "
-        "support/contact is ambiguous, or the wrong object is near the target, score "
-        "zero or negative and lower certainty. The final environment success flag is "
-        "context, not proof that this individual chunk deserves positive credit."
+        "physical completion. A positive placement score requires clear visual evidence "
+        "that the correct target object is no longer held by the gripper, is supported "
+        "by the specifically requested receptacle, surface, side, region, or compartment "
+        "rather than hovering above it, and is stable after release. If the gripper is "
+        "still holding it, it moves with the gripper, support/contact is ambiguous, the "
+        "object is in the wrong receptacle/region/compartment, or the wrong object is near "
+        "the target, assign score 0. The final environment success flag is context, not "
+        "proof that this individual chunk deserves positive credit."
     )
 
 

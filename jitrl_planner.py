@@ -177,11 +177,16 @@ def parse_evaluator_json(text: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError("evaluator JSON root must be an object")
     score = value.get("score")
-    if isinstance(score, bool) or not isinstance(score, int) or not -3 <= score <= 3:
-        raise ValueError("evaluator score must be an integer in [-3, 3]")
+    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 3:
+        raise ValueError("evaluator score must be an integer in [0, 3]")
     usefulness = value.get("usefulness")
-    if usefulness not in {"useful", "harmful", "neutral"}:
-        raise ValueError("evaluator usefulness must be useful, harmful, or neutral")
+    if usefulness not in {"useful", "neutral"}:
+        raise ValueError("evaluator usefulness must be useful or neutral")
+    expected_usefulness = "useful" if score > 0 else "neutral"
+    if usefulness != expected_usefulness:
+        raise ValueError(
+            f"evaluator usefulness must be {expected_usefulness!r} when score is {score}"
+        )
     certainty = value.get("certainty")
     if certainty not in {"certain", "somewhat uncertain", "very uncertain"}:
         raise ValueError("evaluator certainty is invalid")
