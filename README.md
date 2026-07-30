@@ -8,24 +8,36 @@
 - **四组对照**：原始任务、人工 subtask、Qwen subtask、调制后的 Qwen subtask。
 - **JitRL 第一阶段**：Gemini 3.6 Flash 负责无需 logits 的多模态状态理解、五候选生成和逐步评价；本地 Qwen3.5-4B 只负责五个候选编号的真实 logits，再以任务内在线记忆估计 advantage 并调制。
 
-代码只按研究逻辑拆成几个平铺模块，没有配置框架、服务层或实验管理系统：
+代码采用可安装的 `src/jitpi05` 包结构：
 
-- [`settings.py`](settings.py)：模型、数据集和实验常量。
-- [`data.py`](data.py)：单个 LIBERO episode 的读取与图像转换。
-- [`planner.py`](planner.py)：Qwen3.5 高层规划、逐 token logits 记录与调制。
-- [`pi05_pipeline.py`](pi05_pipeline.py)：显式 π₀.₅ 流水线、四组对照和动作指标。
-- [`main.py`](main.py)：单帧离线实验入口。
-- [`sim_eval.py`](sim_eval.py)：固定初始状态、闭环 action chunk、成功判定、视频和评测产物。
-- [`eval_sim.py`](eval_sim.py)：独立仿真评测入口。
-- [`jitrl_memory.py`](jitrl_memory.py)：第一阶段任务内经验记忆、Jaccard 检索与回报估计。
-- [`gemini_vlm.py`](gemini_vlm.py)：通过 PydanticAI 调用 Gemini 3.6 Flash，完成双相机候选生成和四帧逐步 evaluator。
-- [`jitrl_planner.py`](jitrl_planner.py)：本地 Qwen 候选编号 logits 读取及配对 JitRL 更新；保留旧的全本地兼容路径。
-- [`jitrl_eval.py`](jitrl_eval.py)：单个 task/method/seed 的在线 rollout、独立记忆生命周期与产物持久化。
-- [`eval_jitrl.py`](eval_jitrl.py)：JitRL 多任务命令行入口、任务级配对指标及跨任务描述性汇总。
+- [`config.py`](src/jitpi05/config.py)：模型、数据集和实验常量。
+- [`datasets.py`](src/jitpi05/datasets.py)：LIBERO episode 读取与图像转换。
+- [`planning.py`](src/jitpi05/planning.py)：Qwen3.5 高层规划与 logits 调制。
+- [`policy.py`](src/jitpi05/policy.py)：显式 π₀.₅ 流水线与动作指标。
+- [`simulation.py`](src/jitpi05/simulation.py)：LIBERO 环境与闭环 rollout。
+- [`jitrl/`](src/jitpi05/jitrl)：记忆、Gemini VLM、规划、rollout 与统计。
+- [`cli/`](src/jitpi05/cli)：离线、仿真和 JitRL 命令行入口。
+
+支持平台为 Ubuntu 24.04/Linux NVIDIA CUDA。Windows 用户先运行
+`powershell -ExecutionPolicy Bypass -File scripts/setup_wsl.ps1 -LinuxUser <name>`，
+首次启动 Ubuntu
+并把仓库 clone 到 `~/projects` 后，再运行 `bash scripts/bootstrap_ubuntu.sh`。
+不要从 `/mnt/c` 或 `/mnt/d` 运行大模型实验。
+
+```bash
+# 默认安装完整 CUDA 运行环境
+uv sync --frozen
+uv run jitpi05-doctor
+
+# 开发检查与报告工具按需安装
+uv sync --group dev
+uv run --group dev pytest -m "not gpu"
+uv run --group report jitpi05-report --profile positive-reward
+```
 
 ## JitRL 在线记忆实验
 
-这是一个与原有 [`main.py`](main.py) 和 [`eval_sim.py`](eval_sim.py) 分离的在线闭环入口；两者保持原来的单帧离线与四条件闭环语义。当前版本在第一阶段候选级 logit 原型上恢复论文式 augmented candidate、随机 UCB unseen 探索和逐步 VLM evaluator，用于研究 JitRL 在 VLM-VLA 分层控制中的适用性。
+这是一个与原有 `jitpi05-offline` 和 `jitpi05-eval-sim` 分离的在线闭环入口；两者保持原来的单帧离线与四条件闭环语义。当前版本在第一阶段候选级 logit 原型上恢复论文式 augmented candidate、随机 UCB unseen 探索和逐步 VLM evaluator，用于研究 JitRL 在 VLM-VLA 分层控制中的适用性。
 
 ### 高层决策映射与候选 logits
 
@@ -69,7 +81,7 @@ JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 顺序逐个读取动
 
 运行环境要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。JitRL 入口让 4-bit NF4 的本地 Qwen3.5-4B（仅计算候选 logits）与 bf16 的 π₀.₅ 同时驻留显存；Gemini 通过网络 API 提供更强的多模态候选生成和 evaluator。`bitsandbytes`、`flash-linear-attention` 与 `pydantic-ai` 依赖由 `uv sync` 安装。当前 WSL2、CUDA 13、PyTorch 2.11 环境中，`causal-conv1d` CUDA kernel 会触发 segmentation fault，因此未保留该依赖；Qwen 仍使用已安装的 FLA kernels，但 causal conv 部分回退到 Transformers 的 PyTorch 实现。4B 相比上一轮 9B 显著降低了显存与候选打分开销，但本地 Qwen 和 π₀.₅ 仍会同时驻留显存，运行时不要并发占用 GPU。
 
-Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`；API collection URL、模型名和超时配置位于 [`settings.py`](settings.py)。不要把密钥写入 README、命令行参数或提交记录。
+Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`；也可通过 `JITPI05_GEMINI_CREDENTIALS` 指定其他路径。API collection URL、模型名和超时配置位于 [`config.py`](src/jitpi05/config.py)。不要把密钥写入 README、命令行参数或提交记录。
 
 当前实验固定 seed 17。根据上一轮的成功率上限/下限结果，保留中等难度的 task 79，并将过易的 task 19/60 与过难的 task 27/62 替换为四个结构上更可能位于中间成功区间的任务：
 
@@ -83,23 +95,23 @@ Gemini 凭据存放于被 Git 忽略的 `.secrets/gemini.json`，格式为 `{"ap
 
 实验规模仍为 `5 tasks × 2 methods × 15 episodes × 1 seed = 150 rollouts`，共 10 条独立 run。默认循环顺序为 task 18→53→59→69→79，并在每个任务内部依次运行 JitRL→Static；每个 task/method run 使用独立目录，其中 JitRL 从新的空 memory 冷启动。新产物根目录为 `artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_positive_v3/`。
 
-上一轮 task 19/27/60/62/79 的 signed-reward 结果仍保留在 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/`，完整分析见 [`experiment_report.md`](report/experiment_report.md)；新一轮不会覆盖旧 artifact 或报告。
+上一轮 task 19/27/60/62/79 的 signed-reward 结果仍保留在 `artifacts/jitrl_eval_libero90_5tasks_seed17_qwen4b_beta040/`，完整分析见 [`report.md`](reports/signed_reward/report.md)；新一轮不会覆盖旧 artifact 或报告。
 
 ```bash
 # 安装锁定依赖（包括 bitsandbytes 与 flash-linear-attention）
 uv sync
 
 # 默认全量：5 个任务；每个任务内先 JitRL，再 Static
-MUJOCO_GL=egl uv run eval_jitrl.py
+MUJOCO_GL=egl uv run jitpi05-eval-jitrl
 
 # 分片运行一个 task/method/seed
-MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task18 --method jitrl --seed 17
+MUJOCO_GL=egl uv run jitpi05-eval-jitrl --task libero_90_task18 --method jitrl --seed 17
 
 # 单 episode API/rollout smoke test
-MUJOCO_GL=egl uv run eval_jitrl.py --task libero_90_task18 --method jitrl --seed 17 --episodes 1
+MUJOCO_GL=egl uv run jitpi05-eval-jitrl --task libero_90_task18 --method jitrl --seed 17 --episodes 1
 
 # 不加载模型，只从已有 episodes.json 与 memory.json 重算并汇总
-uv run eval_jitrl.py --summarize-only
+uv run jitpi05-eval-jitrl --summarize-only
 ```
 
 `--summarize-only` 可与 `--task`、`--method`、`--seed`、`--output-dir` 组合；`--task`、`--method` 和 `--seed` 均可重复指定，以运行或汇总选定分片。
@@ -134,7 +146,7 @@ uv run eval_jitrl.py --summarize-only
 
 ```bash
 uv sync
-uv run main.py
+uv run jitpi05-offline
 ```
 
 第一次运行会下载：
@@ -150,11 +162,11 @@ uv run main.py
 
 ### 高层 prompt
 
-修改 [`planning_prompt()`](planner.py:13)。当前要求 Qwen 只输出一个立即执行的英文动词短语，并关闭 thinking。
+修改 [`planning_prompt()`](src/jitpi05/planning.py)。当前要求 Qwen 只输出一个立即执行的英文动词短语，并关闭 thinking。
 
 ### logits 调制
 
-修改 [`make_phrase_bias()`](planner.py:78)，或者直接向 [`generate_subtask()`](planner.py:105) 传入自己的回调：
+修改 [`make_phrase_bias()`](src/jitpi05/planning.py)，或者直接向 `generate_subtask()` 传入自己的回调：
 
 ```python
 def modifier(step, input_ids, logits):
@@ -172,7 +184,7 @@ def modifier(step, input_ids, logits):
 
 ### π₀.₅ 显式流水线
 
-[`explicit_pi05_flow()`](pi05_pipeline.py:67) 没有调用 `select_action()` 或黑盒 `predict_action_chunk()`，而是显式执行：
+[`explicit_pi05_flow()`](src/jitpi05/policy.py) 没有调用 `select_action()` 或黑盒 `predict_action_chunk()`，而是显式执行：
 
 1. LeRobot preprocessor：批维、数据集统计归一化、状态离散化、PaliGemma tokenization、搬到 CUDA。
 2. π₀.₅ 图像预处理与 VLM prefix embedding。
@@ -214,7 +226,7 @@ def modifier(step, input_ids, logits):
 闭环入口只支持 Linux。无桌面服务器建议使用 EGL：
 
 ```bash
-MUJOCO_GL=egl uv run eval_sim.py
+MUJOCO_GL=egl uv run jitpi05-eval-sim
 ```
 
 第一次导入 LIBERO 时，上游包会询问数据目录；直接选择默认路径即可。评测模型为当前 LeRobot 0.6 / Transformers 5 兼容的 `lerobot/pi05-libero`，与离线分析使用的 base checkpoint 分开配置。
@@ -233,15 +245,15 @@ MUJOCO_GL=egl uv run eval_sim.py
 - `rollouts.pt`：每次预测的完整 action chunk、实际执行动作和 reward。
 - `videos/<task>/<condition>/episode_<id>.mp4`：逐条件 rollout 视频。
 
-完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](settings.py:17)、[`SIM_ACTION_STEPS`](settings.py:18) 和 [`SIM_TASKS`](settings.py:40) 缩小实验。JitRL 第二轮不使用该原有四条件入口。
+完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](src/jitpi05/config.py)、`SIM_ACTION_STEPS` 和 `SIM_TASKS` 缩小实验。JitRL 第二轮不使用该原有四条件入口。
 
 ## 解释限制
 
-[`main.py`](main.py) 仍是**单帧离线 sanity check**，用于回答：
+`jitpi05-offline` 仍是**单帧离线 sanity check**，用于回答：
 
 - Qwen 是否能输出可读的高层动作？
 - logits 调制是否真的改变 token 分布和最终 subtask？
 - 高层文本变化是否传导到 π₀.₅ 的低层动作？
 - π₀.₅ 输出是否有限、尺度是否正常、是否与示范动作处在相近范围？
 
-示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 [`eval_sim.py`](eval_sim.py) 或 [`eval_jitrl.py`](eval_jitrl.py) 的 LIBERO rollout 为准。原有 task 79 结果是单任务诊断探针；新的 5-task JitRL 面板扩大了任务覆盖，但任务经过有意筛选且只有一个 seed，仍不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。
+示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 `jitpi05-eval-sim` 或 `jitpi05-eval-jitrl` 的 LIBERO rollout 为准。原有 task 79 结果是单任务诊断探针；新的 5-task JitRL 面板扩大了任务覆盖，但任务经过有意筛选且只有一个 seed，仍不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。
