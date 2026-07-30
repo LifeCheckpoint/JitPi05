@@ -41,9 +41,10 @@ if ($LinuxUser) {
             throw "Failed to add Linux user '$LinuxUser' to the sudo group."
         }
 
-        $wslConfig = "[user]`ndefault=$LinuxUser`n"
-        $wslConfig | wsl.exe -d Ubuntu-24.04 -u root -- tee /etc/wsl.conf 2>$null |
-            Out-Null
+        # Write inside Linux so Windows PowerShell cannot encode redirected
+        # text as UTF-16. LinuxUser is constrained by ValidatePattern above.
+        $configureDefaultUser = "printf '[user]\ndefault=$LinuxUser\n' > /etc/wsl.conf"
+        wsl.exe -d Ubuntu-24.04 -u root -- sh -c $configureDefaultUser 2>$null
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to configure '$LinuxUser' as the default WSL user."
         }
