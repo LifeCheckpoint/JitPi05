@@ -1,6 +1,0 @@
-task,description,jitrl_successes,static_successes,jitrl_success_rate,static_success_rate,delta,jitrl_first_5,static_first_5,jitrl_final_10,static_final_10,jitrl_mean_success_steps,static_mean_success_steps,both_success,jitrl_only,static_only,neither_success,exact_mcnemar_p,jitrl_sequence,static_sequence
-libero_90_task18,put the frying pan on the stove,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,,,0,0,0,15,1.0,000000000000000,000000000000000
-libero_90_task53,pick up the orange juice and put it in the basket,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,,,0,0,0,15,1.0,000000000000000,000000000000000
-libero_90_task59,pick up the tomato sauce and put it in the tray,9,4,0.6,0.26666666666666666,0.3333333333333333,0.8,0.6,0.5,0.1,308.8888888888889,265.5,3,6,1,5,0.125,101110010011110,111000000001000
-libero_90_task69,put the chocolate pudding to the left of the plate,0,0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,,,0,0,0,15,1.0,000000000000000,000000000000000
-libero_90_task79,pick up the book and place it in the left compartment of the caddy,1,2,0.06666666666666667,0.13333333333333333,-0.06666666666666667,0.2,0.2,0.0,0.1,370,365,0,1,2,12,1.0,100000000000000,000010000000010
