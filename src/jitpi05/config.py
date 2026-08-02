@@ -12,7 +12,7 @@ OUTPUT_DIR = artifact_root()
 SIM_OUTPUT_DIR = OUTPUT_DIR / "sim_eval"
 JITRL_OUTPUT_DIR = (
     OUTPUT_DIR
-    / "jitrl_eval_libero90_mid5_seed17_qwen4b_workspace_v2_no_stop_diagnostic"
+    / "jitrl_eval_libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic"
 )
 MAX_PLAN_TOKENS = 20
 TOP_K = 5
@@ -22,7 +22,7 @@ SIM_ACTION_STEPS = 10
 
 JITRL_METHODS = ("jitrl", "static")
 JITRL_SEEDS = (17,)
-JITRL_EPISODES = 15
+JITRL_EPISODES = 10
 JITRL_HIGH_LEVEL_STEPS = 30
 JITRL_PLANNER_RETRIES = 7
 JITRL_EVALUATOR_RETRIES = 3
@@ -48,49 +48,110 @@ JITRL_LOGIT_CALIBRATION = "raw_qwen_fixed_workspace_v1"
 JITRL_REWARD_VERSION = "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
 JITRL_BOOTSTRAP_SAMPLES = 10_000
 JITRL_BOOTSTRAP_CONFIDENCE = 0.95
-JITRL_TASKS = (
-    {
-        "name": "libero_90_task18",
-        "suite": "libero_90",
-        "task_id": 18,
-        "description": "put the frying pan on the stove",
-        "max_steps": 400,
-        "zero_shot": True,
-    },
-    {
-        "name": "libero_90_task53",
-        "suite": "libero_90",
-        "task_id": 53,
-        "description": "pick up the orange juice and put it in the basket",
-        "max_steps": 400,
-        "zero_shot": True,
-    },
-    {
-        "name": "libero_90_task59",
-        "suite": "libero_90",
-        "task_id": 59,
-        "description": "pick up the tomato sauce and put it in the tray",
-        "max_steps": 400,
-        "zero_shot": True,
-    },
-    {
-        "name": "libero_90_task69",
-        "suite": "libero_90",
-        "task_id": 69,
-        "description": "put the chocolate pudding to the left of the plate",
-        "max_steps": 400,
-        "zero_shot": True,
-    },
-    {
-        "name": "libero_90_task79",
-        "suite": "libero_90",
-        "task_id": 79,
-        "description": (
-            "pick up the book and place it in the left compartment of the caddy"
+
+# The published LeRobot pi0.5-LIBERO result uses these four standard suites.
+# Keep the task descriptions explicit so config import does not initialize the
+# LIBERO benchmark package.
+_STANDARD_LIBERO_TASKS = (
+    (
+        "libero_spatial",
+        280,
+        (
+            "pick up the black bowl between the plate and the ramekin and place it on the plate",
+            "pick up the black bowl next to the ramekin and place it on the plate",
+            "pick up the black bowl from table center and place it on the plate",
+            "pick up the black bowl on the cookie box and place it on the plate",
+            "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
+            "pick up the black bowl on the ramekin and place it on the plate",
+            "pick up the black bowl next to the cookie box and place it on the plate",
+            "pick up the black bowl on the stove and place it on the plate",
+            "pick up the black bowl next to the plate and place it on the plate",
+            "pick up the black bowl on the wooden cabinet and place it on the plate",
         ),
-        "max_steps": 400,
-        "zero_shot": True,
-    },
+    ),
+    (
+        "libero_object",
+        280,
+        (
+            "pick up the alphabet soup and place it in the basket",
+            "pick up the cream cheese and place it in the basket",
+            "pick up the salad dressing and place it in the basket",
+            "pick up the bbq sauce and place it in the basket",
+            "pick up the ketchup and place it in the basket",
+            "pick up the tomato sauce and place it in the basket",
+            "pick up the butter and place it in the basket",
+            "pick up the milk and place it in the basket",
+            "pick up the chocolate pudding and place it in the basket",
+            "pick up the orange juice and place it in the basket",
+        ),
+    ),
+    (
+        "libero_goal",
+        300,
+        (
+            "open the middle drawer of the cabinet",
+            "put the bowl on the stove",
+            "put the wine bottle on top of the cabinet",
+            "open the top drawer and put the bowl inside",
+            "put the bowl on top of the cabinet",
+            "push the plate to the front of the stove",
+            "put the cream cheese in the bowl",
+            "turn on the stove",
+            "put the bowl on the plate",
+            "put the wine bottle on the rack",
+        ),
+    ),
+    (
+        "libero_10",
+        520,
+        (
+            "put both the alphabet soup and the tomato sauce in the basket",
+            "put both the cream cheese box and the butter in the basket",
+            "turn on the stove and put the moka pot on it",
+            "put the black bowl in the bottom drawer of the cabinet and close it",
+            "put the white mug on the left plate and put the yellow and white mug on the right plate",
+            "pick up the book and place it in the back compartment of the caddy",
+            "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+            "put both the alphabet soup and the cream cheese box in the basket",
+            "put both moka pots on the stove",
+            "put the yellow and white mug in the microwave and close it",
+        ),
+    ),
+)
+
+_STANDARD_LIBERO_TASK_LOOKUP = {
+    suite: {
+        task_id: description
+        for task_id, description in enumerate(descriptions)
+    }
+    for suite, _, descriptions in _STANDARD_LIBERO_TASKS
+}
+
+# A fixed 10-task panel spanning all four suites. The panel contains two
+# Spatial, three Object, two Goal, and three LIBERO-10 tasks, including both
+# short-horizon and multi-stage instructions while keeping the run tractable.
+_JITRL_BENCHMARK_TASK_IDS = (
+    ("libero_spatial", (0, 1)),
+    ("libero_object", (0, 5, 9)),
+    ("libero_goal", (0, 1)),
+    ("libero_10", (0, 5, 9)),
+)
+
+JITRL_TASKS = tuple(
+    {
+        "name": f"{suite}_task{task_id}",
+        "suite": suite,
+        "task_id": task_id,
+        "description": _STANDARD_LIBERO_TASK_LOOKUP[suite][task_id],
+        "max_steps": next(
+            max_steps
+            for configured_suite, max_steps, _ in _STANDARD_LIBERO_TASKS
+            if configured_suite == suite
+        ),
+        "zero_shot": False,
+    }
+    for suite, task_ids in _JITRL_BENCHMARK_TASK_IDS
+    for task_id in task_ids
 )
 
 SIM_TASKS = (

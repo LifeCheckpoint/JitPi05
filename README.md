@@ -88,13 +88,21 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 
 运行要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。4-bit NF4 Qwen3.5-4B 与 bf16 π₀.₅ 同时驻留显存；Gemini 仅通过网络 API 执行 episode 后 evaluator。凭据位于被忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`，也可通过 `JITPI05_GEMINI_CREDENTIALS` 覆盖。
 
-默认任务仍为 LIBERO-90 task 18、53、59、69、79，完整实验规模为 `5 tasks × 2 methods × 15 episodes × 1 seed = 150 rollouts`。当前 no-stop 诊断产物写入 `artifacts/jitrl_eval_libero90_mid5_seed17_qwen4b_workspace_v2_no_stop_diagnostic/`；此前完整的 workspace-v2 结果保留在原目录，不会被覆盖或混用。
+默认 benchmark 从完整四套件缩减为覆盖四个标准 LIBERO suite 的 10-task 固定面板：`libero_spatial` 任务 0、1；`libero_object` 任务 0、5、9；`libero_goal` 任务 0、1；`libero_10` 任务 0、5、9。默认规模为 `10 tasks × 2 methods × 10 episodes × 1 seed = 200 rollouts`，默认产物写入 `artifacts/jitrl_eval_libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic/`。该面板覆盖社区公开验证的四个标准 suite，但不是完整 40-task suite；结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
 
-建议先对每个任务和方法运行 3–5 个 episode，确认禁用停止后基础成功率是否脱离地板区间：
+建议先运行一个小型标准 suite 子集，确认环境、checkpoint 和高层接口正常：
 
 ```bash
 uv sync
-MUJOCO_GL=egl uv run jitpi05-eval-jitrl --task libero_90_task59 --method jitrl --method static --seed 17 --episodes 5
+MUJOCO_GL=egl uv run jitpi05-eval-jitrl \
+  --task libero_object_task0 \
+  --task libero_spatial_task0 \
+  --method jitrl --method static --seed 17 --episodes 3
+```
+
+完整 10-task 标准面板：
+
+```bash
 MUJOCO_GL=egl uv run jitpi05-eval-jitrl
 uv run jitpi05-eval-jitrl --summarize-only
 ```
@@ -200,10 +208,10 @@ MUJOCO_GL=egl uv run jitpi05-eval-sim
 
 第一次导入 LIBERO 时，上游包会询问数据目录；直接选择默认路径即可。评测模型为当前 LeRobot 0.6 / Transformers 5 兼容的 `lerobot/pi05-libero`，与离线分析使用的 base checkpoint 分开配置。
 
-默认运行两个任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
+JitRL 的默认 benchmark 使用上文四个标准 suite；原有四条件入口仍默认运行两个小型诊断任务，每个任务 5 个固定初始状态，并在同一初始状态上配对运行四组语言条件：
 
 1. `libero_object` task 0：`pick up the alphabet soup and place it in the basket`。这是 π₀.₅ LIBERO 微调分布内的闭环基准，用于确认环境、processor、动作空间和 checkpoint 均正常。
-2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`。这一原有四条件入口仍只把 task 79 作为任务级零样本探针；独立的 JitRL 入口则使用前文列出的 5-task 面板。两种入口都不宣称跨 embodiment 的通用零样本控制。
+2. `libero_90` task 79：`pick up the book and place it in the left compartment of the caddy`。这一原有四条件入口仍只把 task 79 作为任务级零样本探针；独立的 JitRL 入口则使用上文四个标准 suite 面板。两种入口都不宣称跨 embodiment 的通用零样本控制。
 
 高层 Qwen 只在每个 episode 的初始双相机观测上规划一次，然后释放显存。低层 π₀.₅ 显式预测 50 步 action chunk，只执行前 10 步，再用新观测重新预测。四组条件在同一 episode 的第 n 次重规划中复用相同 flow-matching 初始噪声。
 
@@ -214,7 +222,7 @@ MUJOCO_GL=egl uv run jitpi05-eval-sim
 - `rollouts.pt`：每次预测的完整 action chunk、实际执行动作和 reward。
 - `videos/<task>/<condition>/episode_<id>.mp4`：逐条件 rollout 视频。
 
-完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](src/jitpi05/config.py)、`SIM_ACTION_STEPS` 和 `SIM_TASKS` 缩小实验。JitRL 第二轮不使用该原有四条件入口。
+完整默认评测共 `2 tasks × 5 episodes × 4 conditions = 40` 个 rollout，并包含 10 次 Qwen 规划对，耗时会明显长于离线 sanity check。可直接修改 [`SIM_EPISODES`](src/jitpi05/config.py)、`SIM_ACTION_STEPS` 和 `SIM_TASKS` 缩小实验。JitRL 第二轮使用标准四 suite 面板，但不复用该原有四条件入口。
 
 ## 解释限制
 
@@ -225,4 +233,4 @@ MUJOCO_GL=egl uv run jitpi05-eval-sim
 - 高层文本变化是否传导到 π₀.₅ 的低层动作？
 - π₀.₅ 输出是否有限、尺度是否正常、是否与示范动作处在相近范围？
 
-示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 `jitpi05-eval-sim` 或 `jitpi05-eval-jitrl` 的 LIBERO rollout 为准。原有 task 79 结果是单任务诊断探针；新的 5-task JitRL 面板扩大了任务覆盖，但任务经过有意筛选且只有一个 seed，仍不应外推成整个 LIBERO-90 或真实机器人上的普遍零样本能力。
+示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 `jitpi05-eval-sim` 或 `jitpi05-eval-jitrl` 的 LIBERO rollout 为准。当前 JitRL 面板覆盖社区已公开验证的四个标准 suite，但只抽取 10 个任务且只有一个 seed，属于可控诊断面板，不代表完整 40-task suite；高层 Qwen/subtask、Static/JitRL 与 direct π₀.₅ 仍是不同条件，不能把 JitRL 结果直接当作 checkpoint 的官方成功率。

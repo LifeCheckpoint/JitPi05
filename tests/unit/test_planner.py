@@ -365,12 +365,32 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     )
     assert JITRL_TERMINATION_MODE == "environment_only_no_stop_v1"
     assert JITRL_LOGIT_CALIBRATION == "raw_qwen_fixed_workspace_v1"
-    assert JITRL_EPISODES == 15
+    assert JITRL_EPISODES == 10
+    assert len(JITRL_TASKS) == 10
+    assert [task["name"] for task in JITRL_TASKS] == [
+        "libero_spatial_task0",
+        "libero_spatial_task1",
+        "libero_object_task0",
+        "libero_object_task5",
+        "libero_object_task9",
+        "libero_goal_task0",
+        "libero_goal_task1",
+        "libero_10_task0",
+        "libero_10_task5",
+        "libero_10_task9",
+    ]
+    assert {task["suite"] for task in JITRL_TASKS} == {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+    }
+    assert all(task["zero_shot"] is False for task in JITRL_TASKS)
     assert JITRL_HIGH_LEVEL_STEPS == 30
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
     assert JITRL_OUTPUT_DIR.as_posix().endswith(
-        "qwen4b_workspace_v2_no_stop_diagnostic"
+        "libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic"
     )
     assert JITRL_REWARD_VERSION == (
         "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
@@ -386,10 +406,10 @@ def test_gemini_is_evaluator_only_and_method_order_is_paired() -> None:
 
 
 def test_task_resolution_and_summary_paths() -> None:
-    selected = resolve_tasks(["libero_90_task79", "libero_90_task18"])
-    assert [task["task_id"] for task in selected] == [79, 18]
+    selected = resolve_tasks(["libero_10_task5", "libero_spatial_task0"])
+    assert [task["task_id"] for task in selected] == [5, 0]
     first = run_dir_for(Path("artifacts/test"), selected[0], "jitrl", 17)
-    assert first == Path("artifacts/test/libero_90_task79/jitrl/seed_17")
+    assert first == Path("artifacts/test/libero_10_task5/jitrl/seed_17")
 
     tasks = [dict(task) for task in JITRL_TASKS[:2]]
     rows = []
@@ -409,7 +429,7 @@ def test_task_resolution_and_summary_paths() -> None:
         requested_tasks=tasks,
         requested_methods=JITRL_METHODS,
         requested_seeds=(17,),
-        requested_episodes=15,
+        requested_episodes=10,
         output_dir=Path("artifacts/test"),
     )
     assert summary["configuration"]["requested_runs"] == 4
