@@ -9,6 +9,7 @@ description = "Hierarchical VLA and JitRL research experiments for LIBERO"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "accelerate>=1.12,<2",
     "bitsandbytes>=0.49,<0.50",
     "flash-linear-attention[cuda]>=0.5.1,<0.6",
     "lerobot[evaluation,libero,pi]>=0.6,<0.7",

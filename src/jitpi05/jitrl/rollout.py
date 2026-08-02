@@ -17,8 +17,8 @@ from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
 from jitpi05.config import (
+    JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
-    JITRL_CANDIDATES,
     JITRL_EPISODES,
     JITRL_EVALUATOR_BACKEND,
     JITRL_EVALUATOR_MODEL,
@@ -29,7 +29,7 @@ from jitpi05.config import (
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_HISTORY_SIZE,
     JITRL_LOGIT_CALIBRATION,
-    JITRL_MEMORY_BASE_LOGIT,
+    JITRL_MAX_PLAN_TOKENS,
     JITRL_METHODS,
     JITRL_OUTPUT_DIR,
     JITRL_PLANNER_RETRIES,
@@ -37,6 +37,7 @@ from jitpi05.config import (
     JITRL_REWARD_VERSION,
     JITRL_TEMPERATURE,
     JITRL_TERMINAL_SUCCESS_BONUS,
+    JITRL_TERMINATION_MODE,
     JITRL_TOP_K,
     JITRL_UCB_ALPHA,
     SIM_ACTION_STEPS,
@@ -46,19 +47,12 @@ from jitpi05.jitrl.memory import JitRLMemory, discounted_returns
 from jitpi05.jitrl.planner import (
     apply_jitrl_update,
     load_jitrl_planner,
-    normalize_semantic_key,
-    score_proposal,
+    plan_and_score,
 )
 from jitpi05.jitrl.vlm import (
     evaluate_chunk as evaluate_chunk_with_gemini,
 )
-from jitpi05.jitrl.vlm import (
-    generate_proposal as generate_proposal_with_gemini,
-)
-from jitpi05.jitrl.vlm import (
-    load_gemini_evaluator,
-    load_gemini_planner,
-)
+from jitpi05.jitrl.vlm import load_gemini_evaluator
 from jitpi05.policy import conditioned_task
 from jitpi05.simulation import (
     load_policy,
@@ -69,7 +63,7 @@ from jitpi05.simulation import (
     success_from_info,
 )
 
-# Paper-aligned extension: augmented actions, stochastic UCB, and visual step rewards.
+# Fixed-workspace JitRL: Qwen policy logits, memory advantages, visual step rewards.
 
 
 def coordinate_seed(kind: str, seed: int, episode: int, chunk: int) -> int:
@@ -161,48 +155,6 @@ def _static_value_estimate(action_keys: Sequence[str]) -> dict:
     }
 
 
-def build_augmented_candidates(
-    generator_candidates: Sequence[dict],
-    raw_generator_logits: Sequence[float],
-    neighbors: Sequence[dict],
-    memory_base_logit: float = 0.0,
-) -> dict:
-    """Merge generator and retrieved actions after mean-centering generator logits."""
-
-    if len(generator_candidates) != len(raw_generator_logits):
-        raise ValueError("generator candidates and logits must have the same length")
-    raw_logits = [float(value) for value in raw_generator_logits]
-    mean_logit = sum(raw_logits) / len(raw_logits) if raw_logits else 0.0
-    centered_logits = [value - mean_logit for value in raw_logits]
-    augmented_candidates = [
-        {**candidate, "source": "generator"} for candidate in generator_candidates
-    ]
-    augmented_logits = list(centered_logits)
-    known_keys = {candidate["semantic_key"] for candidate in generator_candidates}
-    for neighbor in neighbors:
-        action_key = neighbor["action_key"]
-        if action_key in known_keys:
-            continue
-        augmented_candidates.append(
-            {
-                "text": neighbor["action_text"],
-                "semantic_key": action_key,
-                "source": "memory",
-                "memory_id": int(neighbor["id"]),
-                "memory_similarity": float(neighbor["similarity"]),
-            }
-        )
-        augmented_logits.append(float(memory_base_logit))
-        known_keys.add(action_key)
-    return {
-        "raw_generator_logits": raw_logits,
-        "generator_logit_mean": mean_logit,
-        "centered_generator_logits": centered_logits,
-        "candidates": augmented_candidates,
-        "base_logits": augmented_logits,
-    }
-
-
 def _trace_value_estimate(estimate: dict) -> dict:
     """Add compact vectors while retaining the complete memory API estimate."""
 
@@ -282,10 +234,9 @@ def _low_level_chunks_per_high_level_plan() -> int:
     return JITRL_HIGH_LEVEL_STEPS // SIM_ACTION_STEPS
 
 
-def _propose_and_score_with_retry(
+def _plan_and_score_with_retry(
     planner_model,
     planner_processor,
-    visual_planner,
     images,
     overall_task: str,
     recent_subtasks: Sequence[str],
@@ -295,46 +246,27 @@ def _propose_and_score_with_retry(
     episode_index: int,
     high_level_step_index: int,
 ) -> tuple[dict, int]:
-    """Retry malformed planner generations without restarting the episode."""
+    """Retry malformed Qwen workspace bindings without restarting the episode."""
 
+    failures = []
     for attempt in range(1, JITRL_PLANNER_RETRIES + 1):
         try:
-            visual_proposal = generate_proposal_with_gemini(
-                visual_planner,
-                images,
-                overall_task,
-                recent_subtasks=recent_subtasks,
-                attempt=attempt,
-            )
-            proposal = {
-                "state_summary": visual_proposal["state_summary"].strip(),
-                "candidates": [
-                    {
-                        "text": candidate["text"].strip(),
-                        "semantic_key": normalize_semantic_key(
-                            candidate["semantic_key"]
-                        ),
-                    }
-                    for candidate in visual_proposal["candidates"]
-                ],
-            }
-            planning = score_proposal(
+            planning = plan_and_score(
                 planner_model,
                 planner_processor,
                 images,
                 overall_task,
-                proposal,
                 recent_subtasks=recent_subtasks,
+                max_new_tokens=JITRL_MAX_PLAN_TOKENS,
+                attempt=attempt,
             )
-            planning["prompt"] = visual_proposal["prompt"]
-            planning["proposal_backend"] = visual_proposal["backend"]
-            planning["proposal_model"] = visual_proposal["model"]
-            planning["proposal_raw_output"] = visual_proposal["raw_output"]
             return planning, attempt
         except Exception as error:
+            failures.append(f"attempt {attempt}: {error}")
             if attempt == JITRL_PLANNER_RETRIES:
                 raise RuntimeError(
-                    f"planner failed after {JITRL_PLANNER_RETRIES} attempts: {error}"
+                    f"planner failed after {JITRL_PLANNER_RETRIES} attempts:\n"
+                    + "\n".join(failures)
                 ) from error
             tqdm.write(
                 f"[planner-retry] method={method} seed={seed} "
@@ -435,7 +367,6 @@ def _run_episode(
     memory: JitRLMemory | None,
     planner_model,
     planner_processor,
-    visual_planner,
     policy,
     preprocessor,
     postprocessor,
@@ -461,6 +392,7 @@ def _run_episode(
     overall_task = ""
     success = False
     episode_done = False
+    termination_reason: str | None = None
     low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
 
     try:
@@ -490,7 +422,7 @@ def _run_episode(
             if step_progress is not None:
                 step_progress.set_postfix_str(
                     f"low={low_level_chunk_index} high={high_level_step_index} "
-                    f"vlm={'gemini+qwen-logits' if high_level_replan else 'cached'}",
+                    f"planner={'qwen-workspace' if high_level_replan else 'cached'}",
                     refresh=True,
                 )
             frame = policy_frame(observation, overall_task, env_preprocessor)
@@ -498,10 +430,9 @@ def _run_episode(
             if high_level_replan:
                 images = planning_images(frame)
                 active_before_images = [image.copy() for image in images]
-                planning, planner_attempts = _propose_and_score_with_retry(
+                planning, planner_attempts = _plan_and_score_with_retry(
                     planner_model,
                     planner_processor,
-                    visual_planner,
                     images,
                     overall_task,
                     selected_subtasks[-JITRL_HISTORY_SIZE:],
@@ -510,24 +441,12 @@ def _run_episode(
                     episode_index=episode_index,
                     high_level_step_index=high_level_step_index,
                 )
-                generator_candidates = planning["candidates"]
-                if len(generator_candidates) != JITRL_CANDIDATES:
-                    raise ValueError(
-                        f"planner returned {len(generator_candidates)} candidates; "
-                        f"expected {JITRL_CANDIDATES}"
-                    )
+                candidates = planning["candidates"]
                 raw_neighbors = (
                     memory.retrieve(planning["state_summary"])
                     if method == "jitrl" and memory is not None
                     else []
                 )
-                augmented = build_augmented_candidates(
-                    generator_candidates,
-                    planning["base_logits"],
-                    raw_neighbors,
-                    memory_base_logit=JITRL_MEMORY_BASE_LOGIT,
-                )
-                candidates = augmented["candidates"]
                 action_keys = [candidate["semantic_key"] for candidate in candidates]
                 retrieved_neighbors = _trace_neighbors(raw_neighbors)
 
@@ -557,23 +476,16 @@ def _run_episode(
                 ]
                 uniform = coordinate_uniform(seed, episode_index, high_level_step_index)
                 update = apply_jitrl_update(
-                    augmented["base_logits"],
+                    planning["base_logits"],
                     normalized_advantages,
-                    beta=JITRL_BETA,
-                    temperature=JITRL_TEMPERATURE,
-                    uniform=uniform,
-                )
-                generator_update = apply_jitrl_update(
-                    augmented["centered_generator_logits"],
-                    [0.0] * JITRL_CANDIDATES,
-                    beta=0.0,
+                    beta=JITRL_BETA if method == "jitrl" else 0.0,
                     temperature=JITRL_TEMPERATURE,
                     uniform=uniform,
                 )
                 selected_index = (
                     update["updated_choice_index"]
                     if method == "jitrl"
-                    else generator_update["base_choice_index"]
+                    else update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
                 active_condition = conditioned_task(
@@ -593,30 +505,28 @@ def _run_episode(
                 active_chunk_trace = {
                     "chunk_index": high_level_step_index,
                     "planner_attempts": planner_attempts,
-                    "proposal_prompt": planning["prompt"],
-                    "proposal_backend": planning["proposal_backend"],
-                    "proposal_model": planning["proposal_model"],
-                    "proposal_raw_output": planning["proposal_raw_output"],
+                    "binding_prompt": planning["binding_prompt"],
+                    "binding_raw_output": planning["binding_raw_output"],
+                    "binding_assistant_prefill": planning[
+                        "binding_assistant_prefill"
+                    ],
+                    "binding_generated_tokens": planning["binding_generated_tokens"],
+                    "binding_generation_reached_limit": planning[
+                        "binding_generation_reached_limit"
+                    ],
+                    "binding": planning["binding"],
                     "selection_prompt": planning["selection_prompt"],
                     "state_summary": planning["state_summary"],
-                    "generator_candidates": generator_candidates,
+                    "workspace": planning["workspace"],
+                    "qwen_candidates": planning["qwen_candidates"],
                     "candidates": candidates,
+                    "termination_mode": planning["termination_mode"],
                     "candidate_token_ids": planning["candidate_token_ids"],
-                    "raw_generator_logits": augmented["raw_generator_logits"],
-                    "generator_logit_mean": augmented["generator_logit_mean"],
-                    "centered_generator_logits": augmented["centered_generator_logits"],
-                    "generator_choice_index": generator_update["base_choice_index"],
-                    "augmented_base_choice_index": update["base_choice_index"],
-                    "augmentation_changed_choice": (
-                        update["base_choice_index"]
-                        != generator_update["base_choice_index"]
-                    ),
                     "value_estimate": value_estimate,
                     "retrieved_neighbors": retrieved_neighbors,
                     **update,
                     "selected_candidate_index": selected_index,
                     "selected_candidate": selected_candidate,
-                    "selected_source": selected_candidate["source"],
                     "condition": active_condition,
                     "return": None,
                     "action_start_step": action_start_step,
@@ -624,6 +534,20 @@ def _run_episode(
                     "low_level_chunks": [],
                 }
                 chunks.append(active_chunk_trace)
+                if selected_candidate["terminates_rollout"]:
+                    if JITRL_TERMINATION_MODE == "environment_only_no_stop_v1":
+                        raise RuntimeError(
+                            "stop reached rollout selection under the no-stop diagnostic"
+                        )
+                    termination_reason = "qwen_stop"
+                    evaluator_images.append(
+                        (
+                            active_before_images,
+                            [image.copy() for image in images],
+                        )
+                    )
+                    active_before_images = None
+                    break
             elif active_chunk_trace is None:
                 raise RuntimeError("low-level replan has no cached high-level subtask")
 
@@ -659,6 +583,12 @@ def _run_episode(
 
                 episode_done = bool(terminated[0] or truncated[0])
                 success = success or success_from_info(info)
+                if success:
+                    termination_reason = "environment_success"
+                elif episode_done:
+                    termination_reason = "environment_done"
+                elif len(actions) >= max_steps:
+                    termination_reason = "max_steps"
                 if episode_done or success or len(actions) >= max_steps:
                     break
 
@@ -711,12 +641,16 @@ def _run_episode(
             "episode_complete": True,
         },
     )
+    if termination_reason is None:
+        termination_reason = "max_steps"
     tensors = _episode_tensors(action_chunks, actions, rewards, policy)
     episode_result = {
         "episode_index": episode_index,
         "init_state_id": episode_index,
         "task": overall_task,
         "success": bool(success),
+        "termination_mode": JITRL_TERMINATION_MODE,
+        "termination_reason": termination_reason,
         "steps": len(actions),
         "sum_reward": float(sum(rewards)),
         "max_reward": float(max(rewards, default=0.0)),
@@ -751,8 +685,7 @@ def summarize_run(
     ]
     task_descriptions = list(dict.fromkeys(episode["task"] for episode in episodes))
     models = {
-        "visual_planner": JITRL_EVALUATOR_MODEL,
-        "logit_model": JITRL_QWEN_ID,
+        "high_level_policy": JITRL_QWEN_ID,
         "policy": SIM_PI05_ID,
         "evaluator": JITRL_EVALUATOR_MODEL,
     }
@@ -773,7 +706,8 @@ def summarize_run(
         "temperature": JITRL_TEMPERATURE,
         "exploration_rate": JITRL_EXPLORATION_RATE,
         "ucb_alpha": JITRL_UCB_ALPHA,
-        "memory_base_logit": JITRL_MEMORY_BASE_LOGIT,
+        "action_workspace_version": JITRL_ACTION_WORKSPACE_VERSION,
+        "termination_mode": JITRL_TERMINATION_MODE,
         "logit_calibration": JITRL_LOGIT_CALIBRATION,
         "reward_version": JITRL_REWARD_VERSION,
         "episode_results": episode_rows,
@@ -827,7 +761,6 @@ def run_jitrl_experiment(
 
     planner_model = None
     planner_processor = None
-    visual_planner = None
     evaluator = None
     policy = None
     preprocessor = None
@@ -846,11 +779,6 @@ def run_jitrl_experiment(
             f"[load] task={task_name} method={method} seed={seed}: loading Qwen planner"
         )
         planner_model, planner_processor = load_jitrl_planner()
-        tqdm.write(
-            f"[load] task={task_name} method={method} seed={seed}: configuring "
-            f"{JITRL_EVALUATOR_MODEL} visual planner"
-        )
-        visual_planner = load_gemini_planner()
         if method == "jitrl":
             tqdm.write(
                 f"[load] task={task_name} method={method} seed={seed}: "
@@ -894,7 +822,6 @@ def run_jitrl_experiment(
                     memory=memory,
                     planner_model=planner_model,
                     planner_processor=planner_processor,
-                    visual_planner=visual_planner,
                     policy=policy,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
@@ -978,7 +905,6 @@ def run_jitrl_experiment(
         episode_progress.close()
         planner_model = None
         planner_processor = None
-        visual_planner = None
         evaluator = None
         policy = None
         preprocessor = None

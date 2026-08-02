@@ -19,13 +19,18 @@ SCALAR_METRICS = (
     "success_rate",
     "final_10_success_rate",
     "mean_success_steps",
+    "workspace_active_rate",
+    "masked_stop_candidate_rate",
+    "stop_selection_rate",
+    "qwen_stop_termination_rate",
+    "max_steps_termination_rate",
     "neighbor_action_coverage_rate",
     "nonzero_advantage_rate",
     "choice_change_rate",
-    "augmentation_choice_change_rate",
     "ucb_application_rate",
-    "memory_only_candidate_rate",
-    "memory_only_selection_rate",
+    "mean_base_entropy",
+    "mean_updated_entropy",
+    "mean_update_kl",
     "mean_evaluator_score",
     "negative_evaluator_score_rate",
     "zero_evaluator_score_rate",
@@ -82,6 +87,15 @@ def compute_run_metrics(
     successes = [bool(episode["success"]) for episode in episodes]
     steps = [int(episode["steps"]) for episode in episodes]
     episode_count = len(successes)
+    termination_modes = {
+        str(episode.get("termination_mode", "qwen_stop_v1")) for episode in episodes
+    }
+    if len(termination_modes) > 1:
+        raise ValueError("all episodes in one run must share one termination mode")
+    termination_mode = next(iter(termination_modes), "unknown")
+    termination_reasons = [
+        str(episode.get("termination_reason", "unknown")) for episode in episodes
+    ]
 
     moving_success_rate_10 = [
         _rate(
@@ -101,12 +115,14 @@ def compute_run_metrics(
     nonzero_advantage_count = 0
     absolute_logit_shifts: list[float] = []
     neighbor_counts: list[float] = []
+    base_entropies: list[float] = []
+    updated_entropies: list[float] = []
+    update_kls: list[float] = []
     evaluator_scores: list[int] = []
     changed_count = 0
-    augmentation_changed_count = 0
     ucb_applied_count = 0
-    memory_candidate_count = 0
-    memory_selected_count = 0
+    masked_stop_candidate_count = 0
+    stop_selection_count = 0
 
     for chunk in chunks:
         value_estimate = chunk.get("value_estimate", {})
@@ -124,19 +140,26 @@ def compute_run_metrics(
             raise ValueError("each chunk must have one logit shift per candidate slot")
         absolute_logit_shifts.extend(abs(float(shift)) for shift in logit_shifts)
         neighbor_counts.append(float(value_estimate.get("neighbor_count", 0.0)))
+        base_entropies.append(float(chunk.get("base_entropy", 0.0)))
+        updated_entropies.append(float(chunk.get("updated_entropy", 0.0)))
+        update_kls.append(float(chunk.get("update_kl", 0.0)))
         changed_count += bool(chunk.get("choice_changed", False))
-        augmentation_changed_count += bool(
-            chunk.get("augmentation_changed_choice", False)
-        )
         ucb_applied_count += sum(
             bool(candidate.get("exploration_applied", False))
             for candidate in candidates
         )
-        memory_candidate_count += sum(
-            candidate.get("source") == "memory"
-            for candidate in chunk.get("candidates", [])
+        qwen_candidates = chunk.get("qwen_candidates", chunk.get("candidates", []))
+        deployed_candidates = chunk.get("candidates", [])
+        qwen_enabled_stop = any(
+            candidate.get("type") == "stop" for candidate in qwen_candidates
         )
-        memory_selected_count += chunk.get("selected_source") == "memory"
+        deployed_stop = any(
+            candidate.get("type") == "stop" for candidate in deployed_candidates
+        )
+        masked_stop_candidate_count += qwen_enabled_stop and not deployed_stop
+        stop_selection_count += (
+            chunk.get("selected_candidate", {}).get("type") == "stop"
+        )
         if "evaluator_score" in chunk:
             evaluator_scores.append(int(chunk["evaluator_score"]))
 
@@ -145,6 +168,7 @@ def compute_run_metrics(
         "task_name": str(task_spec["name"]),
         "method": method,
         "seed": int(seed),
+        "termination_mode": termination_mode,
         "episodes": episode_count,
         "successes": successes,
         "steps": steps,
@@ -155,15 +179,26 @@ def compute_run_metrics(
             float(np.mean(successful_steps)) if successful_steps else None
         ),
         "memory_size": len(memory),
+        "workspace_active_rate": _rate(candidate_count, 9 * len(chunks)),
+        "masked_stop_candidate_rate": _rate(masked_stop_candidate_count, len(chunks)),
+        "stop_selection_rate": _rate(stop_selection_count, len(chunks)),
+        "qwen_stop_termination_rate": _rate(
+            sum(reason == "qwen_stop" for reason in termination_reasons), episode_count
+        ),
+        "max_steps_termination_rate": _rate(
+            sum(reason == "max_steps" for reason in termination_reasons), episode_count
+        ),
         "neighbor_action_coverage_rate": _rate(seen_count, candidate_count),
         "nonzero_advantage_rate": _rate(nonzero_advantage_count, candidate_count),
         "choice_change_rate": _rate(changed_count, len(chunks)),
-        "augmentation_choice_change_rate": _rate(
-            augmentation_changed_count, len(chunks)
-        ),
         "ucb_application_rate": _rate(ucb_applied_count, candidate_count),
-        "memory_only_candidate_rate": _rate(memory_candidate_count, candidate_count),
-        "memory_only_selection_rate": _rate(memory_selected_count, len(chunks)),
+        "mean_base_entropy": (
+            float(np.mean(base_entropies)) if base_entropies else 0.0
+        ),
+        "mean_updated_entropy": (
+            float(np.mean(updated_entropies)) if updated_entropies else 0.0
+        ),
+        "mean_update_kl": float(np.mean(update_kls)) if update_kls else 0.0,
         "mean_evaluator_score": (
             float(np.mean(evaluator_scores)) if evaluator_scores else None
         ),

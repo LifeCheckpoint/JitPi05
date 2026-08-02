@@ -1,10 +1,8 @@
-"""First-stage visual proposals and paired JitRL candidate selection."""
+"""Qwen-only semantic-action planning and JitRL logit updates."""
 
 from __future__ import annotations
 
 import json
-import math
-import re
 from collections.abc import Sequence
 
 import torch
@@ -15,9 +13,34 @@ from transformers import (
     Qwen3_5ForConditionalGeneration,
 )
 
-from jitpi05.config import JITRL_CANDIDATES, JITRL_QWEN_ID
+from jitpi05.config import JITRL_QWEN_ID, JITRL_TERMINATION_MODE
+from jitpi05.jitrl.semantic_actions import (
+    ACTION_LABELS,
+    ACTION_TYPES,
+    action_schema_text,
+    active_actions,
+    workspace_from_binding,
+)
 
-_SEMANTIC_PART_WHITESPACE = re.compile(r"\s+")
+_ICL = """Example 1
+Task: pick up the mug and put it in the basket
+State: gripper open above the mug; mug not grasped
+Binding: approach/align/grasp enabled for the mug; later-stage actions disabled; retract enabled; stop disabled.
+
+Example 2
+Task: put the mug in the basket
+State: gripper holds the mug above the table; basket visible
+Binding: lift/transport/place enabled for the mug and basket; approach/align/grasp disabled; release disabled until placement contact; retract enabled; stop disabled.
+
+Example 3
+Task: put the mug in the basket
+State: mug appears stable in the basket and gripper is open
+Binding: retract enabled to clear the object and expose the final relation; stop disabled by the diagnostic protocol."""
+
+_SELECTION_ICL = """Selection examples:
+- Open gripper far from the target: choose approach (label 1).
+- Gripper holds the target away from its destination: choose transport (label 5).
+- Object appears placed and the gripper is open: choose retract (label 8)."""
 
 
 def load_jitrl_planner():
@@ -40,64 +63,58 @@ def load_jitrl_planner():
 
 
 def _recent_subtasks(history: Sequence[str] | None) -> list[str]:
-    if history is None:
-        return []
-    items = list(history)[-2:]
-    if any(not isinstance(item, str) for item in items):
-        raise TypeError("recent_subtasks must contain only strings")
-    return [item.strip() for item in items if item.strip()]
+    return [item.strip() for item in (history or [])[-2:] if item.strip()]
 
 
 def _history_text(history: Sequence[str]) -> str:
-    if not history:
-        return "None"
-    return "\n".join(f"- {item}" for item in history)
+    return "\n".join(f"- {item}" for item in history) or "None"
 
 
-def proposal_prompt(
+def workspace_prompt(
     task: str,
     recent_subtasks: Sequence[str] | None = None,
     attempt: int = 1,
 ) -> str:
-    """Build the legacy local visual-planning prompt with five candidates."""
+    """Prompt Qwen to bind the fixed semantic-action workspace to the current state."""
 
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
-        raise ValueError("attempt must be a positive integer")
-    history = _recent_subtasks(recent_subtasks)
-    retry_instruction = (
+    retry = (
         ""
         if attempt == 1
         else (
-            f"This is schema-correction attempt {attempt}. A previous response was "
-            f"invalid. Verify exactly {JITRL_CANDIDATES} complete candidate objects "
-            "with non-empty text and semantic_key fields.\n"
+            f"Schema correction attempt {attempt}: the previous JSON was invalid. "
+            "Re-evaluate the images and return the exact compact binding schema.\n"
         )
     )
-    candidate_skeleton = ",".join(
-        f'{{"text":"ACTION{index}","semantic_key":"skill|object|target"}}'
-        for index in range(1, JITRL_CANDIDATES + 1)
-    )
     return (
-        "You are the high-level planner for a Franka robot. Image 1 is the external "
-        "camera and image 2 is the wrist camera. Thinking is disabled: do not emit "
-        "reasoning or <think> tags.\n"
+        "You are the frozen high-level policy for a Franka robot. Image 1 is the "
+        "external camera and image 2 is the wrist camera. Thinking is disabled.\n"
         f"Overall task: {task}\n"
-        f"{retry_instruction}"
-        "Recently selected subtasks, oldest to newest:\n"
-        f"{_history_text(history)}\n"
-        f"Infer the current manipulation state and propose exactly {JITRL_CANDIDATES} "
-        "distinct, immediately executable next subtasks. Prefer broad spatial, "
-        "directional, gripper-relative, and generic-object wording rather than relying "
-        "on fine color/texture attributes in every candidate. Return exactly ONE valid "
-        "JSON object on one line, with no Markdown or surrounding text. candidates MUST "
-        f"be a JSON array of exactly {JITRL_CANDIDATES} objects. Copy this skeleton and "
-        "replace only string contents:\n"
-        f'{{"state_summary":"STATE","candidates":[{candidate_skeleton}]}}\n'
-        "state_summary must be concise, stable English in the structure "
-        "'robot=...; gripper=...; object=...; target=...; relations=...; stage=...'. "
-        "Each candidate text must be a short imperative English subtask. Each "
-        "semantic_key must have exactly three lowercase fields separated by two | "
-        "characters. Output JSON only."
+        "Recently executed semantic actions (action labels only, not verified facts):\n"
+        f"{_history_text(_recent_subtasks(recent_subtasks))}\n"
+        "Use the current images as authoritative evidence. Do not infer that an object "
+        "is held, placed, or that the task is complete only because an earlier action "
+        "label says grasp, place, release, or retract. The history only provides context "
+        "for choosing the next action.\n"
+        f"{retry}"
+        "The action vocabulary below is fixed before evaluation. You must not invent "
+        "or rename action types. Code constructs all nine action objects; you only bind "
+        "the shared scene parameters and list the currently executable types.\n"
+        f"{action_schema_text()}\n\n"
+        f"{_ICL}\n\n"
+        "Return one JSON object and no other text. Use this exact compact structure:\n"
+        '{"state_summary":"robot=...; gripper=...; object=...; target=...; '
+        'relations=...; stage=...","object":"...","destination":"...",'
+        '"approach_target":"...","align_target":"...",'
+        '"retract_direction":"upward","enabled_actions":'
+        '["approach","align","grasp","retract"]}\n'
+        "enabled_actions may contain only names from the fixed vocabulary and must not "
+        "contain duplicates. Use concise English bindings grounded in visible objects, "
+        "regions, directions, gripper state, and task progress. The object is the item "
+        "to manipulate; destination is its task destination. approach_target and "
+        "align_target may be the object or destination according to the current stage. "
+        "This is an environment-only termination diagnostic: never include stop in "
+        "enabled_actions, even if the task appears complete. When placement appears "
+        "complete, enable retract to clear the object and permit another observation."
     )
 
 
@@ -107,154 +124,135 @@ def selection_prompt(
     candidates: Sequence[dict],
     recent_subtasks: Sequence[str] | None = None,
 ) -> str:
-    """Build the prompt whose first token selects one numbered candidate."""
+    """Build the Qwen policy prompt over its own active workspace instances."""
 
-    history = _recent_subtasks(recent_subtasks)
-    if len(candidates) != JITRL_CANDIDATES:
-        raise ValueError(
-            f"selection prompt requires exactly {JITRL_CANDIDATES} candidates"
-        )
     candidate_lines = "\n".join(
-        f"{index}. {candidate['text']}" for index, candidate in enumerate(candidates, 1)
+        f"{action['label']}. {action['type']}: {action['text']}" for action in candidates
     )
-    candidate_labels = ", ".join(str(index) for index in range(1, JITRL_CANDIDATES + 1))
+    labels = ", ".join(action["label"] for action in candidates)
     return (
-        "You are selecting the immediate high-level subtask for a Franka robot. "
-        "Image 1 is the external camera and image 2 is the wrist camera. Thinking "
-        "is disabled.\n"
+        "You are the frozen high-level policy for a Franka robot. Image 1 is the "
+        "external camera and image 2 is the wrist camera. Thinking is disabled.\n"
         f"Overall task: {task}\n"
         f"Current state: {state_summary}\n"
-        "Recently selected subtasks, oldest to newest:\n"
-        f"{_history_text(history)}\n"
-        "Candidates:\n"
+        "Recently executed semantic actions:\n"
+        f"{_history_text(_recent_subtasks(recent_subtasks))}\n"
+        "The following actions were bound by this same Qwen policy from the fixed "
+        "pre-deployment workspace. Only these actions are currently valid:\n"
         f"{candidate_lines}\n"
-        f"Select the best candidate now. Output exactly one digit: {candidate_labels}. "
+        f"{_SELECTION_ICL}\n"
+        f"Select the best immediate action. Output exactly one label from: {labels}. "
         "Output no whitespace, explanation, or punctuation."
     )
-
-
-def normalize_semantic_key(value: str) -> str:
-    """Normalize a structurally valid ``skill|object|target`` key."""
-
-    if not isinstance(value, str):
-        raise ValueError("candidate semantic_key must be a string")
-    parts = value.split("|")
-    if len(parts) != 3:
-        raise ValueError(
-            "candidate semantic_key must contain exactly 3 fields separated by 2 '|'"
-        )
-    normalized = [
-        _SEMANTIC_PART_WHITESPACE.sub("-", part.strip().lower()) or "none"
-        for part in parts
-    ]
-    return "|".join(normalized)
 
 
 def _strip_markdown_fence(text: str) -> str:
     text = text.strip()
     if not text.startswith("```"):
         return text
-    lines = text.splitlines()
-    lines = lines[1:]
+    lines = text.splitlines()[1:]
     if lines and lines[-1].strip() == "```":
         lines.pop()
     return "\n".join(lines).strip()
 
 
+def _workspace_binding_diagnostics(binding: dict) -> str:
+    required = (
+        "state_summary",
+        "object",
+        "destination",
+        "approach_target",
+        "align_target",
+        "retract_direction",
+        "enabled_actions",
+    )
+    missing_fields = [field for field in required if field not in binding]
+    enabled = list(binding.get("enabled_actions", []))
+    unexpected = [action_type for action_type in enabled if action_type not in ACTION_TYPES]
+    duplicates = sorted(
+        {action_type for action_type in enabled if enabled.count(action_type) > 1}
+    )
+    return (
+        f"missing_fields={missing_fields}, unexpected_actions={unexpected}, "
+        f"duplicate_actions={duplicates}, enabled_actions={enabled}"
+    )
+
+
 def parse_evaluator_json(text: str) -> dict:
-    """Extract one strict step-reward record from evaluator output."""
+    """Extract one strict positive-only step-reward record."""
 
     cleaned = _strip_markdown_fence(text)
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start < 0 or end < start:
         raise ValueError("evaluator response must contain one JSON object")
-    try:
-        value = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid evaluator JSON: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError("evaluator JSON root must be an object")
-    score = value.get("score")
-    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 3:
-        raise ValueError("evaluator score must be an integer in [0, 3]")
-    usefulness = value.get("usefulness")
-    if usefulness not in {"useful", "neutral"}:
-        raise ValueError("evaluator usefulness must be useful or neutral")
-    expected_usefulness = "useful" if score > 0 else "neutral"
-    if usefulness != expected_usefulness:
-        raise ValueError(
-            f"evaluator usefulness must be {expected_usefulness!r} when score is {score}"
-        )
-    certainty = value.get("certainty")
-    if certainty not in {"certain", "somewhat uncertain", "very uncertain"}:
-        raise ValueError("evaluator certainty is invalid")
-    result = value.get("result")
-    if not isinstance(result, str) or not result.strip():
-        raise ValueError("evaluator result must be a non-empty string")
+    value = json.loads(cleaned[start : end + 1])
+    score = value["score"]
+    usefulness = value["usefulness"]
+    expected = "useful" if score > 0 else "neutral"
+    if not isinstance(score, int) or not 0 <= score <= 3 or usefulness != expected:
+        raise ValueError("invalid positive-only evaluator record")
     return {
         "score": score,
         "usefulness": usefulness,
-        "certainty": certainty,
-        "result": result.strip(),
+        "certainty": value["certainty"],
+        "result": value["result"].strip(),
     }
 
 
-def parse_proposal_json(text: str) -> dict:
-    """Extract and validate the first proposal JSON object."""
+def deployment_candidates(
+    workspace: Sequence[dict],
+    termination_mode: str = JITRL_TERMINATION_MODE,
+) -> list[dict]:
+    """Apply the method-independent deployment mask to Qwen's active workspace."""
 
-    if not isinstance(text, str):
-        raise ValueError("planner output must be a string")
-    cleaned = _strip_markdown_fence(text)
-    object_start = cleaned.find("{")
-    if object_start < 0:
-        raise ValueError("planner output does not contain a JSON object")
-    try:
-        proposal, _ = json.JSONDecoder().raw_decode(cleaned[object_start:])
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid planner JSON: {error.msg}") from error
-
-    if not isinstance(proposal, dict):
-        raise ValueError("planner JSON root must be an object")
-    state_summary = proposal.get("state_summary")
-    if not isinstance(state_summary, str) or not state_summary.strip():
-        raise ValueError("planner JSON state_summary must be a non-empty string")
-    candidates = proposal.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) != JITRL_CANDIDATES:
+    candidates = active_actions(list(workspace))
+    if termination_mode == "environment_only_no_stop_v1":
+        candidates = [candidate for candidate in candidates if candidate["type"] != "stop"]
+    elif termination_mode != "qwen_stop_v1":
+        raise ValueError(f"unknown JITRL termination mode: {termination_mode!r}")
+    if not candidates:
         raise ValueError(
-            f"planner JSON must contain exactly {JITRL_CANDIDATES} candidates"
+            "deployment mask left no executable actions; Qwen must enable at least "
+            "one non-stop fixed action"
         )
+    return candidates
 
-    validated_candidates = []
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, dict):
-            raise ValueError(f"candidate {index + 1} must be an object")
-        candidate_text = candidate.get("text")
-        if not isinstance(candidate_text, str) or not candidate_text.strip():
-            raise ValueError(f"candidate {index + 1} text must be a non-empty string")
-        try:
-            semantic_key = normalize_semantic_key(candidate.get("semantic_key"))
-        except ValueError as error:
-            raise ValueError(f"candidate {index + 1}: {error}") from error
-        validated_candidates.append(
-            {"text": candidate_text.strip(), "semantic_key": semantic_key}
-        )
 
+def parse_workspace_json(text: str) -> dict:
+    """Parse Qwen's compact binding and construct the complete fixed workspace."""
+
+    cleaned = _strip_markdown_fence(text)
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("Qwen workspace response must contain a JSON object")
+    value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    try:
+        workspace = workspace_from_binding(value)
+        qwen_candidates = active_actions(workspace)
+        candidates = deployment_candidates(workspace)
+    except Exception as error:
+        diagnostics = _workspace_binding_diagnostics(value)
+        raise ValueError(
+            f"compact workspace binding invalid: {diagnostics}; reason={error}"
+        ) from error
     return {
-        "state_summary": state_summary.strip(),
-        "candidates": validated_candidates,
+        "state_summary": value["state_summary"].strip(),
+        "workspace": workspace,
+        "qwen_candidates": qwen_candidates,
+        "candidates": candidates,
+        "termination_mode": JITRL_TERMINATION_MODE,
+        "binding": value,
     }
 
 
-def _validate_images(images: list[Image.Image]) -> None:
-    if len(images) not in {2, 4}:
-        raise ValueError("planner inputs require 2 images; evaluator inputs require 4")
-    if any(not isinstance(image, Image.Image) for image in images):
-        raise TypeError("images must contain PIL.Image.Image instances")
-
-
-def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
-    _validate_images(images)
+def _planner_inputs(
+    model,
+    processor,
+    images: Sequence[Image.Image],
+    prompt: str,
+    assistant_prefill: str | None = None,
+):
     messages = [
         {
             "role": "user",
@@ -264,10 +262,18 @@ def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
             ],
         }
     ]
+    if assistant_prefill is not None:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": assistant_prefill}],
+            }
+        )
     return processor.apply_chat_template(
         messages,
         tokenize=True,
-        add_generation_prompt=True,
+        add_generation_prompt=assistant_prefill is None,
+        continue_final_message=assistant_prefill is not None,
         enable_thinking=False,
         return_dict=True,
         return_tensors="pt",
@@ -275,19 +281,26 @@ def _planner_inputs(model, processor, images: list[Image.Image], prompt: str):
 
 
 @torch.inference_mode()
-def generate_proposal(
+def generate_workspace(
     model: Qwen3_5ForConditionalGeneration,
     processor,
-    images: list[Image.Image],
+    images: Sequence[Image.Image],
     task: str,
     recent_subtasks: Sequence[str] | None = None,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 768,
     attempt: int = 1,
 ) -> dict:
-    """Generate and parse one state summary with the configured candidate count."""
+    """Use Qwen to abstract state and instantiate all fixed semantic templates."""
 
-    prompt = proposal_prompt(task, recent_subtasks, attempt=attempt)
-    inputs = _planner_inputs(model, processor, images, prompt)
+    prompt = workspace_prompt(task, recent_subtasks, attempt)
+    assistant_prefill = "{"
+    inputs = _planner_inputs(
+        model,
+        processor,
+        images,
+        prompt,
+        assistant_prefill=assistant_prefill,
+    )
     generated = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -297,148 +310,120 @@ def generate_proposal(
         eos_token_id=processor.tokenizer.eos_token_id,
     )
     generated_ids = generated[0, inputs["input_ids"].shape[1] :]
-    output_text = processor.decode(
+    generated_tokens = int(generated_ids.shape[0])
+    generation_reached_limit = generated_tokens >= max_new_tokens
+    raw_output = assistant_prefill + processor.decode(
         generated_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
-    proposal = parse_proposal_json(output_text)
-    return {"prompt": prompt, **proposal}
-
-
-def candidate_token_ids(tokenizer) -> list[int]:
-    """Return single-token ids for literal labels 1 through JITRL_CANDIDATES."""
-
-    labels = tuple(str(index) for index in range(1, JITRL_CANDIDATES + 1))
-    result = []
-    for label in labels:
-        token_ids = tokenizer.encode(label, add_special_tokens=False)
-        if len(token_ids) != 1:
-            raise ValueError(
-                f"candidate label {label!r} must encode to exactly one token; got {token_ids}"
-            )
-        result.append(int(token_ids[0]))
-    if len(set(result)) != JITRL_CANDIDATES:
-        raise ValueError(f"candidate labels {labels} must have distinct token ids")
-    return result
-
-
-@torch.inference_mode()
-def candidate_base_logits(
-    model: Qwen3_5ForConditionalGeneration,
-    processor,
-    images: list[Image.Image],
-    prompt: str,
-) -> tuple[list[int], torch.Tensor]:
-    """Read only the configured candidate-label logits at the final valid token."""
-
-    inputs = _planner_inputs(model, processor, images, prompt)
-    outputs = model(**inputs)
-    logits = outputs.logits
-    if logits.ndim != 3 or logits.shape[0] != 1:
+    try:
+        parsed = parse_workspace_json(raw_output)
+    except Exception as error:
         raise ValueError(
-            "planner forward pass must return [1, sequence, vocabulary] logits"
-        )
+            f"{error}; generated_tokens={generated_tokens}; "
+            f"max_new_tokens={max_new_tokens}; "
+            f"generation_reached_limit={generation_reached_limit}; "
+            f"Qwen output={raw_output!r}"
+        ) from error
+    return {
+        "binding_prompt": prompt,
+        "binding_raw_output": raw_output,
+        "binding_assistant_prefill": assistant_prefill,
+        "binding_generated_tokens": generated_tokens,
+        "binding_generation_reached_limit": generation_reached_limit,
+        **parsed,
+    }
 
-    attention_mask = inputs.get("attention_mask")
-    if attention_mask is None:
-        last_token_index = inputs["input_ids"].shape[1] - 1
-    else:
-        valid_positions = torch.nonzero(attention_mask[0], as_tuple=False).flatten()
-        if valid_positions.numel() == 0:
-            raise ValueError("planner prompt has no valid input tokens")
-        last_token_index = int(valid_positions[-1])
 
-    token_ids = candidate_token_ids(processor.tokenizer)
-    selected = logits[0, last_token_index, token_ids]
-    return token_ids, selected.detach().to(device="cpu", dtype=torch.float32)
+def action_label_token_ids(tokenizer, candidates: Sequence[dict]) -> list[int]:
+    """Map active fixed-action labels to their single-token Qwen ids."""
+
+    token_ids = []
+    for candidate in candidates:
+        encoded = tokenizer.encode(candidate["label"], add_special_tokens=False)
+        if len(encoded) != 1:
+            raise ValueError(f"action label {candidate['label']} is not one token")
+        token_ids.append(int(encoded[0]))
+    return token_ids
 
 
 @torch.inference_mode()
-def score_proposal(
+def score_workspace(
     model: Qwen3_5ForConditionalGeneration,
     processor,
-    images: list[Image.Image],
+    images: Sequence[Image.Image],
     task: str,
-    proposal: dict,
+    binding: dict,
     recent_subtasks: Sequence[str] | None = None,
 ) -> dict:
-    """Use local Qwen only for the interpretable candidate-label logits."""
+    """Read Qwen's raw logits for its current active semantic actions."""
 
-    history = _recent_subtasks(recent_subtasks)
-    state_summary = proposal.get("state_summary")
-    candidates = proposal.get("candidates")
-    if not isinstance(state_summary, str) or not state_summary.strip():
-        raise ValueError("proposal state_summary must be a non-empty string")
-    if not isinstance(candidates, list) or len(candidates) != JITRL_CANDIDATES:
-        raise ValueError(f"proposal must contain exactly {JITRL_CANDIDATES} candidates")
-    score_prompt = selection_prompt(
+    candidates = binding["candidates"]
+    prompt = selection_prompt(
         task,
-        state_summary.strip(),
+        binding["state_summary"],
         candidates,
-        recent_subtasks=history,
+        recent_subtasks,
     )
-    token_ids, base_logits = candidate_base_logits(
-        model, processor, images, score_prompt
-    )
+    inputs = _planner_inputs(model, processor, images, prompt)
+    outputs = model(**inputs)
+    last_token_index = int(torch.nonzero(inputs["attention_mask"][0])[-1])
+    token_ids = action_label_token_ids(processor.tokenizer, candidates)
+    logits = outputs.logits[0, last_token_index, token_ids]
     return {
-        "selection_prompt": score_prompt,
-        "state_summary": state_summary.strip(),
-        "candidates": candidates,
+        **binding,
+        "selection_prompt": prompt,
         "candidate_token_ids": token_ids,
-        "base_logits": base_logits.tolist(),
+        "base_logits": logits.detach().to(device="cpu", dtype=torch.float32).tolist(),
     }
 
 
 @torch.inference_mode()
-def propose_and_score(
+def plan_and_score(
     model: Qwen3_5ForConditionalGeneration,
     processor,
-    images: list[Image.Image],
+    images: Sequence[Image.Image],
     task: str,
     recent_subtasks: Sequence[str] | None = None,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 768,
     attempt: int = 1,
 ) -> dict:
-    """Legacy all-local path retained for standalone compatibility."""
+    """Bind and score the fixed workspace with one frozen Qwen model."""
 
-    history = _recent_subtasks(recent_subtasks)
-    proposal = generate_proposal(
+    binding = generate_workspace(
         model,
         processor,
         images,
         task,
-        recent_subtasks=history,
-        max_new_tokens=max_new_tokens,
-        attempt=attempt,
+        recent_subtasks,
+        max_new_tokens,
+        attempt,
     )
-    scored = score_proposal(
+    return score_workspace(
         model,
         processor,
         images,
         task,
-        proposal,
-        recent_subtasks=history,
+        binding,
+        recent_subtasks,
     )
-    return {"prompt": proposal["prompt"], **scored}
 
 
-def _float_vector(values: Sequence[float] | torch.Tensor, name: str) -> torch.Tensor:
+def _float_vector(values: Sequence[float] | torch.Tensor) -> torch.Tensor:
     if isinstance(values, torch.Tensor):
-        vector = values.detach().to(device="cpu", dtype=torch.float32)
-    else:
-        vector = torch.tensor(list(values), dtype=torch.float32)
-    if vector.ndim != 1 or vector.numel() == 0:
-        raise ValueError(f"{name} must be a non-empty one-dimensional vector")
-    if not bool(torch.isfinite(vector).all()):
-        raise ValueError(f"{name} must contain only finite values")
-    return vector
+        return values.detach().to(device="cpu", dtype=torch.float32)
+    return torch.tensor(list(values), dtype=torch.float32)
 
 
 def _cdf_choice(probabilities: torch.Tensor, uniform: float) -> int:
     cdf = probabilities.cumsum(dim=0)
     cdf[-1] = 1.0
     return int(torch.searchsorted(cdf, torch.tensor(uniform), right=True))
+
+
+def _entropy(probabilities: torch.Tensor) -> float:
+    return float(-(probabilities * probabilities.log()).sum())
 
 
 def apply_jitrl_update(
@@ -448,35 +433,30 @@ def apply_jitrl_update(
     temperature: float,
     uniform: float,
 ) -> dict:
-    """Shift logits and make paired CDF draws; returned choice indices are 0-based."""
+    """Apply the closed-form JitRL update to Qwen's fixed-workspace logits."""
 
-    base = _float_vector(base_logits, "base_logits")
-    advantages = _float_vector(normalized_advantages, "normalized_advantages")
-    if base.shape != advantages.shape:
-        raise ValueError(
-            "base_logits and normalized_advantages must have the same length"
-        )
-    if not math.isfinite(beta):
-        raise ValueError("beta must be finite")
-    if not math.isfinite(temperature) or temperature <= 0:
-        raise ValueError("temperature must be finite and greater than zero")
-    if not math.isfinite(uniform) or not 0.0 <= uniform < 1.0:
-        raise ValueError("uniform must be finite and in [0, 1)")
-
+    base = _float_vector(base_logits)
+    advantages = _float_vector(normalized_advantages)
     updated = base + float(beta) * advantages
     base_probs = torch.softmax(base / float(temperature), dim=0)
     updated_probs = torch.softmax(updated / float(temperature), dim=0)
     base_choice_index = _cdf_choice(base_probs, float(uniform))
     updated_choice_index = _cdf_choice(updated_probs, float(uniform))
-
+    update_kl = float((updated_probs * (updated_probs.log() - base_probs.log())).sum())
     return {
         "base_logits": base.tolist(),
         "updated_logits": updated.tolist(),
         "logit_shifts": (updated - base).tolist(),
         "base_probs": base_probs.tolist(),
         "updated_probs": updated_probs.tolist(),
+        "base_entropy": _entropy(base_probs),
+        "updated_entropy": _entropy(updated_probs),
+        "update_kl": update_kl,
         "uniform": float(uniform),
         "base_choice_index": base_choice_index,
         "updated_choice_index": updated_choice_index,
         "choice_changed": base_choice_index != updated_choice_index,
     }
+
+
+assert tuple(ACTION_LABELS) == ACTION_TYPES
