@@ -3,7 +3,7 @@ from jitpi05.paths import artifact_root, gemini_credentials_path
 DATASET_ID = "HuggingFaceVLA/libero"
 EPISODE_INDEX = 0
 QWEN_ID = "Qwen/Qwen3.5-4B"
-JITRL_QWEN_ID = "Qwen/Qwen3.5-4B"
+JITRL_QWEN_ID = "Qwen/Qwen3.5-2B"
 PI05_ID = "lerobot/pi05_libero_base"
 SIM_PI05_ID = "lerobot/pi05-libero"
 PI05_TOKENIZER_ID = "nnh-pbbb/paligemma-3b-pt-224"
@@ -12,7 +12,7 @@ OUTPUT_DIR = artifact_root()
 SIM_OUTPUT_DIR = OUTPUT_DIR / "sim_eval"
 JITRL_OUTPUT_DIR = (
     OUTPUT_DIR
-    / "jitrl_eval_libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic"
+    / "jitrl_eval_libero10_long_seed17_qwen2b_workspace_v2_no_stop_diagnostic"
 )
 MAX_PLAN_TOKENS = 20
 TOP_K = 5
@@ -25,7 +25,7 @@ JITRL_SEEDS = (17,)
 JITRL_EPISODES = 10
 JITRL_HIGH_LEVEL_STEPS = 30
 JITRL_PLANNER_RETRIES = 7
-JITRL_EVALUATOR_RETRIES = 3
+JITRL_EVALUATOR_RETRIES = 5
 JITRL_ACTION_WORKSPACE_VERSION = "libero_semantic_actions_9_compact_binding_v2"
 JITRL_TERMINATION_MODE = "environment_only_no_stop_v1"
 JITRL_HISTORY_SIZE = 2
@@ -49,9 +49,9 @@ JITRL_REWARD_VERSION = "gemini36flash_positive_step_score_div3_terminal_plus1_v3
 JITRL_BOOTSTRAP_SAMPLES = 10_000
 JITRL_BOOTSTRAP_CONFIDENCE = 0.95
 
-# The published LeRobot pi0.5-LIBERO result uses these four standard suites.
-# Keep the task descriptions explicit so config import does not initialize the
-# LIBERO benchmark package.
+# The published LeRobot pi0.5-LIBERO result includes the standard LIBERO-10
+# long-horizon suite. Keep descriptions explicit so config import does not
+# initialize the LIBERO benchmark package.
 _STANDARD_LIBERO_TASKS = (
     (
         "libero_spatial",
@@ -127,15 +127,10 @@ _STANDARD_LIBERO_TASK_LOOKUP = {
     for suite, _, descriptions in _STANDARD_LIBERO_TASKS
 }
 
-# A fixed 10-task panel spanning all four suites. The panel contains two
-# Spatial, three Object, two Goal, and three LIBERO-10 tasks, including both
-# short-horizon and multi-stage instructions while keeping the run tractable.
-_JITRL_BENCHMARK_TASK_IDS = (
-    ("libero_spatial", (0, 1)),
-    ("libero_object", (0, 5, 9)),
-    ("libero_goal", (0, 1)),
-    ("libero_10", (0, 5, 9)),
-)
+# Use the complete LIBERO-10 long-horizon suite rather than mixing short and
+# long tasks. This keeps the benchmark inside the published fine-tuning
+# distribution while avoiding a hand-picked cross-suite task panel.
+_JITRL_BENCHMARK_TASK_IDS = (("libero_10", tuple(range(10))),)
 
 JITRL_TASKS = tuple(
     {

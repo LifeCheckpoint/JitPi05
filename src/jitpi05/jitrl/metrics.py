@@ -39,20 +39,25 @@ SCALAR_METRICS = (
     "mean_neighbor_count",
     "memory_size",
 )
+# Success rate remains an auxiliary health metric. The primary JitRL effect is
+# positive when successful episodes use fewer steps than the Static baseline.
+PRIMARY_EFFECT_METRIC = "success_step_reduction"
 PAIRED_METRICS = (
+    PRIMARY_EFFECT_METRIC,
     "success_rate",
     "final_10_success_rate",
-    "mean_success_steps",
 )
 WARNINGS = (
+    "Success rate is retained as an auxiliary health metric; the primary "
+    "JitRL effect metric is successful-episode step reduction versus Static.",
     "Per task/method, the default design has only 1 seed-level run; sample "
     "standard deviation is 0 and the seed-level bootstrap interval collapses "
     "to the observed value, so neither supports across-seed inference.",
     "Episodes within one JitRL run are sequentially dependent through online "
     "memory adaptation and must not be treated as independent replicates.",
-    "The five LIBERO-90 tasks were deliberately selected rather than randomly "
-    "sampled; task-macro means and task-level bootstrap intervals are descriptive "
-    "for this panel and do not establish suite-wide generalization.",
+    "The default benchmark uses the complete 10-task LIBERO-10 long-horizon "
+    "suite, but a CLI run may intentionally select a subset; results still use "
+    "one seed and task-level intervals are descriptive.",
 )
 
 
@@ -427,13 +432,20 @@ def _build_one_task_summary(
             for metric in PAIRED_METRICS:
                 differences = []
                 for seed in sorted(static_by_seed):
-                    static_value = static_by_seed[seed][metric]
-                    jitrl_value = jitrl_by_seed[seed][metric]
-                    difference = (
-                        None
-                        if static_value is None or jitrl_value is None
-                        else float(jitrl_value) - float(static_value)
-                    )
+                    if metric == PRIMARY_EFFECT_METRIC:
+                        static_value = static_by_seed[seed]["mean_success_steps"]
+                        jitrl_value = jitrl_by_seed[seed]["mean_success_steps"]
+                        # Positive means JitRL completed successful episodes in
+                        # fewer steps; None means one method had no successes.
+                        difference = (
+                            None
+                            if static_value is None or jitrl_value is None
+                            else float(static_value) - float(jitrl_value)
+                        )
+                    else:
+                        static_value = static_by_seed[seed][metric]
+                        jitrl_value = jitrl_by_seed[seed][metric]
+                        difference = float(jitrl_value) - float(static_value)
                     differences.append((seed, difference))
                 paired[metric] = aggregate_seed_values(
                     differences,
@@ -495,6 +507,11 @@ def build_summary(
         )
 
     return {
+        "primary_effect_metric": PRIMARY_EFFECT_METRIC,
+        "primary_effect_definition": (
+            "Static mean successful-episode steps minus JitRL mean "
+            "successful-episode steps; positive values favor JitRL."
+        ),
         "configuration": {
             "requested_tasks": [dict(task) for task in requested_tasks],
             "requested_methods": list(requested_methods),

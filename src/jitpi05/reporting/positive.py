@@ -196,6 +196,13 @@ def derive_statistics(
                     method_stats["jitrl"]["success_rate"]
                     - method_stats["static"]["success_rate"]
                 ),
+                "success_step_reduction": (
+                    None
+                    if method_stats["jitrl"]["mean_success_steps"] is None
+                    or method_stats["static"]["mean_success_steps"] is None
+                    else method_stats["static"]["mean_success_steps"]
+                    - method_stats["jitrl"]["mean_success_steps"]
+                ),
                 "paired": paired,
             }
         )
@@ -203,7 +210,10 @@ def derive_statistics(
     paired_total["exact_mcnemar_p"] = exact_mcnemar_two_sided(
         paired_total["jitrl_only"], paired_total["static_only"]
     )
-    macro_delta = summary["task_macro"]["paired_differences"]["success_rate"]
+    step_reduction = summary["task_macro"]["paired_differences"][
+        "success_step_reduction"
+    ]
+    success_rate_delta = summary["task_macro"]["paired_differences"]["success_rate"]
     final_10_delta = summary["task_macro"]["paired_differences"][
         "final_10_success_rate"
     ]
@@ -222,6 +232,10 @@ def derive_statistics(
                 pooled_successes["jitrl"] - pooled_successes["static"]
             )
             / total_episodes_per_method,
+            "success_step_reduction": step_reduction["mean"],
+            "success_step_reduction_ci": step_reduction[
+                "descriptive_task_bootstrap_ci"
+            ],
             "jitrl_mean_success_steps": (
                 mean(pooled_success_steps["jitrl"])
                 if pooled_success_steps["jitrl"]
@@ -233,8 +247,10 @@ def derive_statistics(
                 else None
             ),
             "paired": dict(paired_total),
-            "task_macro_delta": macro_delta["mean"],
-            "task_macro_delta_ci": macro_delta["descriptive_task_bootstrap_ci"],
+            "success_rate_task_macro_delta": success_rate_delta["mean"],
+            "success_rate_task_macro_delta_ci": success_rate_delta[
+                "descriptive_task_bootstrap_ci"
+            ],
             "final_10_task_macro_delta": final_10_delta["mean"],
             "final_10_task_macro_delta_ci": final_10_delta[
                 "descriptive_task_bootstrap_ci"

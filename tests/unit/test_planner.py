@@ -9,6 +9,7 @@ from jitpi05.config import (
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
     JITRL_EPISODES,
+    JITRL_EVALUATOR_RETRIES,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_LOGIT_CALIBRATION,
     JITRL_METHODS,
@@ -358,7 +359,7 @@ def test_positive_only_evaluator_schema_and_parser() -> None:
 
 
 def test_experiment_configuration_is_qwen_workspace_only() -> None:
-    assert JITRL_QWEN_ID == "Qwen/Qwen3.5-4B"
+    assert JITRL_QWEN_ID == "Qwen/Qwen3.5-2B"
     assert (
         JITRL_ACTION_WORKSPACE_VERSION
         == "libero_semantic_actions_9_compact_binding_v2"
@@ -368,29 +369,16 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     assert JITRL_EPISODES == 10
     assert len(JITRL_TASKS) == 10
     assert [task["name"] for task in JITRL_TASKS] == [
-        "libero_spatial_task0",
-        "libero_spatial_task1",
-        "libero_object_task0",
-        "libero_object_task5",
-        "libero_object_task9",
-        "libero_goal_task0",
-        "libero_goal_task1",
-        "libero_10_task0",
-        "libero_10_task5",
-        "libero_10_task9",
+        f"libero_10_task{task_id}" for task_id in range(10)
     ]
-    assert {task["suite"] for task in JITRL_TASKS} == {
-        "libero_spatial",
-        "libero_object",
-        "libero_goal",
-        "libero_10",
-    }
+    assert {task["suite"] for task in JITRL_TASKS} == {"libero_10"}
     assert all(task["zero_shot"] is False for task in JITRL_TASKS)
     assert JITRL_HIGH_LEVEL_STEPS == 30
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
+    assert JITRL_EVALUATOR_RETRIES == 5
     assert JITRL_OUTPUT_DIR.as_posix().endswith(
-        "libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic"
+        "libero10_long_seed17_qwen2b_workspace_v2_no_stop_diagnostic"
     )
     assert JITRL_REWARD_VERSION == (
         "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
@@ -406,7 +394,7 @@ def test_gemini_is_evaluator_only_and_method_order_is_paired() -> None:
 
 
 def test_task_resolution_and_summary_paths() -> None:
-    selected = resolve_tasks(["libero_10_task5", "libero_spatial_task0"])
+    selected = resolve_tasks(["libero_10_task5", "libero_10_task0"])
     assert [task["task_id"] for task in selected] == [5, 0]
     first = run_dir_for(Path("artifacts/test"), selected[0], "jitrl", 17)
     assert first == Path("artifacts/test/libero_10_task5/jitrl/seed_17")
@@ -417,7 +405,13 @@ def test_task_resolution_and_summary_paths() -> None:
         for method in JITRL_METHODS:
             rows.append(
                 compute_run_metrics(
-                    [{"success": method == "jitrl", "steps": 400, "chunks": []}],
+                    [
+                        {
+                            "success": True,
+                            "steps": 100 if method == "jitrl" else 120,
+                            "chunks": [],
+                        }
+                    ],
                     [],
                     task_spec=task,
                     method=method,
@@ -433,7 +427,12 @@ def test_task_resolution_and_summary_paths() -> None:
         output_dir=Path("artifacts/test"),
     )
     assert summary["configuration"]["requested_runs"] == 4
-    assert summary["task_macro"]["paired_differences"]["success_rate"]["mean"] == 1.0
+    assert summary["primary_effect_metric"] == "success_step_reduction"
+    assert (
+        summary["task_macro"]["paired_differences"]["success_step_reduction"]["mean"]
+        == 20.0
+    )
+    assert summary["task_macro"]["paired_differences"]["success_rate"]["mean"] == 0.0
 
 
 def test_discounted_signed_returns() -> None:

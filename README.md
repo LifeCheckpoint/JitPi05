@@ -2,11 +2,11 @@
 
 一个尽量简洁的分层 VLA 研究原型：
 
-- **Qwen3.5-4B**：读取 LIBERO 双相机首帧，生成当前高层 subtask。
+- **Qwen3.5-4B**：读取 LIBERO 双相机首帧，生成原有离线入口的高层 subtask。
 - **显式 logits 调制**：逐 token 保存原始/调制后 logits，并在 argmax 前暴露可编辑回调。
 - **LeRobot π₀.₅ LIBERO**：把总任务与 subtask 组成低层语言条件，显式执行 prefix 编码、KV cache、10 步 flow-matching 去噪和反归一化。
 - **四组对照**：原始任务、人工 subtask、Qwen subtask、调制后的 Qwen subtask。
-- **JitRL 第一阶段**：Qwen3.5-4B 基于固定九类语义动作工作集完成状态抽象、参数绑定和基础策略 logits；任务内在线记忆只估计当前 Qwen 动作的 advantage。Gemini 仅在 episode 结束后提供视觉 step reward。
+- **JitRL 第一阶段**：Qwen3.5-2B 基于固定九类语义动作工作集完成状态抽象、参数绑定和基础策略 logits；任务内在线记忆只估计当前 Qwen 动作的 advantage。Gemini 仅在 episode 结束后提供视觉 step reward。
 
 代码采用可安装的 `src/jitpi05` 包结构：
 
@@ -37,7 +37,7 @@ uv run --group report jitpi05-report --profile positive-reward
 
 ## JitRL 在线记忆实验
 
-这是一个与原有 `jitpi05-offline` 和 `jitpi05-eval-sim` 分离的在线闭环入口。当前版本按 [`jitrl-reproduction-corrections.md`](docs/issues/jitrl-reproduction-corrections.md) 回退为单一 Qwen3.5-4B 高层策略：固定语义动作工作集、Qwen 状态绑定与基础 logits、memory advantage、additive logit update。Gemini 不参与高层候选生成，仅在 episode 结束后评价视觉 step reward。
+这是一个与原有 `jitpi05-offline` 和 `jitpi05-eval-sim` 分离的在线闭环入口。当前版本按 [`jitrl-reproduction-corrections.md`](docs/issues/jitrl-reproduction-corrections.md) 使用单一 Qwen3.5-2B 高层策略：固定语义动作工作集、Qwen 状态绑定与基础 logits、memory advantage、additive logit update。Gemini 不参与高层候选生成，仅在 episode 结束后评价视觉 step reward。
 
 ### 固定语义动作工作集与 Qwen 基础策略
 
@@ -57,9 +57,9 @@ retract(direction)
 stop()
 ```
 
-同一个 Qwen3.5-4B 完成两个步骤：
+同一个 Qwen3.5-2B 完成两个步骤：
 
-1. 读取外部相机、腕部相机、总任务、最近动作、固定 schema 和静态 ICL 示例，输出结构化 `state_summary`、共享对象/目标/方向参数及当前有效动作类型。代码按这些紧凑绑定构造完整且有序的九类工作集，避免要求 4B 重复抄写固定动作表。
+1. 读取外部相机、腕部相机、总任务、最近动作、固定 schema 和静态 ICL 示例，输出结构化 `state_summary`、共享对象/目标/方向参数及当前有效动作类型。代码按这些紧凑绑定构造完整且有序的九类工作集，避免要求 2B 重复抄写固定动作表。
 2. 仅对当前部署有效实例构造固定标签选择 prompt，执行一次 forward，直接读取这些标签的原始 logits。状态绑定、有效性和基础 logits 均来自同一冻结 Qwen；不使用外部 proposal model，不对 logits 做均值中心化。
 
 当前配置是 `environment_only_no_stop_v1` 诊断上限：固定九类工作集仍完整保留 `stop()`，但 prompt 要求 Qwen 不启用它，代码还会在部署候选中二次屏蔽。若 Qwen 只启用 `stop()`，该次绑定无可执行动作并进入既有 planner 重试；代码不会注入非 Qwen 恢复动作。JitRL 与 Static 都只能由 LIBERO 环境成功、环境结束或最大步数终止，因此本实验用于测量去除视觉假停止后的策略上限，不是最终部署停止机制。完整九类工作集、Qwen 原始有效实例、部署后实例、终止模式和标签 token 均写入 trace。
@@ -86,7 +86,7 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 
 ### 环境、默认实验与运行命令
 
-运行要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。4-bit NF4 Qwen3.5-4B 与 bf16 π₀.₅ 同时驻留显存；Gemini 仅通过网络 API 执行 episode 后 evaluator。凭据位于被忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`，也可通过 `JITPI05_GEMINI_CREDENTIALS` 覆盖。
+运行要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。4-bit NF4 Qwen3.5-2B 与 bf16 π₀.₅ 同时驻留显存；Gemini 仅通过网络 API 执行 episode 后 evaluator。凭据位于被忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`，也可通过 `JITPI05_GEMINI_CREDENTIALS` 覆盖。
 
 默认 benchmark 从完整四套件缩减为覆盖四个标准 LIBERO suite 的 10-task 固定面板：`libero_spatial` 任务 0、1；`libero_object` 任务 0、5、9；`libero_goal` 任务 0、1；`libero_10` 任务 0、5、9。默认规模为 `10 tasks × 2 methods × 10 episodes × 1 seed = 200 rollouts`，默认产物写入 `artifacts/jitrl_eval_libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic/`。该面板覆盖社区公开验证的四个标准 suite，但不是完整 40-task suite；结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
 
@@ -95,8 +95,8 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 ```bash
 uv sync
 MUJOCO_GL=egl uv run jitpi05-eval-jitrl \
-  --task libero_object_task0 \
-  --task libero_spatial_task0 \
+  --task libero_10_task0 \
+  --task libero_10_task1 \
   --method jitrl --method static --seed 17 --episodes 3
 ```
 
@@ -113,7 +113,7 @@ uv run jitpi05-eval-jitrl --summarize-only
 
 ### 论文对齐边界
 
-当前版本不再使用 Gemini 动态候选、memory-only 动作、人工 `base_logit=0` 或均值中心化。被 advantage 调制的候选和基础 logits 均由同一 Qwen3.5-4B 在固定工作集内产生，因此更新可解释为对冻结 Qwen 基础策略的概率重分配。
+当前版本不再使用 Gemini 动态候选、memory-only 动作、人工 `base_logit=0` 或均值中心化。被 advantage 调制的候选和基础 logits 均由同一 Qwen3.5-2B 在固定工作集内产生，因此更新可解释为对冻结 Qwen 基础策略的概率重分配。
 
 机器人领域仍保留两项适配：语义动作以文本条件驱动冻结 π₀.₅；credit assignment 使用 episode 后 Gemini 视觉 evaluator 和环境成功 bonus。这些设计不改变单一高层基础策略与固定动作空间的核心实验边界。
 
@@ -233,4 +233,4 @@ JitRL 的默认 benchmark 使用上文四个标准 suite；原有四条件入口
 - 高层文本变化是否传导到 π₀.₅ 的低层动作？
 - π₀.₅ 输出是否有限、尺度是否正常、是否与示范动作处在相近范围？
 
-示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确；闭环成功率应以 `jitpi05-eval-sim` 或 `jitpi05-eval-jitrl` 的 LIBERO rollout 为准。当前 JitRL 面板覆盖社区已公开验证的四个标准 suite，但只抽取 10 个任务且只有一个 seed，属于可控诊断面板，不代表完整 40-task suite；高层 Qwen/subtask、Static/JitRL 与 direct π₀.₅ 仍是不同条件，不能把 JitRL 结果直接当作 checkpoint 的官方成功率。
+示范动作 MAE/RMSE 不是策略成功率，也不能单独证明动作语义正确。当前 JitRL 的主要比较指标是成功 episode 的步数减少，闭环成功率只作为环境健康度辅助指标；两者都应以 `jitpi05-eval-jitrl` 的 LIBERO rollout 为准。当前面板是完整 LIBERO-10 长任务 suite、只有一个 seed，属于可控诊断实验，不代表跨套件泛化；高层 Qwen/subtask、Static/JitRL 与 direct π₀.₅ 仍是不同条件，不能把 JitRL 结果直接当作 checkpoint 的官方成功率。
