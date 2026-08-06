@@ -18,13 +18,14 @@ from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
 from jitpi05.config import (
+    ALL_METHODS,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
-    CYCLE_JITRL_METHODS,
     CYCLE_MAX_RETRIES,
     CYCLE_MBR_ACTION_STEPS,
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
+    CYCLE_METHODS,
     CYCLE_PROGRESS_THRESHOLD,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
@@ -35,14 +36,12 @@ from jitpi05.config import (
     JITRL_EVALUATOR_SCORE_SCALE,
     JITRL_EXPLORATION_RATE,
     JITRL_FREE_ACTION_SIM_THRESHOLD,
-    JITRL_FREE_MAX_PLAN_RETRIES,
     JITRL_FREE_PLAN_TOKENS,
     JITRL_GAMMA,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_HISTORY_SIZE,
     JITRL_LOGIT_CALIBRATION,
     JITRL_MAX_PLAN_TOKENS,
-    JITRL_METHODS,
     JITRL_OUTPUT_DIR,
     JITRL_PLANNER_RETRIES,
     JITRL_QWEN_ID,
@@ -105,11 +104,6 @@ FREE_METHODS = (
 MEMORY_METHODS = ("jitrl", "jitrl-free", "jitrl-free-cycle")
 # Methods that apply the memory advantage logit update (beta > 0).
 UPDATED_METHODS = ("jitrl", "jitrl-free", "jitrl-free-cycle")
-CYCLE_METHODS = tuple(
-    method for method in CYCLE_JITRL_METHODS if method.endswith("-cycle")
-)
-ALL_METHODS = tuple(dict.fromkeys((*JITRL_METHODS, *CYCLE_METHODS)))
-
 # Fixed-workspace JitRL: Qwen policy logits, memory advantages, visual step rewards.
 
 
@@ -296,11 +290,7 @@ def _plan_and_score_with_retry(
 ) -> tuple[dict, int]:
     """Retry malformed Qwen workspace bindings without restarting the episode."""
 
-    max_retries = (
-        JITRL_FREE_MAX_PLAN_RETRIES
-        if method in FREE_METHODS
-        else JITRL_PLANNER_RETRIES
-    )
+    max_retries = JITRL_PLANNER_RETRIES
     failures = []
     for attempt in range(1, max_retries + 1):
         try:

@@ -384,7 +384,7 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     assert JITRL_HIGH_LEVEL_STEPS == 40
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
-    assert JITRL_EVALUATOR_RETRIES == 5
+    assert JITRL_EVALUATOR_RETRIES == 10
     assert JITRL_OUTPUT_DIR.as_posix() == "artifacts/jitrl_cycle"
     assert JITRL_REWARD_VERSION == (
         "gemini36flash_positive_step_score_div3_terminal_plus1_v3"

@@ -2,8 +2,8 @@ import pytest
 
 from jitpi05.config import (
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
+    CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
-    CYCLE_LIBERO90_CANDIDATES,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_PROGRESS_THRESHOLD,
 )
@@ -34,7 +34,7 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
     assert CYCLE_PROGRESS_THRESHOLD == pytest.approx(0.75)
     assert CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS == 3
     assert CYCLE_MBR_HYPOTHESES == 8
-    assert 59 in CYCLE_LIBERO90_CANDIDATES
+    assert 59 in CYCLE_EVALUATION.libero90_candidates
 
 
 def test_proxy_gate_triggers_at_three_of_four_chunks() -> None:
