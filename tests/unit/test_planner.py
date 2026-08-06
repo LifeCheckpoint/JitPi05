@@ -10,6 +10,9 @@ from jitpi05.config import (
     JITRL_BETA,
     JITRL_EPISODES,
     JITRL_EVALUATOR_RETRIES,
+    JITRL_FREE_ACTION_SIM_THRESHOLD,
+    JITRL_FREE_CANDIDATES,
+    JITRL_FREE_PLAN_TOKENS,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_LOGIT_CALIBRATION,
     JITRL_METHODS,
@@ -20,15 +23,25 @@ from jitpi05.config import (
     JITRL_TASKS,
     JITRL_TERMINATION_MODE,
 )
-from jitpi05.jitrl.memory import JitRLMemory, discounted_returns
+from jitpi05.jitrl.memory import (
+    JitRLMemory,
+    action_similarity,
+    discounted_returns,
+    normalize_action,
+)
 from jitpi05.jitrl.metrics import build_summary, compute_run_metrics, run_dir_for
 from jitpi05.jitrl.planner import (
     _planner_inputs,
     action_label_token_ids,
     apply_jitrl_update,
     deployment_candidates,
+    deployment_candidates_free,
+    free_proposal_prompt,
+    free_selection_prompt,
+    generate_free_candidates,
     generate_workspace,
     parse_evaluator_json,
+    parse_free_planning_json,
     parse_workspace_json,
     selection_prompt,
     workspace_prompt,
@@ -373,12 +386,12 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     ]
     assert {task["suite"] for task in JITRL_TASKS} == {"libero_10"}
     assert all(task["zero_shot"] is False for task in JITRL_TASKS)
-    assert JITRL_HIGH_LEVEL_STEPS == 30
+    assert JITRL_HIGH_LEVEL_STEPS == 40
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
     assert JITRL_EVALUATOR_RETRIES == 5
     assert JITRL_OUTPUT_DIR.as_posix().endswith(
-        "libero10_long_seed17_qwen2b_workspace_v2_no_stop_diagnostic"
+        "libero10_long_seed17_qwen2b_workspace_v2_free"
     )
     assert JITRL_REWARD_VERSION == (
         "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
@@ -389,8 +402,8 @@ def test_gemini_is_evaluator_only_and_method_order_is_paired() -> None:
     assert google_provider_base_url("https://api.ikuncode.cc/v1beta/models") == (
         "https://api.ikuncode.cc"
     )
-    assert JITRL_METHODS == ("jitrl", "static")
-    assert _low_level_chunks_per_high_level_plan() == 3
+    assert JITRL_METHODS == ("jitrl-free", "static-free")
+    assert _low_level_chunks_per_high_level_plan() == 4
 
 
 def test_task_resolution_and_summary_paths() -> None:
@@ -408,7 +421,9 @@ def test_task_resolution_and_summary_paths() -> None:
                     [
                         {
                             "success": True,
-                            "steps": 100 if method == "jitrl" else 120,
+                            "steps": (
+                                100 if method in ("jitrl", "jitrl-free") else 120
+                            ),
                             "chunks": [],
                         }
                     ],
@@ -429,10 +444,17 @@ def test_task_resolution_and_summary_paths() -> None:
     assert summary["configuration"]["requested_runs"] == 4
     assert summary["primary_effect_metric"] == "success_step_reduction"
     assert (
-        summary["task_macro"]["paired_differences"]["success_step_reduction"]["mean"]
+        summary["task_macro"]["paired_differences"]["jitrl-free-static-free"][
+            "success_step_reduction"
+        ]["mean"]
         == 20.0
     )
-    assert summary["task_macro"]["paired_differences"]["success_rate"]["mean"] == 0.0
+    assert (
+        summary["task_macro"]["paired_differences"]["jitrl-free-static-free"][
+            "success_rate"
+        ]["mean"]
+        == 0.0
+    )
 
 
 def test_discounted_signed_returns() -> None:
@@ -441,3 +463,220 @@ def test_discounted_signed_returns() -> None:
         -0.050000000000000044,
         1.0,
     ]
+
+
+def test_free_proposal_prompt_requests_json_candidates() -> None:
+    prompt = free_proposal_prompt(
+        "put the mug in the basket", ["carry the mug toward the basket"]
+    )
+    retry_prompt = free_proposal_prompt("put the mug in the basket", attempt=3)
+    assert "state_summary" in prompt
+    assert "5 distinct immediate manipulation actions" in prompt
+    assert "current images as authoritative evidence" in prompt
+    assert "correction attempt 3" in retry_prompt
+    # Default termination mode is no-stop: forbid stop and use the stop-free ICL.
+    assert 'Do NOT include the candidate "stop"' in prompt
+    assert "decided by the environment evaluator" in prompt
+    assert '"stop"' not in _free_proposal_icl_no_stop(prompt)
+    # qwen_stop_v1 mode explicitly allows a stop candidate.
+    stop_prompt = free_proposal_prompt(
+        "put the mug in the basket", termination_mode="qwen_stop_v1"
+    )
+    assert 'Include the literal candidate "stop" only when' in stop_prompt
+
+
+def _free_proposal_icl_no_stop(prompt: str) -> str:
+    # Sanity helper: locate the ICL block inside the rendered prompt.
+    start = prompt.find("Example 1")
+    end = prompt.find("Return one JSON object")
+    return prompt[start:end]
+
+
+def test_free_selection_prompt_lists_candidates_and_labels() -> None:
+    candidates = parse_free_planning_json(
+        '{"state_summary":"gripper open above mug",'
+        '"candidates":["grasp the mug","carry the mug to the basket","stop"]}'
+    )["candidates"]
+    prompt = free_selection_prompt("task", "state", candidates)
+    assert "1. grasp the mug" in prompt
+    assert "3. stop" in prompt
+    assert "1, 2, 3" in prompt
+
+
+def test_parse_free_planning_json_constructs_compatible_candidates() -> None:
+    parsed = parse_free_planning_json(
+        '{"state_summary":"gripper open above mug",'
+        '"candidates":["grasp the mug","grasp the mug",'
+        '"carry the mug to the basket","stop"]}',
+        candidate_count=5,
+    )
+    assert parsed["state_summary"] == "gripper open above mug"
+    assert [candidate["text"] for candidate in parsed["candidates"]] == [
+        "grasp the mug",
+        "carry the mug to the basket",
+        "stop",
+    ]
+    assert [candidate["label"] for candidate in parsed["candidates"]] == [
+        "1",
+        "2",
+        "3",
+    ]
+    assert parsed["candidates"][0]["semantic_key"] == "grasp the mug"
+    assert parsed["candidates"][-1]["type"] == "stop"
+    assert parsed["candidates"][-1]["terminates_rollout"] is True
+    assert parsed["stop_only"] is False
+    assert all(
+        not candidate["terminates_rollout"]
+        for candidate in parsed["candidates"][:-1]
+    )
+
+
+def test_parse_free_planning_json_rejects_invalid_proposals() -> None:
+    with pytest.raises(ValueError, match="JSON object"):
+        parse_free_planning_json("not json")
+    with pytest.raises(ValueError, match="state_summary"):
+        parse_free_planning_json('{"candidates":["grasp the mug","stop"]}')
+    with pytest.raises(ValueError, match="at least 1"):
+        parse_free_planning_json('{"state_summary":"s","candidates":[]}')
+    with pytest.raises(ValueError, match="must be a JSON array"):
+        parse_free_planning_json('{"state_summary":"s","candidates":"grasp"}')
+
+
+def test_parse_free_planning_json_accepts_single_candidate() -> None:
+    stop_only = parse_free_planning_json(
+        '{"state_summary":"s","candidates":["stop"]}'
+    )
+    assert len(stop_only["candidates"]) == 1
+    assert stop_only["candidates"][0]["type"] == "stop"
+    assert stop_only["candidates"][0]["terminates_rollout"] is True
+    assert stop_only["stop_only"] is True
+
+    single = parse_free_planning_json(
+        '{"state_summary":"s","candidates":["grasp the mug"]}'
+    )
+    assert len(single["candidates"]) == 1
+    assert single["candidates"][0]["terminates_rollout"] is False
+    assert single["stop_only"] is False
+
+
+def test_deployment_candidates_free_masks_stop_under_no_stop_diagnostic() -> None:
+    candidates = parse_free_planning_json(
+        '{"state_summary":"s",'
+        '"candidates":["grasp the mug","carry the mug to the basket","stop"]}'
+    )["candidates"]
+    deployed = deployment_candidates_free(
+        candidates, termination_mode="environment_only_no_stop_v1"
+    )
+    assert [candidate["type"] for candidate in deployed] == ["free", "free"]
+    assert [candidate["label"] for candidate in deployed] == ["1", "2"]
+    assert all(not candidate["terminates_rollout"] for candidate in deployed)
+
+    kept = deployment_candidates_free(candidates, termination_mode="qwen_stop_v1")
+    assert [candidate["type"] for candidate in kept] == ["free", "free", "stop"]
+
+    only_stop = parse_free_planning_json(
+        '{"state_summary":"s","candidates":["stop"]}'
+    )["candidates"]
+    assert (
+        deployment_candidates_free(
+            only_stop, termination_mode="environment_only_no_stop_v1"
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="unknown JITRL termination mode"):
+        deployment_candidates_free(candidates, termination_mode="unknown")
+
+
+def test_plan_and_score_free_returns_stop_only_masked(monkeypatch) -> None:
+    from jitpi05.jitrl import planner as planner_module
+
+    stop_candidate = {
+        "label": "1",
+        "type": "stop",
+        "text": "stop",
+        "semantic_key": "stop",
+        "enabled": True,
+        "terminates_rollout": True,
+    }
+    proposal = {
+        "binding_prompt": "p",
+        "binding_raw_output": '{"state_summary":"s","candidates":["stop"]}',
+        "binding_assistant_prefill": "{",
+        "binding_generated_tokens": 1,
+        "binding_generation_reached_limit": False,
+        "state_summary": "s",
+        "workspace": [],
+        "termination_mode": "environment_only_no_stop_v1",
+        "binding": {"state_summary": "s", "candidates": ["stop"]},
+        "candidates": [dict(stop_candidate)],
+        "qwen_candidates": [dict(stop_candidate)],
+        "stop_only": True,
+    }
+    monkeypatch.setattr(
+        planner_module, "generate_free_candidates", lambda *args, **kwargs: proposal
+    )
+    result = planner_module.plan_and_score_free(
+        None, None, [], "task", max_new_tokens=8
+    )
+    assert result["stop_only_masked"] is True
+    assert result["candidates"] == []
+    assert result["qwen_candidates"][0]["type"] == "stop"
+
+
+def test_free_proposal_generation_prefills_json_and_parses_candidates() -> None:
+    raw = json.dumps(
+        {
+            "state_summary": "gripper open above mug",
+            "candidates": ["grasp the mug", "carry the mug to the basket", "stop"],
+        }
+    )
+    captured = {}
+
+    class Inputs(dict):
+        def to(self, device):
+            return self
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            captured["messages"] = messages
+            return Inputs(
+                input_ids=torch.tensor([[1, 2]]),
+                attention_mask=torch.tensor([[1, 1]]),
+            )
+
+        @staticmethod
+        def decode(token_ids, **kwargs):
+            captured["decoded_token_count"] = int(token_ids.shape[0])
+            return raw[1:]
+
+    class Model:
+        device = torch.device("cpu")
+
+        @staticmethod
+        def generate(**kwargs):
+            captured["generate_kwargs"] = kwargs
+            return torch.tensor([[1, 2, 7, 8]])
+
+    proposal = generate_free_candidates(
+        Model(),
+        Processor(),
+        [],
+        "put the mug in the basket",
+        max_new_tokens=8,
+    )
+    assert captured["messages"][-1]["role"] == "assistant"
+    assert captured["generate_kwargs"]["max_new_tokens"] == 8
+    assert proposal["binding_raw_output"] == raw
+    assert [candidate["text"] for candidate in proposal["candidates"]] == [
+        "grasp the mug",
+        "carry the mug to the basket",
+        "stop",
+    ]
+    assert proposal["candidates"][-1]["terminates_rollout"] is True

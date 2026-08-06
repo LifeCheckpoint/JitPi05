@@ -25,6 +25,8 @@ SCALAR_METRICS = (
     "qwen_stop_termination_rate",
     "max_steps_termination_rate",
     "neighbor_action_coverage_rate",
+    "free_action_match_rate",
+    "free_unseen_rate",
     "nonzero_advantage_rate",
     "choice_change_rate",
     "ucb_application_rate",
@@ -46,6 +48,15 @@ PAIRED_METRICS = (
     PRIMARY_EFFECT_METRIC,
     "success_rate",
     "final_10_success_rate",
+)
+# Free-candidate methods do not use the fixed nine-action workspace.
+_FREE_METHODS = ("jitrl-free", "static-free")
+# Comparison names for the two paired (learner, static) method pairs.
+PAIRED_COMPARISONS = ("jitrl-static", "jitrl-free-static-free")
+# (static_method, learner_method, comparison_name) triples used for paired diffs.
+_PAIRED_SPECS = (
+    ("static", "jitrl", "jitrl-static"),
+    ("static-free", "jitrl-free", "jitrl-free-static-free"),
 )
 WARNINGS = (
     "Success rate is retained as an auxiliary health metric; the primary "
@@ -184,7 +195,11 @@ def compute_run_metrics(
             float(np.mean(successful_steps)) if successful_steps else None
         ),
         "memory_size": len(memory),
-        "workspace_active_rate": _rate(candidate_count, 9 * len(chunks)),
+        "workspace_active_rate": (
+            None
+            if method in _FREE_METHODS
+            else _rate(candidate_count, 9 * len(chunks))
+        ),
         "masked_stop_candidate_rate": _rate(masked_stop_candidate_count, len(chunks)),
         "stop_selection_rate": _rate(stop_selection_count, len(chunks)),
         "qwen_stop_termination_rate": _rate(
@@ -194,6 +209,14 @@ def compute_run_metrics(
             sum(reason == "max_steps" for reason in termination_reasons), episode_count
         ),
         "neighbor_action_coverage_rate": _rate(seen_count, candidate_count),
+        "free_action_match_rate": (
+            _rate(seen_count, candidate_count) if method in _FREE_METHODS else None
+        ),
+        "free_unseen_rate": (
+            1.0 - _rate(seen_count, candidate_count)
+            if method in _FREE_METHODS
+            else None
+        ),
         "nonzero_advantage_rate": _rate(nonzero_advantage_count, candidate_count),
         "choice_change_rate": _rate(changed_count, len(chunks)),
         "ucb_application_rate": _rate(ucb_applied_count, candidate_count),
@@ -421,39 +444,48 @@ def _build_one_task_summary(
         "run_count": sum(method["run_count"] for method in methods.values()),
         "methods": methods,
     }
-    if "static" in metrics_by_method and "jitrl" in metrics_by_method:
-        static_by_seed = metrics_by_method["static"]
-        jitrl_by_seed = metrics_by_method["jitrl"]
-        if static_by_seed and set(static_by_seed) == set(jitrl_by_seed):
-            paired: dict[str, Any] = {
-                "comparison": "jitrl-static",
-                "seeds": sorted(static_by_seed),
-            }
-            for metric in PAIRED_METRICS:
-                differences = []
-                for seed in sorted(static_by_seed):
-                    if metric == PRIMARY_EFFECT_METRIC:
-                        static_value = static_by_seed[seed]["mean_success_steps"]
-                        jitrl_value = jitrl_by_seed[seed]["mean_success_steps"]
-                        # Positive means JitRL completed successful episodes in
-                        # fewer steps; None means one method had no successes.
-                        difference = (
-                            None
-                            if static_value is None or jitrl_value is None
-                            else float(static_value) - float(jitrl_value)
-                        )
-                    else:
-                        static_value = static_by_seed[seed][metric]
-                        jitrl_value = jitrl_by_seed[seed][metric]
-                        difference = float(jitrl_value) - float(static_value)
-                    differences.append((seed, difference))
-                paired[metric] = aggregate_seed_values(
-                    differences,
-                    namespace=(
-                        f"eval_jitrl|bootstrap|{task_name}|jitrl-static|{metric}"
-                    ),
-                )
-            task_summary["paired_differences"] = paired
+    paired_differences: dict[str, Any] = {}
+    for static_method, jitrl_method, comparison in _PAIRED_SPECS:
+        if (
+            static_method not in metrics_by_method
+            or jitrl_method not in metrics_by_method
+        ):
+            continue
+        static_by_seed = metrics_by_method[static_method]
+        jitrl_by_seed = metrics_by_method[jitrl_method]
+        if not static_by_seed or set(static_by_seed) != set(jitrl_by_seed):
+            continue
+        paired: dict[str, Any] = {
+            "comparison": comparison,
+            "seeds": sorted(static_by_seed),
+        }
+        for metric in PAIRED_METRICS:
+            differences = []
+            for seed in sorted(static_by_seed):
+                if metric == PRIMARY_EFFECT_METRIC:
+                    static_value = static_by_seed[seed]["mean_success_steps"]
+                    jitrl_value = jitrl_by_seed[seed]["mean_success_steps"]
+                    # Positive means the learner completed successful episodes in
+                    # fewer steps; None means one method had no successes.
+                    difference = (
+                        None
+                        if static_value is None or jitrl_value is None
+                        else float(static_value) - float(jitrl_value)
+                    )
+                else:
+                    static_value = static_by_seed[seed][metric]
+                    jitrl_value = jitrl_by_seed[seed][metric]
+                    difference = float(jitrl_value) - float(static_value)
+                differences.append((seed, difference))
+            paired[metric] = aggregate_seed_values(
+                differences,
+                namespace=(
+                    f"eval_jitrl|bootstrap|{task_name}|{comparison}|{metric}"
+                ),
+            )
+        paired_differences[comparison] = paired
+    if paired_differences:
+        task_summary["paired_differences"] = paired_differences
     return task_summary
 
 
@@ -495,16 +527,23 @@ def build_summary(
             for metric in SCALAR_METRICS
         }
 
-    macro_paired: dict[str, Any] = {"comparison": "jitrl-static"}
-    for metric in PAIRED_METRICS:
-        macro_paired[metric] = aggregate_task_values(
-            [
-                (task_name, task_summary["paired_differences"][metric]["mean"])
-                for task_name, task_summary in task_summaries.items()
-                if "paired_differences" in task_summary
-            ],
-            namespace=f"eval_jitrl|task-macro|jitrl-static|{metric}",
-        )
+    macro_paired: dict[str, Any] = {}
+    for _, _, comparison in _PAIRED_SPECS:
+        per_comparison: dict[str, Any] = {"comparison": comparison}
+        for metric in PAIRED_METRICS:
+            per_comparison[metric] = aggregate_task_values(
+                [
+                    (
+                        task_name,
+                        task_summary["paired_differences"][comparison][metric]["mean"],
+                    )
+                    for task_name, task_summary in task_summaries.items()
+                    if "paired_differences" in task_summary
+                    and comparison in task_summary["paired_differences"]
+                ],
+                namespace=f"eval_jitrl|task-macro|{comparison}|{metric}",
+            )
+        macro_paired[comparison] = per_comparison
 
     return {
         "primary_effect_metric": PRIMARY_EFFECT_METRIC,

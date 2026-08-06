@@ -101,14 +101,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     total_rollouts = total_runs * args.episodes
 
     run_experiment = None
+    models = None
     if not args.summarize_only:
         import torch
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required unless --summarize-only is used")
-        from jitpi05.jitrl.rollout import run_jitrl_experiment
+        from jitpi05.jitrl.rollout import (
+            load_experiment_models,
+            release_experiment_models,
+            run_jitrl_experiment,
+        )
 
         run_experiment = run_jitrl_experiment
+        need_evaluator = any(method in ("jitrl", "jitrl-free") for method in methods)
+        tqdm.write(
+            "[experiment] loading shared models once "
+            f"(need_evaluator={need_evaluator})"
+        )
+        models = load_experiment_models(need_evaluator=need_evaluator)
 
     mode = "summarize" if args.summarize_only else "evaluate"
     tqdm.write(
@@ -146,6 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 seed,
                                 args.episodes,
                                 output_dir,
+                                models=models,
                             )
                         metrics = load_and_write_run_metrics(
                             output_dir,
@@ -183,6 +195,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
     finally:
         run_progress.close()
+        if models is not None:
+            release_experiment_models(models)
 
     summary = build_summary(
         collected,

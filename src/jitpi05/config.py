@@ -12,7 +12,7 @@ OUTPUT_DIR = artifact_root()
 SIM_OUTPUT_DIR = OUTPUT_DIR / "sim_eval"
 JITRL_OUTPUT_DIR = (
     OUTPUT_DIR
-    / "jitrl_eval_libero10_long_seed17_qwen2b_workspace_v2_no_stop_diagnostic"
+    / "jitrl_eval_libero10_long_seed17_qwen2b_workspace_v2_free"
 )
 MAX_PLAN_TOKENS = 20
 TOP_K = 5
@@ -20,10 +20,10 @@ SEED = 7
 SIM_EPISODES = 5
 SIM_ACTION_STEPS = 10
 
-JITRL_METHODS = ("jitrl", "static")
+JITRL_METHODS = ("jitrl-free", "static-free")
 JITRL_SEEDS = (17,)
 JITRL_EPISODES = 10
-JITRL_HIGH_LEVEL_STEPS = 30
+JITRL_HIGH_LEVEL_STEPS = 40
 JITRL_PLANNER_RETRIES = 7
 JITRL_EVALUATOR_RETRIES = 5
 JITRL_ACTION_WORKSPACE_VERSION = "libero_semantic_actions_9_compact_binding_v2"
@@ -46,6 +46,12 @@ JITRL_GEMINI_CREDENTIALS_PATH = gemini_credentials_path()
 JITRL_GEMINI_TIMEOUT_SECONDS = 120.0
 JITRL_LOGIT_CALIBRATION = "raw_qwen_fixed_workspace_v1"
 JITRL_REWARD_VERSION = "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
+# Free-candidate JitRL (method jitrl-free / static-free): Qwen proposes free-text
+# high-level actions, memory matches them by normalized-token Jaccard similarity.
+JITRL_FREE_CANDIDATES = 5
+JITRL_FREE_ACTION_SIM_THRESHOLD = 0.6
+JITRL_FREE_PLAN_TOKENS = 512
+JITRL_FREE_MAX_PLAN_RETRIES = 7
 JITRL_BOOTSTRAP_SAMPLES = 10_000
 JITRL_BOOTSTRAP_CONFIDENCE = 0.95
 

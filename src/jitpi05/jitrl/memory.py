@@ -87,6 +87,23 @@ def jaccard_similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(union)
 
 
+def normalize_action(text: str) -> str:
+    """Normalize a free-text action to a canonical lowercase token-space string.
+
+    Token order is preserved so the result is both deterministic and readable
+    (e.g. ``"Pick up the Mug!"`` -> ``"pick up the mug"``). A single-token
+    canonical form is what the free-candidate stop detection compares against.
+    """
+
+    return " ".join(_TOKEN_RE.findall(text.lower()))
+
+
+def action_similarity(left: str, right: str) -> float:
+    """Return token-set Jaccard similarity between two normalized actions."""
+
+    return jaccard_similarity(normalize_action(left), normalize_action(right))
+
+
 def discounted_returns(rewards: Sequence[float], gamma: float = 0.95) -> list[float]:
     """Compute signed reward-to-go values for one completed chunk trajectory."""
 
@@ -211,6 +228,112 @@ class JitRLMemory:
                     "advantage": advantage,
                     "normalized_advantage": 0.0,
                     "neighbor_count": len(returns),
+                    "seen": seen,
+                    "exploration_uniform": exploration_uniform,
+                    "exploration_applied": exploration_applied,
+                    "exploration_branch": exploration_branch,
+                    "ucb_bonus": ucb_bonus,
+                }
+            )
+
+        scale = max((abs(item["advantage"]) for item in candidates), default=0.0)
+        if scale:
+            for item in candidates:
+                item["normalized_advantage"] = item["advantage"] / scale
+
+        coverage = dict(Counter(neighbor["action_key"] for neighbor in local_neighbors))
+        return {
+            "V": value,
+            "neighbor_count": len(local_neighbors),
+            "neighbor_action_coverage": coverage,
+            "candidates": candidates,
+        }
+
+    def estimate_candidate_values_free(
+        self,
+        state: str,
+        candidate_texts: Sequence[str],
+        k: int | None = None,
+        *,
+        neighbors: Sequence[RetrievedEntry] | None = None,
+        exploration_uniforms: Sequence[float] | None = None,
+        exploration_rate: float = 0.0,
+        ucb_alpha: float = 0.0,
+        action_sim_threshold: float = 0.0,
+    ) -> ValueEstimate:
+        """Estimate local V/Q/A for free-text candidates via similarity matching.
+
+        Unlike :meth:`estimate_candidate_values` (which groups neighbors by the
+        exact ``action_key``), this variant treats each candidate as free text and
+        matches historical ``action_text`` entries whose normalized-token Jaccard
+        similarity reaches ``action_sim_threshold``. Unmatched candidates follow the
+        paper's stochastic unseen-action rule (optimistic UCB bonus or a zero value).
+        """
+
+        if not 0.0 <= exploration_rate <= 1.0:
+            raise ValueError("exploration_rate must be in [0, 1]")
+        if ucb_alpha < 0.0:
+            raise ValueError("ucb_alpha must be non-negative")
+        if not 0.0 <= action_sim_threshold <= 1.0:
+            raise ValueError("action_sim_threshold must be in [0, 1]")
+        local_neighbors = list(
+            self.retrieve(state, k) if neighbors is None else neighbors
+        )
+        if exploration_uniforms is None:
+            uniforms: list[float | None] = [None] * len(candidate_texts)
+        else:
+            uniforms = [float(value) for value in exploration_uniforms]
+            if len(uniforms) != len(candidate_texts):
+                raise ValueError(
+                    "exploration_uniforms and candidate_texts must have the same length"
+                )
+            if any(not 0.0 <= value < 1.0 for value in uniforms):
+                raise ValueError("exploration uniforms must be in [0, 1)")
+
+        value = (
+            sum(neighbor["return"] for neighbor in local_neighbors)
+            / len(local_neighbors)
+            if local_neighbors
+            else 0.0
+        )
+        candidates: list[CandidateValue] = []
+        for text, exploration_uniform in zip(candidate_texts, uniforms):
+            matching = [
+                neighbor
+                for neighbor in local_neighbors
+                if action_similarity(text, neighbor["action_text"])
+                >= action_sim_threshold
+            ]
+            seen = bool(matching)
+            exploration_applied = False
+            exploration_branch = "known"
+            ucb_bonus = 0.0
+            if seen:
+                q_value = sum(neighbor["return"] for neighbor in matching) / len(
+                    matching
+                )
+            elif not local_neighbors:
+                q_value = 0.0
+                exploration_branch = "empty_memory"
+            elif (
+                exploration_uniform is not None
+                and exploration_uniform < exploration_rate
+            ):
+                ucb_bonus = ucb_alpha / len(local_neighbors)
+                q_value = value + ucb_bonus
+                exploration_applied = True
+                exploration_branch = "optimistic"
+            else:
+                q_value = 0.0
+                exploration_branch = "zero"
+            advantage = q_value - value
+            candidates.append(
+                {
+                    "action_key": normalize_action(text),
+                    "Q": q_value,
+                    "advantage": advantage,
+                    "normalized_advantage": 0.0,
+                    "neighbor_count": len(matching),
                     "seen": seen,
                     "exploration_uniform": exploration_uniform,
                     "exploration_applied": exploration_applied,

@@ -25,6 +25,9 @@ from jitpi05.config import (
     JITRL_EVALUATOR_RETRIES,
     JITRL_EVALUATOR_SCORE_SCALE,
     JITRL_EXPLORATION_RATE,
+    JITRL_FREE_ACTION_SIM_THRESHOLD,
+    JITRL_FREE_MAX_PLAN_RETRIES,
+    JITRL_FREE_PLAN_TOKENS,
     JITRL_GAMMA,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_HISTORY_SIZE,
@@ -48,7 +51,16 @@ from jitpi05.jitrl.planner import (
     apply_jitrl_update,
     load_jitrl_planner,
     plan_and_score,
+    plan_and_score_free,
+    score_free_candidates,
 )
+
+# Free-candidate methods propose free-text actions from Qwen (no fixed workspace).
+FREE_METHODS = ("jitrl-free", "static-free")
+# Methods that populate/read the online experience memory.
+MEMORY_METHODS = ("jitrl", "jitrl-free")
+# Methods that apply the memory advantage logit update (beta > 0).
+UPDATED_METHODS = ("jitrl", "jitrl-free")
 from jitpi05.jitrl.vlm import (
     evaluate_chunk as evaluate_chunk_with_gemini,
 )
@@ -248,30 +260,46 @@ def _plan_and_score_with_retry(
 ) -> tuple[dict, int]:
     """Retry malformed Qwen workspace bindings without restarting the episode."""
 
+    max_retries = (
+        JITRL_FREE_MAX_PLAN_RETRIES
+        if method in FREE_METHODS
+        else JITRL_PLANNER_RETRIES
+    )
     failures = []
-    for attempt in range(1, JITRL_PLANNER_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
-            planning = plan_and_score(
-                planner_model,
-                planner_processor,
-                images,
-                overall_task,
-                recent_subtasks=recent_subtasks,
-                max_new_tokens=JITRL_MAX_PLAN_TOKENS,
-                attempt=attempt,
-            )
+            if method in FREE_METHODS:
+                planning = plan_and_score_free(
+                    planner_model,
+                    planner_processor,
+                    images,
+                    overall_task,
+                    recent_subtasks=recent_subtasks,
+                    max_new_tokens=JITRL_FREE_PLAN_TOKENS,
+                    attempt=attempt,
+                )
+            else:
+                planning = plan_and_score(
+                    planner_model,
+                    planner_processor,
+                    images,
+                    overall_task,
+                    recent_subtasks=recent_subtasks,
+                    max_new_tokens=JITRL_MAX_PLAN_TOKENS,
+                    attempt=attempt,
+                )
             return planning, attempt
         except Exception as error:
             failures.append(f"attempt {attempt}: {error}")
-            if attempt == JITRL_PLANNER_RETRIES:
+            if attempt == max_retries:
                 raise RuntimeError(
-                    f"planner failed after {JITRL_PLANNER_RETRIES} attempts:\n"
+                    f"planner failed after {max_retries} attempts:\n"
                     + "\n".join(failures)
                 ) from error
             tqdm.write(
                 f"[planner-retry] method={method} seed={seed} "
                 f"episode={episode_index + 1} high={high_level_step_index} "
-                f"attempt={attempt}/{JITRL_PLANNER_RETRIES} error={error}"
+                f"attempt={attempt}/{max_retries} error={error}"
             )
 
     raise RuntimeError("planner retry loop terminated unexpectedly")
@@ -441,31 +469,75 @@ def _run_episode(
                     episode_index=episode_index,
                     high_level_step_index=high_level_step_index,
                 )
+                if method in FREE_METHODS and planning.get("stop_only_masked"):
+                    # Qwen proposed only "stop" (a visual completion judgement)
+                    # which is disabled under environment-only termination. On the
+                    # first decision there is no previous action to reuse, so the
+                    # episode fails as a stop termination; otherwise repeat the
+                    # previous high-level action so the episode keeps running.
+                    if not selected_subtasks:
+                        termination_reason = "qwen_stop"
+                        evaluator_images.append(
+                            (
+                                active_before_images,
+                                [image.copy() for image in images],
+                            )
+                        )
+                        active_before_images = None
+                        break
+                    repeated = dict(chunks[-1]["selected_candidate"])
+                    repeated["label"] = "1"
+                    planning = score_free_candidates(
+                        planner_model,
+                        planner_processor,
+                        images,
+                        overall_task,
+                        {
+                            **planning,
+                            "candidates": [repeated],
+                            "qwen_candidates": [dict(repeated)],
+                        },
+                        selected_subtasks[-JITRL_HISTORY_SIZE:],
+                    )
+                    planning["stop_only_masked"] = True
+                    planning["repeated_previous_action"] = True
                 candidates = planning["candidates"]
                 raw_neighbors = (
                     memory.retrieve(planning["state_summary"])
-                    if method == "jitrl" and memory is not None
+                    if method in MEMORY_METHODS and memory is not None
                     else []
                 )
                 action_keys = [candidate["semantic_key"] for candidate in candidates]
                 retrieved_neighbors = _trace_neighbors(raw_neighbors)
 
-                if method == "jitrl":
+                if method in MEMORY_METHODS:
                     if memory is None:
-                        raise RuntimeError("jitrl method requires a task-local memory")
-                    value_estimate = memory.estimate_candidate_values(
-                        planning["state_summary"],
-                        action_keys,
-                        neighbors=raw_neighbors,
-                        exploration_uniforms=coordinate_exploration_uniforms(
-                            seed,
-                            episode_index,
-                            high_level_step_index,
-                            len(candidates),
-                        ),
-                        exploration_rate=JITRL_EXPLORATION_RATE,
-                        ucb_alpha=JITRL_UCB_ALPHA,
+                        raise RuntimeError(f"{method} method requires a task-local memory")
+                    exploration_uniforms = coordinate_exploration_uniforms(
+                        seed,
+                        episode_index,
+                        high_level_step_index,
+                        len(candidates),
                     )
+                    if method == "jitrl":
+                        value_estimate = memory.estimate_candidate_values(
+                            planning["state_summary"],
+                            action_keys,
+                            neighbors=raw_neighbors,
+                            exploration_uniforms=exploration_uniforms,
+                            exploration_rate=JITRL_EXPLORATION_RATE,
+                            ucb_alpha=JITRL_UCB_ALPHA,
+                        )
+                    else:
+                        value_estimate = memory.estimate_candidate_values_free(
+                            planning["state_summary"],
+                            [candidate["text"] for candidate in candidates],
+                            neighbors=raw_neighbors,
+                            exploration_uniforms=exploration_uniforms,
+                            exploration_rate=JITRL_EXPLORATION_RATE,
+                            ucb_alpha=JITRL_UCB_ALPHA,
+                            action_sim_threshold=JITRL_FREE_ACTION_SIM_THRESHOLD,
+                        )
                 else:
                     value_estimate = _static_value_estimate(action_keys)
                 value_estimate = _trace_value_estimate(value_estimate)
@@ -478,13 +550,13 @@ def _run_episode(
                 update = apply_jitrl_update(
                     planning["base_logits"],
                     normalized_advantages,
-                    beta=JITRL_BETA if method == "jitrl" else 0.0,
+                    beta=JITRL_BETA if method in UPDATED_METHODS else 0.0,
                     temperature=JITRL_TEMPERATURE,
                     uniform=uniform,
                 )
                 selected_index = (
                     update["updated_choice_index"]
-                    if method == "jitrl"
+                    if method in UPDATED_METHODS
                     else update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
@@ -535,7 +607,10 @@ def _run_episode(
                 }
                 chunks.append(active_chunk_trace)
                 if selected_candidate["terminates_rollout"]:
-                    if JITRL_TERMINATION_MODE == "environment_only_no_stop_v1":
+                    if (
+                        JITRL_TERMINATION_MODE == "environment_only_no_stop_v1"
+                        and method not in FREE_METHODS
+                    ):
                         raise RuntimeError(
                             "stop reached rollout selection under the no-stop diagnostic"
                         )
@@ -688,6 +763,9 @@ def summarize_run(
         "high_level_policy": JITRL_QWEN_ID,
         "policy": SIM_PI05_ID,
         "evaluator": JITRL_EVALUATOR_MODEL,
+        "planning_mode": (
+            "free-candidates" if method in FREE_METHODS else "fixed-workspace"
+        ),
     }
     return {
         "model": models,
@@ -725,14 +803,57 @@ def summarize_run(
     }
 
 
+def load_experiment_models(*, need_evaluator: bool) -> dict:
+    """Load planner, policy and (optionally) evaluator once for reuse across runs.
+
+    Models stay resident on the GPU across task/method/seed runs so the CLI does not
+    repeatedly unload and reload them.
+    """
+
+    planner_model, planner_processor = load_jitrl_planner()
+    policy, preprocessor, postprocessor = load_policy()
+    evaluator = load_gemini_evaluator() if need_evaluator else None
+    return {
+        "planner_model": planner_model,
+        "planner_processor": planner_processor,
+        "policy": policy,
+        "preprocessor": preprocessor,
+        "postprocessor": postprocessor,
+        "evaluator": evaluator,
+    }
+
+
+def release_experiment_models(models: dict) -> None:
+    """Release the shared experiment models and free CUDA memory."""
+
+    for key in (
+        "planner_model",
+        "planner_processor",
+        "policy",
+        "preprocessor",
+        "postprocessor",
+        "evaluator",
+    ):
+        models[key] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def run_jitrl_experiment(
     task_spec: dict[str, Any],
     method: str,
     seed: int,
     episodes: int = JITRL_EPISODES,
     output_dir: Path = JITRL_OUTPUT_DIR,
+    models: dict | None = None,
 ) -> dict:
-    """Run one task/method/seed pairing from an independent empty memory."""
+    """Run one task/method/seed pairing from an independent empty memory.
+
+    When ``models`` (from :func:`load_experiment_models`) is provided, the resident
+    model objects are reused and not unloaded when this run finishes; otherwise the
+    models are loaded here and released in the ``finally`` block.
+    """
 
     if method not in JITRL_METHODS:
         raise ValueError(f"method must be one of {JITRL_METHODS}; got {method!r}")
@@ -755,7 +876,9 @@ def run_jitrl_experiment(
         directory.mkdir(parents=True, exist_ok=True)
 
     episode_results: list[dict] = []
-    memory = JitRLMemory(top_k=JITRL_TOP_K) if method == "jitrl" else None
+    memory = (
+        JitRLMemory(top_k=JITRL_TOP_K) if method in MEMORY_METHODS else None
+    )
     _atomic_write_json(run_dir / "episodes.json", episode_results)
     _atomic_write_json(run_dir / "memory.json", _memory_snapshot(memory))
 
@@ -766,6 +889,7 @@ def run_jitrl_experiment(
     preprocessor = None
     postprocessor = None
     current_episode = None
+    owns_models = models is None
     episode_progress = tqdm(
         total=episodes,
         desc=f"{task_name} {method} seed={seed} episodes",
@@ -775,20 +899,32 @@ def run_jitrl_experiment(
         leave=True,
     )
     try:
-        tqdm.write(
-            f"[load] task={task_name} method={method} seed={seed}: loading Qwen planner"
-        )
-        planner_model, planner_processor = load_jitrl_planner()
-        if method == "jitrl":
+        if models is not None:
+            planner_model = models["planner_model"]
+            planner_processor = models["planner_processor"]
+            policy = models["policy"]
+            preprocessor = models["preprocessor"]
+            postprocessor = models["postprocessor"]
+            evaluator = models.get("evaluator")
+            if method in MEMORY_METHODS and evaluator is None:
+                raise RuntimeError(f"{method} method requires a Gemini evaluator")
+        else:
             tqdm.write(
                 f"[load] task={task_name} method={method} seed={seed}: "
-                f"configuring {JITRL_EVALUATOR_MODEL} evaluator"
+                "loading Qwen planner"
             )
-            evaluator = load_gemini_evaluator()
-        tqdm.write(
-            f"[load] task={task_name} method={method} seed={seed}: loading π₀.₅ policy"
-        )
-        policy, preprocessor, postprocessor = load_policy()
+            planner_model, planner_processor = load_jitrl_planner()
+            if method in MEMORY_METHODS:
+                tqdm.write(
+                    f"[load] task={task_name} method={method} seed={seed}: "
+                    f"configuring {JITRL_EVALUATOR_MODEL} evaluator"
+                )
+                evaluator = load_gemini_evaluator()
+            tqdm.write(
+                f"[load] task={task_name} method={method} seed={seed}: "
+                "loading π₀.₅ policy"
+            )
+            policy, preprocessor, postprocessor = load_policy()
         tqdm.write(
             f"[ready] task={task_name} method={method} seed={seed}: models loaded"
         )
@@ -829,9 +965,9 @@ def run_jitrl_experiment(
                 )
             finally:
                 step_progress.close()
-            if method == "jitrl":
+            if method in MEMORY_METHODS:
                 if evaluator is None:
-                    raise RuntimeError("jitrl method lost its Gemini evaluator")
+                    raise RuntimeError(f"{method} method lost its Gemini evaluator")
                 _step_rewards, returns = _evaluate_episode_chunks(
                     evaluator,
                     episode_result,
@@ -847,9 +983,9 @@ def run_jitrl_experiment(
                 for chunk, return_value in zip(episode_result["chunks"], returns):
                     chunk["return"] = float(return_value)
 
-            if method == "jitrl":
+            if method in MEMORY_METHODS:
                 if memory is None:
-                    raise RuntimeError("jitrl method lost its task-local memory")
+                    raise RuntimeError(f"{method} method lost its task-local memory")
                 memory.append_episode(episode_records, returns, episode_index)
 
             tensor_paths = _save_episode_tensors(tensor_dir, episode_index, tensors)
@@ -903,14 +1039,15 @@ def run_jitrl_experiment(
         raise
     finally:
         episode_progress.close()
-        planner_model = None
-        planner_processor = None
-        evaluator = None
-        policy = None
-        preprocessor = None
-        postprocessor = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if owns_models:
+            planner_model = None
+            planner_processor = None
+            evaluator = None
+            policy = None
+            preprocessor = None
+            postprocessor = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     memory_size = len(memory) if memory is not None else 0
     summary = summarize_run(
