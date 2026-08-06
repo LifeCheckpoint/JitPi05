@@ -81,3 +81,59 @@ def test_fixed_workspace_metrics_exclude_augmentation_fields() -> None:
     assert metrics["mean_update_kl"] == 0.03
     assert "augmentation_choice_change_rate" not in metrics
     assert "memory_only_selection_rate" not in metrics
+
+
+def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
+    metrics = compute_run_metrics(
+        [
+            {
+                "success": True,
+                "termination_mode": "environment_only_no_stop_v1",
+                "termination_reason": "environment_success",
+                "steps": 120,
+                "cycle_enabled": True,
+                "cycle_checks": 2,
+                "cycle_backtracks": 1,
+                "cycle_vetoes": 1,
+                "cycle_retries": 1,
+                "cycle_wall_time_seconds": 0.5,
+                "mbr_hypothesis_count": 8,
+                "mbr_events": [
+                    {"selected_risk": 1.25, "mean_pairwise_distance": 2.5}
+                ],
+                "chunks": [],
+            },
+            {
+                "success": False,
+                "termination_mode": "environment_only_no_stop_v1",
+                "termination_reason": "max_steps",
+                "steps": 200,
+                "cycle_enabled": True,
+                "cycle_checks": 1,
+                "cycle_backtracks": 0,
+                "cycle_vetoes": 1,
+                "cycle_retries": 0,
+                "cycle_wall_time_seconds": 0.25,
+                "mbr_hypothesis_count": 0,
+                "mbr_events": [],
+                "chunks": [],
+            },
+        ],
+        [],
+        task_spec={"name": "cycle-task"},
+        method="jitrl-free-cycle",
+        seed=17,
+    )
+
+    assert metrics["cycle_enabled_rate"] == 1.0
+    assert metrics["cycle_check_count"] == 3.0
+    assert metrics["cycle_backtrack_count"] == 1.0
+    assert metrics["cycle_backtrack_rate"] == 1 / 3
+    assert metrics["cycle_veto_count"] == 2.0
+    assert metrics["cycle_veto_rate"] == 2 / 3
+    assert metrics["cycle_success_after_backtrack_rate"] == 1.0
+    assert metrics["cycle_failure_after_backtrack_rate"] == 0.0
+    assert metrics["mbr_hypothesis_count"] == 8.0
+    assert metrics["mean_mbr_selected_risk"] == 1.25
+    assert metrics["mean_mbr_pairwise_distance"] == 2.5
+    assert metrics["mean_cycle_wall_time_seconds"] == 0.375

@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import shutil
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,14 @@ from lerobot.utils.io_utils import write_video
 from tqdm.auto import tqdm
 
 from jitpi05.config import (
+    CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
+    CYCLE_CONFIG_VERSION,
+    CYCLE_JITRL_METHODS,
+    CYCLE_MAX_RETRIES,
+    CYCLE_MBR_ACTION_STEPS,
+    CYCLE_MBR_DELTA_DIMS,
+    CYCLE_MBR_HYPOTHESES,
+    CYCLE_PROGRESS_THRESHOLD,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
     JITRL_EPISODES,
@@ -46,6 +55,19 @@ from jitpi05.config import (
     SIM_ACTION_STEPS,
     SIM_PI05_ID,
 )
+from jitpi05.jitrl.cycle import (
+    CycleGate,
+    PhysicalEvidence,
+    SemanticAnchor,
+    resolve_cycle_decision,
+    select_mbr_chunk,
+    semantic_action_type,
+)
+from jitpi05.jitrl.libero_recovery import (
+    capture_robot_configuration,
+    refresh_libero_observation,
+    restore_robot_configuration,
+)
 from jitpi05.jitrl.memory import JitRLMemory, discounted_returns
 from jitpi05.jitrl.planner import (
     apply_jitrl_update,
@@ -54,17 +76,12 @@ from jitpi05.jitrl.planner import (
     plan_and_score_free,
     score_free_candidates,
 )
-
-# Free-candidate methods propose free-text actions from Qwen (no fixed workspace).
-FREE_METHODS = ("jitrl-free", "static-free")
-# Methods that populate/read the online experience memory.
-MEMORY_METHODS = ("jitrl", "jitrl-free")
-# Methods that apply the memory advantage logit update (beta > 0).
-UPDATED_METHODS = ("jitrl", "jitrl-free")
+from jitpi05.jitrl.vlm import evaluate_chunk as evaluate_chunk_with_gemini
 from jitpi05.jitrl.vlm import (
-    evaluate_chunk as evaluate_chunk_with_gemini,
+    load_cycle_failure_predictor,
+    load_gemini_evaluator,
+    predict_cycle_failure,
 )
-from jitpi05.jitrl.vlm import load_gemini_evaluator
 from jitpi05.policy import conditioned_task
 from jitpi05.simulation import (
     load_policy,
@@ -74,6 +91,24 @@ from jitpi05.simulation import (
     reset_rollout_state,
     success_from_info,
 )
+
+# Free-candidate methods propose free-text actions from Qwen (no fixed workspace).
+FREE_METHODS = (
+    "jitrl-free",
+    "static-free",
+    "jitrl-free-cycle",
+    "static-free-cycle",
+)
+# Methods that populate/read the online experience memory. Recovery actions are
+# deliberately excluded from episode_records, so Cycle does not change the JitRL
+# learning boundary.
+MEMORY_METHODS = ("jitrl", "jitrl-free", "jitrl-free-cycle")
+# Methods that apply the memory advantage logit update (beta > 0).
+UPDATED_METHODS = ("jitrl", "jitrl-free", "jitrl-free-cycle")
+CYCLE_METHODS = tuple(
+    method for method in CYCLE_JITRL_METHODS if method.endswith("-cycle")
+)
+ALL_METHODS = tuple(dict.fromkeys((*JITRL_METHODS, *CYCLE_METHODS)))
 
 # Fixed-workspace JitRL: Qwen policy logits, memory advantages, visual step rewards.
 
@@ -114,11 +149,12 @@ def coordinate_flow_noise(
     episode: int,
     chunk: int,
     device: str | torch.device = "cuda",
+    kind: str = "flow_noise",
 ) -> torch.Tensor:
-    """Rebuild one paired flow-noise tensor without materializing a whole rollout."""
+    """Rebuild one coordinate-local flow-noise tensor for paired rollout or MBR."""
 
     generator = torch.Generator(device="cpu").manual_seed(
-        coordinate_seed("flow_noise", seed, episode, chunk)
+        coordinate_seed(kind, seed, episode, chunk)
     )
     noise = torch.randn(
         1,
@@ -359,6 +395,9 @@ def _evaluate_episode_chunks(
                     f"episode={episode_index + 1} chunk={chunk_index} "
                     f"attempt={attempt}/{JITRL_EVALUATOR_RETRIES} error={error}"
                 )
+                # Exponential backoff for every retry so the attempts spread
+                # across a longer outage window instead of all landing in one.
+                time.sleep(min(2.0**attempt, 60.0))
         if evaluation is None:
             raise RuntimeError("chunk evaluator returned no result")
         evaluation["attempts"] = attempt
@@ -385,6 +424,547 @@ def _evaluate_episode_chunks(
     return step_rewards, returns
 
 
+def _run_episode_cycle(
+    *,
+    task_spec: dict[str, Any],
+    method: str,
+    seed: int,
+    episode_index: int,
+    run_dir: Path,
+    memory: JitRLMemory | None,
+    planner_model,
+    planner_processor,
+    policy,
+    preprocessor,
+    postprocessor,
+    cycle_predictor=None,
+    step_progress=None,
+) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
+    """Run the zero-shot CycleVLA-lite state machine for one episode.
+
+    The ordinary Qwen/JitRL path remains separate below.  Cycle recovery is a
+    physical intervention on the existing environment state: it never calls the
+    planner, never creates an experience record, and never appends a synthetic
+    evaluator frame.  MBR candidates are generated only after an accepted
+    backtrack and are selected as an original pi0.5 hypothesis.
+    """
+
+    cycle_wall_start = time.perf_counter()
+    envs, env, env_preprocessor, env_postprocessor = make_single_env(
+        task_spec, episode_index
+    )
+    episode_seed = int(seed) + episode_index
+    video_path = run_dir / "videos" / f"episode_{episode_index}.mp4"
+    frames: list[np.ndarray] = []
+    action_chunks: list[torch.Tensor] = []
+    actions: list[torch.Tensor] = []
+    rewards: list[float] = []
+    chunks: list[dict] = []
+    evaluator_images: list[tuple[list, list]] = []
+    episode_records: list[dict] = []
+    selected_subtasks: list[str] = []
+    anchors: list[SemanticAnchor] = []
+    snapshots: dict[str, Any] = {}
+    anchor_traces: dict[str, dict] = {}
+    evaluated_anchor_ids: set[str] = set()
+    recovery_events: list[dict] = []
+    cycle_trace: list[dict] = []
+    active_anchor: SemanticAnchor | None = None
+    active_trace: dict | None = None
+    active_condition = ""
+    active_before_images: list | None = None
+    active_attempt_chunks = 0
+    active_attempt_is_recovery = False
+    active_attempt_checked = False
+    last_info: dict = {}
+    overall_task = ""
+    success = False
+    episode_done = False
+    termination_reason: str | None = None
+    cycle_retry_count = 0
+    cycle_check_count = 0
+    cycle_backtrack_count = 0
+    cycle_veto_count = 0
+    mbr_events: list[dict] = []
+    low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
+    gate = CycleGate(threshold=CYCLE_PROGRESS_THRESHOLD)
+
+    def _current_images() -> list:
+        current_frame = policy_frame(observation, overall_task, env_preprocessor)
+        return [image.copy() for image in planning_images(current_frame)]
+
+    def _finalize_evaluator_images() -> None:
+        nonlocal active_before_images
+        if (
+            active_anchor is None
+            or active_before_images is None
+            or active_anchor.anchor_id in evaluated_anchor_ids
+        ):
+            active_before_images = None
+            return
+        evaluator_images.append((active_before_images, _current_images()))
+        evaluated_anchor_ids.add(active_anchor.anchor_id)
+        active_before_images = None
+
+    def _execute_action_chunk(
+        action_chunk: torch.Tensor,
+        *,
+        source: str,
+        anchor_id: str,
+    ) -> dict:
+        nonlocal observation, episode_done, success, termination_reason, last_info
+        chunk_index = len(action_chunks)
+        action_start_step = len(actions)
+        cpu_chunk = action_chunk.detach().cpu().clone()
+        action_chunks.append(cpu_chunk)
+        for action in cpu_chunk[:SIM_ACTION_STEPS]:
+            action_transition = env_postprocessor({"action": action.unsqueeze(0)})
+            env_action = action_transition["action"].detach().cpu()
+            observation, reward, terminated, truncated, info = env.step(
+                env_action.numpy()
+            )
+            actions.append(env_action.squeeze(0).clone())
+            rewards.append(float(reward[0]))
+            frames.append(env.render()[0])
+            last_info = info if isinstance(info, dict) else {}
+            if step_progress is not None:
+                step_progress.update(1)
+            episode_done = bool(terminated[0] or truncated[0])
+            success = success or success_from_info(last_info)
+            if success:
+                termination_reason = "environment_success"
+            elif episode_done:
+                termination_reason = "environment_done"
+            elif len(actions) >= max_steps:
+                termination_reason = "max_steps"
+            if episode_done or success or len(actions) >= max_steps:
+                break
+        return {
+            "chunk_index": chunk_index,
+            "action_start_step": action_start_step,
+            "action_end_step": len(actions),
+            "source": source,
+            "anchor_id": anchor_id,
+        }
+
+    def _predict_action_chunk(frame: dict, condition: str, noise: torch.Tensor) -> torch.Tensor:
+        conditioned_frame = dict(frame)
+        conditioned_frame["task"] = [condition]
+        batch = preprocessor(conditioned_frame)
+        with torch.inference_mode():
+            normalized_chunk = policy.predict_action_chunk(batch, noise=noise)
+        action_chunk = postprocessor(normalized_chunk).squeeze(0)
+        del batch, normalized_chunk, noise
+        if action_chunk.shape[0] != policy.config.chunk_size:
+            raise ValueError(
+                "predict_action_chunk must return the complete configured action chunk"
+            )
+        return action_chunk.detach().cpu()
+
+    def _run_mbr_retry(anchor: SemanticAnchor, restored_frame: dict) -> dict:
+        candidates: list[torch.Tensor] = []
+        candidate_seeds: list[int] = []
+        mbr_retry_index = max(0, cycle_retry_count - 1)
+        mbr_coordinate = (
+            anchor.high_level_step_index * CYCLE_MAX_RETRIES * CYCLE_MBR_HYPOTHESES
+            + mbr_retry_index * CYCLE_MBR_HYPOTHESES
+        )
+        for candidate_index in range(CYCLE_MBR_HYPOTHESES):
+            coordinate = mbr_coordinate + candidate_index
+            candidate_seeds.append(
+                coordinate_seed("mbr_flow_noise", seed, episode_index, coordinate)
+            )
+            noise = coordinate_flow_noise(
+                policy,
+                seed,
+                episode_index,
+                coordinate,
+                device="cuda",
+                kind="mbr_flow_noise",
+            )
+            candidates.append(_predict_action_chunk(restored_frame, anchor.condition, noise))
+        selected_chunk, selection = select_mbr_chunk(
+            torch.stack(candidates),
+            action_steps=CYCLE_MBR_ACTION_STEPS,
+            delta_dims=CYCLE_MBR_DELTA_DIMS,
+        )
+        action_record = _execute_action_chunk(
+            selected_chunk,
+            source="mbr_retry",
+            anchor_id=anchor.anchor_id,
+        )
+        event = {
+            "event": "mbr_retry",
+            "anchor_id": anchor.anchor_id,
+            "high_level_step_index": anchor.high_level_step_index,
+            "hypothesis_count": CYCLE_MBR_HYPOTHESES,
+            "action_steps": CYCLE_MBR_ACTION_STEPS,
+            "delta_dims": CYCLE_MBR_DELTA_DIMS,
+            "candidate_flow_noise_seeds": candidate_seeds,
+            "selected_index": selection.selected_index,
+            "selected_risk": selection.selected_risk,
+            "mean_pairwise_distance": selection.mean_pairwise_distance,
+            "risks": list(selection.risks),
+            "features": selection.features.tolist(),
+            "pairwise_distances": selection.pairwise_distances.tolist(),
+            "executed_chunk": action_record,
+        }
+        if active_trace is not None:
+            active_trace["retry_low_level_chunks"].append(action_record)
+        mbr_events.append(event)
+        recovery_events.append(event)
+        return event
+
+    def _physical_evidence(anchor: SemanticAnchor) -> PhysicalEvidence:
+        raw = last_info.get("cycle_physical_evidence") if isinstance(last_info, dict) else None
+        values = raw if isinstance(raw, dict) else {}
+        success_fact = success or values.get("postcondition_satisfied") is True
+        failure_fact = values.get("failure_detected")
+        reasons = values.get("failure_reasons", ())
+        if isinstance(reasons, str):
+            reasons = (reasons,)
+        return PhysicalEvidence(
+            action_type=anchor.action_type,
+            gripper_closed=values.get("gripper_closed"),
+            object_following_gripper=values.get("object_following_gripper"),
+            target_identity_ok=values.get("target_identity_ok"),
+            destination_reached=values.get("destination_reached"),
+            released=values.get("released"),
+            postcondition_satisfied=True if success_fact else values.get("postcondition_satisfied"),
+            failure_detected=failure_fact,
+            failure_reasons=tuple(str(reason) for reason in reasons),
+        )
+
+    try:
+        reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
+        observation, _ = env.reset(seed=[episode_seed])
+        overall_task = list(env.call("task_description"))[0]
+        max_steps = int(env.call("_max_episode_steps")[0])
+        frames.append(env.render()[0])
+
+        while len(actions) < max_steps and not success and not episode_done:
+            if active_anchor is None:
+                low_level_chunk_index = len(action_chunks)
+                high_level_step_index = len(chunks)
+                frame = policy_frame(observation, overall_task, env_preprocessor)
+                images = planning_images(frame)
+                active_before_images = [image.copy() for image in images]
+                if step_progress is not None:
+                    step_progress.set_postfix_str(
+                        f"low={low_level_chunk_index} high={high_level_step_index} planner=qwen-cycle",
+                        refresh=True,
+                    )
+                planning, planner_attempts = _plan_and_score_with_retry(
+                    planner_model,
+                    planner_processor,
+                    images,
+                    overall_task,
+                    selected_subtasks[-JITRL_HISTORY_SIZE:],
+                    method=method,
+                    seed=seed,
+                    episode_index=episode_index,
+                    high_level_step_index=high_level_step_index,
+                )
+                if planning.get("stop_only_masked"):
+                    if not selected_subtasks:
+                        termination_reason = "qwen_stop"
+                        evaluator_images.append((active_before_images, [image.copy() for image in images]))
+                        active_before_images = None
+                        break
+                    repeated = dict(chunks[-1]["selected_candidate"])
+                    repeated["label"] = "1"
+                    planning = score_free_candidates(
+                        planner_model,
+                        planner_processor,
+                        images,
+                        overall_task,
+                        {**planning, "candidates": [repeated], "qwen_candidates": [dict(repeated)]},
+                        selected_subtasks[-JITRL_HISTORY_SIZE:],
+                    )
+                    planning["stop_only_masked"] = True
+                    planning["repeated_previous_action"] = True
+                candidates = planning["candidates"]
+                raw_neighbors = (
+                    memory.retrieve(planning["state_summary"])
+                    if method in MEMORY_METHODS and memory is not None
+                    else []
+                )
+                action_keys = [candidate["semantic_key"] for candidate in candidates]
+                retrieved_neighbors = _trace_neighbors(raw_neighbors)
+                if method in MEMORY_METHODS:
+                    if memory is None:
+                        raise RuntimeError(f"{method} method requires a task-local memory")
+                    exploration_uniforms = coordinate_exploration_uniforms(
+                        seed, episode_index, high_level_step_index, len(candidates)
+                    )
+                    if method == "jitrl":
+                        value_estimate = memory.estimate_candidate_values(
+                            planning["state_summary"], action_keys,
+                            neighbors=raw_neighbors,
+                            exploration_uniforms=exploration_uniforms,
+                            exploration_rate=JITRL_EXPLORATION_RATE,
+                            ucb_alpha=JITRL_UCB_ALPHA,
+                        )
+                    else:
+                        value_estimate = memory.estimate_candidate_values_free(
+                            planning["state_summary"], [candidate["text"] for candidate in candidates],
+                            neighbors=raw_neighbors,
+                            exploration_uniforms=exploration_uniforms,
+                            exploration_rate=JITRL_EXPLORATION_RATE,
+                            ucb_alpha=JITRL_UCB_ALPHA,
+                            action_sim_threshold=JITRL_FREE_ACTION_SIM_THRESHOLD,
+                        )
+                else:
+                    value_estimate = _static_value_estimate(action_keys)
+                value_estimate = _trace_value_estimate(value_estimate)
+                update = apply_jitrl_update(
+                    planning["base_logits"],
+                    [item["normalized_advantage"] for item in value_estimate["candidates"]],
+                    beta=JITRL_BETA if method in UPDATED_METHODS else 0.0,
+                    temperature=JITRL_TEMPERATURE,
+                    uniform=coordinate_uniform(seed, episode_index, high_level_step_index),
+                )
+                selected_index = (
+                    update["updated_choice_index"] if method in UPDATED_METHODS
+                    else update["base_choice_index"]
+                )
+                selected_candidate = candidates[selected_index]
+                active_condition = conditioned_task(overall_task, selected_candidate["text"])
+                anchor_id = f"anchor-{high_level_step_index}"
+                active_anchor = SemanticAnchor(
+                    anchor_id=anchor_id,
+                    action_text=selected_candidate["text"],
+                    condition=active_condition,
+                    high_level_step_index=high_level_step_index,
+                    action_type=semantic_action_type(selected_candidate),
+                )
+                anchors.append(active_anchor)
+                snapshots[anchor_id] = capture_robot_configuration(env)
+                episode_records.append(
+                    {
+                        "state": planning["state_summary"],
+                        "action_key": selected_candidate["semantic_key"],
+                        "action_text": selected_candidate["text"],
+                        "chunk_index": high_level_step_index,
+                    }
+                )
+                selected_subtasks.append(selected_candidate["text"])
+                active_trace = {
+                    "chunk_index": high_level_step_index,
+                    "anchor_id": anchor_id,
+                    "planner_attempts": planner_attempts,
+                    "binding_prompt": planning["binding_prompt"],
+                    "binding_raw_output": planning["binding_raw_output"],
+                    "binding_assistant_prefill": planning["binding_assistant_prefill"],
+                    "binding_generated_tokens": planning["binding_generated_tokens"],
+                    "binding_generation_reached_limit": planning["binding_generation_reached_limit"],
+                    "binding": planning["binding"],
+                    "selection_prompt": planning["selection_prompt"],
+                    "state_summary": planning["state_summary"],
+                    "workspace": planning["workspace"],
+                    "qwen_candidates": planning["qwen_candidates"],
+                    "candidates": candidates,
+                    "termination_mode": planning["termination_mode"],
+                    "candidate_token_ids": planning["candidate_token_ids"],
+                    "value_estimate": value_estimate,
+                    "retrieved_neighbors": retrieved_neighbors,
+                    **update,
+                    "selected_candidate_index": selected_index,
+                    "selected_candidate": selected_candidate,
+                    "condition": active_condition,
+                    "action_start_step": len(actions),
+                    "action_end_step": len(actions),
+                    "low_level_chunks": [],
+                    "retry_low_level_chunks": [],
+                }
+                chunks.append(active_trace)
+                anchor_traces[anchor_id] = active_trace
+                active_attempt_chunks = 0
+                active_attempt_is_recovery = False
+                active_attempt_checked = False
+                if selected_candidate["terminates_rollout"]:
+                    termination_reason = "qwen_stop"
+                    evaluator_images.append((active_before_images, [image.copy() for image in images]))
+                    active_before_images = None
+                    break
+
+            frame = policy_frame(observation, overall_task, env_preprocessor)
+            low_level_chunk_index = len(action_chunks)
+            noise = coordinate_flow_noise(
+                policy, seed, episode_index, low_level_chunk_index, device="cuda"
+            )
+            action_chunk = _predict_action_chunk(frame, active_condition, noise)
+            action_record = _execute_action_chunk(
+                action_chunk, source="policy", anchor_id=active_anchor.anchor_id
+            )
+            if active_trace is None or active_anchor is None:
+                raise RuntimeError("Cycle active action trace is missing")
+            active_trace["action_end_step"] = len(actions)
+            low_level_key = (
+                "retry_low_level_chunks" if active_attempt_is_recovery else "low_level_chunks"
+            )
+            active_trace[low_level_key].append(action_record)
+            active_attempt_chunks += 1
+
+            if episode_done or success or len(actions) >= max_steps:
+                _finalize_evaluator_images()
+                active_anchor = None
+                break
+
+            if (
+                not active_attempt_checked
+                and active_attempt_chunks >= CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS
+                and gate.triggered(active_attempt_chunks, low_level_chunks_per_plan)
+            ):
+                active_attempt_checked = True
+                cycle_check_count += 1
+                current_images = _current_images()
+                physical = _physical_evidence(active_anchor)
+                prediction = None
+                prediction_error = None
+                if cycle_predictor is not None:
+                    try:
+                        prediction = predict_cycle_failure(
+                            cycle_predictor,
+                            current_images,
+                            overall_task,
+                            [anchor.action_text for anchor in anchors],
+                            active_anchor.action_text,
+                            attempt=cycle_check_count,
+                        )
+                    except Exception as error:
+                        prediction_error = f"{type(error).__name__}: {error}"
+                decision = resolve_cycle_decision(
+                    vlm=prediction,
+                    physical=physical,
+                    anchors=anchors,
+                    current_anchor=active_anchor,
+                    retry_count=cycle_retry_count,
+                    max_retries=CYCLE_MAX_RETRIES,
+                )
+                trace_event = {
+                    "event": "cycle_check",
+                    "phase": "check",
+                    "anchor_id": active_anchor.anchor_id,
+                    "completed_chunks": active_attempt_chunks,
+                    "total_chunks": low_level_chunks_per_plan,
+                    "proxy_progress": gate.proxy_progress(active_attempt_chunks, low_level_chunks_per_plan),
+                    "physical_evidence": {
+                        "action_type": physical.action_type,
+                        "postcondition_satisfied": physical.postcondition_satisfied,
+                        "failure_detected": physical.failure_detected,
+                        "failure_reasons": list(physical.failure_reasons),
+                    },
+                    "prediction": prediction,
+                    "prediction_error": prediction_error,
+                    "decision": decision.decision,
+                    "decision_reason": decision.reason,
+                    "next_anchor_id": decision.next_anchor_id,
+                    "retry_count": decision.retry_count,
+                    "accepted": decision.accepted,
+                    "physical_failure": decision.physical_failure,
+                    "vlm_requested_backtrack": decision.vlm_requested_backtrack,
+                    "vetoed": decision.vetoed,
+                }
+                cycle_trace.append(trace_event)
+                if decision.vetoed:
+                    cycle_veto_count += 1
+                if decision.decision == "backtrack" and decision.next_anchor_id is not None:
+                    target_anchor = next(
+                        anchor for anchor in anchors if anchor.anchor_id == decision.next_anchor_id
+                    )
+                    _finalize_evaluator_images()
+                    restore_report = restore_robot_configuration(env, snapshots[target_anchor.anchor_id])
+                    observation = refresh_libero_observation(env)
+                    restored_frame = policy_frame(observation, overall_task, env_preprocessor)
+                    recovery_event = {
+                        "event": "backtrack",
+                        "phase": "backtrack",
+                        "from_anchor_id": active_anchor.anchor_id,
+                        "to_anchor_id": target_anchor.anchor_id,
+                        "decision_reason": decision.reason,
+                        "restore_report": {
+                            "qpos_max_error": restore_report.qpos_max_error,
+                            "robot_qvel_max_abs": restore_report.robot_qvel_max_abs,
+                            "non_robot_qpos_max_change": restore_report.non_robot_qpos_max_change,
+                            "controller_resynchronized": restore_report.controller_resynchronized,
+                        },
+                    }
+                    recovery_events.append(recovery_event)
+                    cycle_backtrack_count += 1
+                    cycle_retry_count = decision.retry_count
+                    active_anchor = target_anchor
+                    active_trace = anchor_traces[target_anchor.anchor_id]
+                    active_condition = target_anchor.condition
+                    active_attempt_chunks = 0
+                    active_attempt_is_recovery = True
+                    active_attempt_checked = False
+                    _run_mbr_retry(target_anchor, restored_frame)
+                    active_attempt_chunks = 1
+                    if success or episode_done or len(actions) >= max_steps:
+                        _finalize_evaluator_images()
+                        break
+
+            if active_attempt_chunks >= low_level_chunks_per_plan:
+                _finalize_evaluator_images()
+                active_anchor = None
+                active_trace = None
+                active_condition = ""
+                active_attempt_chunks = 0
+                active_attempt_is_recovery = False
+                active_attempt_checked = False
+
+    finally:
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if frames:
+                write_video(video_path, frames, env.metadata.get("render_fps", 80))
+        finally:
+            close_envs(envs)
+
+    if len(chunks) != len(evaluator_images):
+        raise RuntimeError(
+            "Cycle episode produced misaligned semantic traces and evaluator images: "
+            f"{len(chunks)} != {len(evaluator_images)}"
+        )
+    if termination_reason is None:
+        termination_reason = "max_steps"
+    tensors = _episode_tensors(action_chunks, actions, rewards, policy)
+    episode_result = {
+        "episode_index": episode_index,
+        "init_state_id": episode_index,
+        "task": overall_task,
+        "success": bool(success),
+        "termination_mode": JITRL_TERMINATION_MODE,
+        "termination_reason": termination_reason,
+        "steps": len(actions),
+        "sum_reward": float(sum(rewards)),
+        "max_reward": float(max(rewards, default=0.0)),
+        "chunk_count": len(chunks),
+        "high_level_step_count": len(chunks),
+        "low_level_chunk_count": len(action_chunks),
+        "video_path": str(video_path),
+        "chunks": chunks,
+        "cycle_enabled": True,
+        "cycle_config_version": CYCLE_CONFIG_VERSION,
+        "cycle_progress_threshold": CYCLE_PROGRESS_THRESHOLD,
+        "cycle_check_after_low_level_chunks": CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
+        "cycle_checks": cycle_check_count,
+        "cycle_backtracks": cycle_backtrack_count,
+        "cycle_vetoes": cycle_veto_count,
+        "cycle_retries": cycle_retry_count,
+        "cycle_max_retries": CYCLE_MAX_RETRIES,
+        "cycle_trace": cycle_trace,
+        "recovery_events": recovery_events,
+        "mbr_events": mbr_events,
+        "mbr_hypothesis_count": sum(
+            int(event["hypothesis_count"]) for event in mbr_events
+        ),
+        "cycle_wall_time_seconds": float(time.perf_counter() - cycle_wall_start),
+    }
+    return episode_result, episode_records, tensors, evaluator_images
+
+
 def _run_episode(
     *,
     task_spec: dict[str, Any],
@@ -398,8 +978,25 @@ def _run_episode(
     policy,
     preprocessor,
     postprocessor,
+    cycle_predictor=None,
     step_progress=None,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
+    if method in CYCLE_METHODS:
+        return _run_episode_cycle(
+            task_spec=task_spec,
+            method=method,
+            seed=seed,
+            episode_index=episode_index,
+            run_dir=run_dir,
+            memory=memory,
+            planner_model=planner_model,
+            planner_processor=planner_processor,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            cycle_predictor=cycle_predictor,
+            step_progress=step_progress,
+        )
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec, episode_index
     )
@@ -803,7 +1400,9 @@ def summarize_run(
     }
 
 
-def load_experiment_models(*, need_evaluator: bool) -> dict:
+def load_experiment_models(
+    *, need_evaluator: bool, need_cycle_predictor: bool = False
+) -> dict:
     """Load planner, policy and (optionally) evaluator once for reuse across runs.
 
     Models stay resident on the GPU across task/method/seed runs so the CLI does not
@@ -813,6 +1412,7 @@ def load_experiment_models(*, need_evaluator: bool) -> dict:
     planner_model, planner_processor = load_jitrl_planner()
     policy, preprocessor, postprocessor = load_policy()
     evaluator = load_gemini_evaluator() if need_evaluator else None
+    cycle_predictor = load_cycle_failure_predictor() if need_cycle_predictor else None
     return {
         "planner_model": planner_model,
         "planner_processor": planner_processor,
@@ -820,6 +1420,7 @@ def load_experiment_models(*, need_evaluator: bool) -> dict:
         "preprocessor": preprocessor,
         "postprocessor": postprocessor,
         "evaluator": evaluator,
+        "cycle_predictor": cycle_predictor,
     }
 
 
@@ -833,6 +1434,7 @@ def release_experiment_models(models: dict) -> None:
         "preprocessor",
         "postprocessor",
         "evaluator",
+        "cycle_predictor",
     ):
         models[key] = None
     gc.collect()
@@ -855,8 +1457,8 @@ def run_jitrl_experiment(
     models are loaded here and released in the ``finally`` block.
     """
 
-    if method not in JITRL_METHODS:
-        raise ValueError(f"method must be one of {JITRL_METHODS}; got {method!r}")
+    if method not in ALL_METHODS:
+        raise ValueError(f"method must be one of {ALL_METHODS}; got {method!r}")
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
         raise ValueError("episodes must be a positive integer")
     task_name = str(task_spec.get("name", "")).strip()
@@ -885,6 +1487,7 @@ def run_jitrl_experiment(
     planner_model = None
     planner_processor = None
     evaluator = None
+    cycle_predictor = None
     policy = None
     preprocessor = None
     postprocessor = None
@@ -906,8 +1509,11 @@ def run_jitrl_experiment(
             preprocessor = models["preprocessor"]
             postprocessor = models["postprocessor"]
             evaluator = models.get("evaluator")
+            cycle_predictor = models.get("cycle_predictor")
             if method in MEMORY_METHODS and evaluator is None:
                 raise RuntimeError(f"{method} method requires a Gemini evaluator")
+            if method in CYCLE_METHODS and cycle_predictor is None:
+                raise RuntimeError(f"{method} method requires a Cycle predictor")
         else:
             tqdm.write(
                 f"[load] task={task_name} method={method} seed={seed}: "
@@ -920,6 +1526,12 @@ def run_jitrl_experiment(
                     f"configuring {JITRL_EVALUATOR_MODEL} evaluator"
                 )
                 evaluator = load_gemini_evaluator()
+            if method in CYCLE_METHODS:
+                tqdm.write(
+                    f"[load] task={task_name} method={method} seed={seed}: "
+                    f"configuring {JITRL_EVALUATOR_MODEL} Cycle predictor"
+                )
+                cycle_predictor = load_cycle_failure_predictor()
             tqdm.write(
                 f"[load] task={task_name} method={method} seed={seed}: "
                 "loading π₀.₅ policy"
@@ -961,6 +1573,7 @@ def run_jitrl_experiment(
                     policy=policy,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
+                    cycle_predictor=cycle_predictor,
                     step_progress=step_progress,
                 )
             finally:
@@ -1043,6 +1656,7 @@ def run_jitrl_experiment(
             planner_model = None
             planner_processor = None
             evaluator = None
+            cycle_predictor = None
             policy = None
             preprocessor = None
             postprocessor = None

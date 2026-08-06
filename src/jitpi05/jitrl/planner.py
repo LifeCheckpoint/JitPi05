@@ -22,7 +22,6 @@ from jitpi05.config import (
 )
 from jitpi05.jitrl.memory import normalize_action
 from jitpi05.jitrl.semantic_actions import (
-    ACTION_LABELS,
     ACTION_TYPES,
     action_schema_text,
     active_actions,

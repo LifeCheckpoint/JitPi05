@@ -12,7 +12,7 @@ OUTPUT_DIR = artifact_root()
 SIM_OUTPUT_DIR = OUTPUT_DIR / "sim_eval"
 JITRL_OUTPUT_DIR = (
     OUTPUT_DIR
-    / "jitrl_eval_libero10_long_seed17_qwen2b_workspace_v2_free"
+    / "jitrl_cycle"
 )
 MAX_PLAN_TOKENS = 20
 TOP_K = 5
@@ -21,11 +21,49 @@ SIM_EPISODES = 5
 SIM_ACTION_STEPS = 10
 
 JITRL_METHODS = ("jitrl-free", "static-free")
+# CycleVLA-lite is an orthogonal inference wrapper.  Keep the historical
+# two-method default unchanged; the four-way comparison is opt-in via the CLI.
+CYCLE_JITRL_METHODS = (
+    "static-free",
+    "jitrl-free",
+    "static-free-cycle",
+    "jitrl-free-cycle",
+)
+CYCLE_BASE_METHODS = ("static-free", "jitrl-free")
+CYCLE_METHODS = ("static-free-cycle", "jitrl-free-cycle")
+CYCLE_METHOD_CAPABILITIES = {
+    "static-free": {"memory": False, "cycle": False},
+    "jitrl-free": {"memory": True, "cycle": False},
+    "static-free-cycle": {"memory": False, "cycle": True},
+    "jitrl-free-cycle": {"memory": True, "cycle": True},
+}
+CYCLE_PROGRESS_THRESHOLD = 0.75
+CYCLE_MBR_HYPOTHESES = 8
+CYCLE_MBR_ACTION_STEPS = 10
+CYCLE_MBR_DELTA_DIMS = 6
+CYCLE_MAX_RETRIES = 3
+CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3
+CYCLE_CONFIG_VERSION = "cyclevla_lite_zero_shot_v1"
+CYCLE_DIFFICULTY_SCREEN_EPISODES = 10
+CYCLE_DIFFICULTY_SCREEN_STATE_RANGE = (0, 9)
+CYCLE_FORMAL_STATE_RANGE = (10, 29)
+# Natural LIBERO-90 candidates with recoverable pick/place or alignment errors.
+# This is a pre-registered candidate pool, not the final post-screen panel.
+CYCLE_LIBERO90_CANDIDATES = (
+    19,
+    27,
+    53,
+    59,
+    60,
+    62,
+    69,
+    79,
+)
 JITRL_SEEDS = (17,)
 JITRL_EPISODES = 10
 JITRL_HIGH_LEVEL_STEPS = 40
 JITRL_PLANNER_RETRIES = 7
-JITRL_EVALUATOR_RETRIES = 5
+JITRL_EVALUATOR_RETRIES = 10
 JITRL_ACTION_WORKSPACE_VERSION = "libero_semantic_actions_9_compact_binding_v2"
 JITRL_TERMINATION_MODE = "environment_only_no_stop_v1"
 JITRL_HISTORY_SIZE = 2

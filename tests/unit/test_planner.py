@@ -10,9 +10,6 @@ from jitpi05.config import (
     JITRL_BETA,
     JITRL_EPISODES,
     JITRL_EVALUATOR_RETRIES,
-    JITRL_FREE_ACTION_SIM_THRESHOLD,
-    JITRL_FREE_CANDIDATES,
-    JITRL_FREE_PLAN_TOKENS,
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_LOGIT_CALIBRATION,
     JITRL_METHODS,
@@ -25,9 +22,7 @@ from jitpi05.config import (
 )
 from jitpi05.jitrl.memory import (
     JitRLMemory,
-    action_similarity,
     discounted_returns,
-    normalize_action,
 )
 from jitpi05.jitrl.metrics import build_summary, compute_run_metrics, run_dir_for
 from jitpi05.jitrl.planner import (
@@ -390,9 +385,7 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
     assert JITRL_EVALUATOR_RETRIES == 5
-    assert JITRL_OUTPUT_DIR.as_posix().endswith(
-        "libero10_long_seed17_qwen2b_workspace_v2_free"
-    )
+    assert JITRL_OUTPUT_DIR.as_posix() == "artifacts/jitrl_cycle"
     assert JITRL_REWARD_VERSION == (
         "gemini36flash_positive_step_score_div3_terminal_plus1_v3"
     )

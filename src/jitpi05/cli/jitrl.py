@@ -12,6 +12,7 @@ from typing import Any
 from tqdm.auto import tqdm
 
 from jitpi05.config import (
+    CYCLE_JITRL_METHODS,
     JITRL_EPISODES,
     JITRL_METHODS,
     JITRL_OUTPUT_DIR,
@@ -62,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--method",
         action="append",
-        choices=JITRL_METHODS,
+        choices=CYCLE_JITRL_METHODS,
         help="Method to run or summarize; repeat for multiple methods (default: all).",
     )
     parser.add_argument(
@@ -114,12 +115,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         run_experiment = run_jitrl_experiment
-        need_evaluator = any(method in ("jitrl", "jitrl-free") for method in methods)
+        need_evaluator = any(
+            method in ("jitrl", "jitrl-free", "jitrl-free-cycle")
+            for method in methods
+        )
+        need_cycle_predictor = any(method.endswith("-cycle") for method in methods)
         tqdm.write(
             "[experiment] loading shared models once "
-            f"(need_evaluator={need_evaluator})"
+            f"(need_evaluator={need_evaluator}, "
+            f"need_cycle_predictor={need_cycle_predictor})"
         )
-        models = load_experiment_models(need_evaluator=need_evaluator)
+        models = load_experiment_models(
+            need_evaluator=need_evaluator,
+            need_cycle_predictor=need_cycle_predictor,
+        )
 
     mode = "summarize" if args.summarize_only else "evaluate"
     tqdm.write(

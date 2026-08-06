@@ -40,6 +40,19 @@ SCALAR_METRICS = (
     "mean_absolute_logit_shift",
     "mean_neighbor_count",
     "memory_size",
+    "cycle_enabled_rate",
+    "cycle_check_count",
+    "cycle_backtrack_count",
+    "cycle_backtrack_rate",
+    "cycle_veto_count",
+    "cycle_veto_rate",
+    "cycle_retry_count",
+    "cycle_success_after_backtrack_rate",
+    "cycle_failure_after_backtrack_rate",
+    "mbr_hypothesis_count",
+    "mean_mbr_selected_risk",
+    "mean_mbr_pairwise_distance",
+    "mean_cycle_wall_time_seconds",
 )
 # Success rate remains an auxiliary health metric. The primary JitRL effect is
 # positive when successful episodes use fewer steps than the Static baseline.
@@ -50,13 +63,28 @@ PAIRED_METRICS = (
     "final_10_success_rate",
 )
 # Free-candidate methods do not use the fixed nine-action workspace.
-_FREE_METHODS = ("jitrl-free", "static-free")
-# Comparison names for the two paired (learner, static) method pairs.
-PAIRED_COMPARISONS = ("jitrl-static", "jitrl-free-static-free")
-# (static_method, learner_method, comparison_name) triples used for paired diffs.
+_FREE_METHODS = (
+    "jitrl-free",
+    "static-free",
+    "jitrl-free-cycle",
+    "static-free-cycle",
+)
+# Comparison names for the historical fixed-workspace/free-candidate pairs plus
+# the Cycle learner effect and the two within-learner Cycle main effects.
+PAIRED_COMPARISONS = (
+    "jitrl-static",
+    "jitrl-free-static-free",
+    "jitrl-free-cycle-static-free-cycle",
+    "cycle-static-free",
+    "cycle-jitrl-free",
+)
+# (left_method, right_method, comparison_name) triples used for paired diffs.
 _PAIRED_SPECS = (
     ("static", "jitrl", "jitrl-static"),
     ("static-free", "jitrl-free", "jitrl-free-static-free"),
+    ("static-free-cycle", "jitrl-free-cycle", "jitrl-free-cycle-static-free-cycle"),
+    ("static-free", "static-free-cycle", "cycle-static-free"),
+    ("jitrl-free", "jitrl-free-cycle", "cycle-jitrl-free"),
 )
 WARNINGS = (
     "Success rate is retained as an auxiliary health metric; the primary "
@@ -126,6 +154,43 @@ def compute_run_metrics(
     ]
 
     chunks = [chunk for episode in episodes for chunk in episode.get("chunks", [])]
+    cycle_episodes = [
+        episode for episode in episodes if episode.get("cycle_enabled", False)
+    ]
+    cycle_checks = sum(int(episode.get("cycle_checks", 0)) for episode in episodes)
+    cycle_backtracks = sum(
+        int(episode.get("cycle_backtracks", 0)) for episode in episodes
+    )
+    cycle_vetoes = sum(int(episode.get("cycle_vetoes", 0)) for episode in episodes)
+    cycle_retries = sum(int(episode.get("cycle_retries", 0)) for episode in episodes)
+    mbr_hypotheses = sum(
+        int(episode.get("mbr_hypothesis_count", 0)) for episode in episodes
+    )
+    mbr_risks = [
+        float(event["selected_risk"])
+        for episode in episodes
+        for event in episode.get("mbr_events", [])
+        if event.get("selected_risk") is not None
+    ]
+    mbr_pairwise_distances = [
+        float(event["mean_pairwise_distance"])
+        for episode in episodes
+        for event in episode.get("mbr_events", [])
+        if event.get("mean_pairwise_distance") is not None
+    ]
+    cycle_wall_times = [
+        float(episode.get("cycle_wall_time_seconds", 0.0))
+        for episode in cycle_episodes
+    ]
+    backtracked_episodes = [
+        episode for episode in episodes if int(episode.get("cycle_backtracks", 0)) > 0
+    ]
+    cycle_success_after_backtrack_count = sum(
+        bool(episode.get("success", False)) for episode in backtracked_episodes
+    )
+    cycle_failure_after_backtrack_count = (
+        len(backtracked_episodes) - cycle_success_after_backtrack_count
+    )
     candidate_count = 0
     seen_count = 0
     nonzero_advantage_count = 0
@@ -245,6 +310,33 @@ def compute_run_metrics(
         ),
         "mean_neighbor_count": (
             float(np.mean(neighbor_counts)) if neighbor_counts else 0.0
+        ),
+        "cycle_enabled_rate": _rate(len(cycle_episodes), episode_count),
+        "cycle_check_count": float(cycle_checks),
+        "cycle_backtrack_count": float(cycle_backtracks),
+        "cycle_backtrack_rate": _rate(cycle_backtracks, cycle_checks),
+        "cycle_veto_count": float(cycle_vetoes),
+        "cycle_veto_rate": _rate(cycle_vetoes, cycle_checks),
+        "cycle_retry_count": float(cycle_retries),
+        "mbr_hypothesis_count": float(mbr_hypotheses),
+        "mean_mbr_selected_risk": (
+            float(np.mean(mbr_risks)) if mbr_risks else None
+        ),
+        "mean_mbr_pairwise_distance": (
+            float(np.mean(mbr_pairwise_distances))
+            if mbr_pairwise_distances
+            else None
+        ),
+        "mean_cycle_wall_time_seconds": (
+            float(np.mean(cycle_wall_times)) if cycle_wall_times else None
+        ),
+        # These are within-run rescue/harm proxies, not counterfactual causal
+        # claims: a true rescue/harm comparison requires the paired baseline run.
+        "cycle_success_after_backtrack_rate": _rate(
+            cycle_success_after_backtrack_count, len(backtracked_episodes)
+        ),
+        "cycle_failure_after_backtrack_rate": _rate(
+            cycle_failure_after_backtrack_count, len(backtracked_episodes)
         ),
     }
 
@@ -486,6 +578,61 @@ def _build_one_task_summary(
         paired_differences[comparison] = paired
     if paired_differences:
         task_summary["paired_differences"] = paired_differences
+
+    required_methods = (
+        "static-free",
+        "jitrl-free",
+        "static-free-cycle",
+        "jitrl-free-cycle",
+    )
+    if all(method in metrics_by_method for method in required_methods):
+        seed_sets = [set(metrics_by_method[method]) for method in required_methods]
+        if seed_sets and all(seed_set == seed_sets[0] for seed_set in seed_sets):
+            interaction: dict[str, Any] = {
+                "comparison": "cycle_x_jitrl_difference_in_differences",
+                "seeds": sorted(seed_sets[0]),
+            }
+            for metric in PAIRED_METRICS:
+                differences = []
+                for seed in sorted(seed_sets[0]):
+                    static_base = metrics_by_method["static-free"][seed]
+                    jitrl_base = metrics_by_method["jitrl-free"][seed]
+                    static_cycle = metrics_by_method["static-free-cycle"][seed]
+                    jitrl_cycle = metrics_by_method["jitrl-free-cycle"][seed]
+                    if metric == PRIMARY_EFFECT_METRIC:
+                        static_delta = (
+                            None
+                            if static_base["mean_success_steps"] is None
+                            or static_cycle["mean_success_steps"] is None
+                            else float(static_base["mean_success_steps"])
+                            - float(static_cycle["mean_success_steps"])
+                        )
+                        jitrl_delta = (
+                            None
+                            if jitrl_base["mean_success_steps"] is None
+                            or jitrl_cycle["mean_success_steps"] is None
+                            else float(jitrl_base["mean_success_steps"])
+                            - float(jitrl_cycle["mean_success_steps"])
+                        )
+                    else:
+                        static_delta = float(static_cycle[metric]) - float(static_base[metric])
+                        jitrl_delta = float(jitrl_cycle[metric]) - float(jitrl_base[metric])
+                    differences.append(
+                        (
+                            seed,
+                            None
+                            if static_delta is None or jitrl_delta is None
+                            else jitrl_delta - static_delta,
+                        )
+                    )
+                interaction[metric] = aggregate_seed_values(
+                    differences,
+                    namespace=(
+                        f"eval_jitrl|bootstrap|{task_name}|"
+                        f"cycle_x_jitrl_difference_in_differences|{metric}"
+                    ),
+                )
+            task_summary["interaction_differences"] = interaction
     return task_summary
 
 
@@ -545,6 +692,25 @@ def build_summary(
             )
         macro_paired[comparison] = per_comparison
 
+    macro_interaction: dict[str, Any] = {
+        "comparison": "cycle_x_jitrl_difference_in_differences"
+    }
+    for metric in PAIRED_METRICS:
+        macro_interaction[metric] = aggregate_task_values(
+            [
+                (
+                    task_name,
+                    task_summary["interaction_differences"][metric]["mean"],
+                )
+                for task_name, task_summary in task_summaries.items()
+                if "interaction_differences" in task_summary
+            ],
+            namespace=(
+                f"eval_jitrl|task-macro|"
+                f"cycle_x_jitrl_difference_in_differences|{metric}"
+            ),
+        )
+
     return {
         "primary_effect_metric": PRIMARY_EFFECT_METRIC,
         "primary_effect_definition": (
@@ -574,6 +740,7 @@ def build_summary(
         "task_macro": {
             "methods": macro_methods,
             "paired_differences": macro_paired,
+            "interaction_differences": macro_interaction,
         },
         "warnings": list(WARNINGS),
     }
