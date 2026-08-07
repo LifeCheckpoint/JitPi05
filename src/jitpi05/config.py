@@ -104,17 +104,27 @@ CYCLE_CONFIG_VERSION = "cyclevla_lite_zero_shot_v1"
 CYCLE_PROGRESS_THRESHOLD = 0.75  # 代理进度门控（3/4 chunk）
 CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3  # 每次尝试的第 N 个 chunk 后触发检查
 CYCLE_MAX_RETRIES = 3  # 每个锚点的回溯/重试上限
+# 为 Cycle 回溯预留的统一步数预算：所有方法共用同一 max_steps =
+# 任务官方上限 + CYCLE_RETRY_TOTAL_BUDGET，保证回退链有足够步数执行完，
+# 且不因预算不同而破坏配对公平。单次回溯实际成本约 40 步，120 留三倍裕量。
+CYCLE_RETRY_BUDGET_PER_BACKTRACK = 120
+CYCLE_RETRY_TOTAL_BUDGET = CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
 CYCLE_MBR_HYPOTHESES = 8  # MBR 采样假设数
 CYCLE_MBR_ACTION_STEPS = 10  # MBR 轨迹特征使用的前缀动作步数
 CYCLE_MBR_DELTA_DIMS = 6  # MBR 累积轨迹的平移/旋转维度
+# 可接受的回溯低置信集合（transit-default 的召回调节）。默认含 medium 以激活
+# 回溯；若误回溯（harm）过高可收紧为 ("low",)。
+CYCLE_VLM_BACKTRACK_LIKELIHOODS = ("low", "medium")
+# 夹爪闭合的 qpos 阈值（两指 qpos 之和）。None 表示不启用 gripper 物理失败判断
+# （该阈值依赖夹爪型号，需在真实环境校准后再启用）。
+CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD = None
 
 
 @dataclass(frozen=True)
 class CycleEvaluationDesign:
     """LIBERO-90 难度筛选与正式评测的预注册设计。
 
-    字段当前被测试锁定但尚未接入 CLI/脚本；接入筛选与正式比较时应直接使用
-    本对象，避免再次散落为扁平常量。
+    字段被测试锁定；CLI 的 ``--screen`` 与 ``--init-state-start`` 直接消费本对象。
     """
 
     difficulty_screen_episodes: int = 10
@@ -129,100 +139,22 @@ CYCLE_EVALUATION = CycleEvaluationDesign()
 # =========================================================================
 # 评测任务定义
 # =========================================================================
-# 官方 LIBERO 任务描述（suite, max_steps, 描述列表）。导入时不初始化 LIBERO 包。
-_STANDARD_LIBERO_TASKS = (
-    (
-        "libero_spatial",
-        280,
-        (
-            "pick up the black bowl between the plate and the ramekin and place it on the plate",
-            "pick up the black bowl next to the ramekin and place it on the plate",
-            "pick up the black bowl from table center and place it on the plate",
-            "pick up the black bowl on the cookie box and place it on the plate",
-            "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
-            "pick up the black bowl on the ramekin and place it on the plate",
-            "pick up the black bowl next to the cookie box and place it on the plate",
-            "pick up the black bowl on the stove and place it on the plate",
-            "pick up the black bowl next to the plate and place it on the plate",
-            "pick up the black bowl on the wooden cabinet and place it on the plate",
-        ),
-    ),
-    (
-        "libero_object",
-        280,
-        (
-            "pick up the alphabet soup and place it in the basket",
-            "pick up the cream cheese and place it in the basket",
-            "pick up the salad dressing and place it in the basket",
-            "pick up the bbq sauce and place it in the basket",
-            "pick up the ketchup and place it in the basket",
-            "pick up the tomato sauce and place it in the basket",
-            "pick up the butter and place it in the basket",
-            "pick up the milk and place it in the basket",
-            "pick up the chocolate pudding and place it in the basket",
-            "pick up the orange juice and place it in the basket",
-        ),
-    ),
-    (
-        "libero_goal",
-        300,
-        (
-            "open the middle drawer of the cabinet",
-            "put the bowl on the stove",
-            "put the wine bottle on top of the cabinet",
-            "open the top drawer and put the bowl inside",
-            "put the bowl on top of the cabinet",
-            "push the plate to the front of the stove",
-            "put the cream cheese in the bowl",
-            "turn on the stove",
-            "put the bowl on the plate",
-            "put the wine bottle on the rack",
-        ),
-    ),
-    (
-        "libero_10",
-        520,
-        (
-            "put both the alphabet soup and the tomato sauce in the basket",
-            "put both the cream cheese box and the butter in the basket",
-            "turn on the stove and put the moka pot on it",
-            "put the black bowl in the bottom drawer of the cabinet and close it",
-            "put the white mug on the left plate and put the yellow and white mug on the right plate",
-            "pick up the book and place it in the back compartment of the caddy",
-            "put the white mug on the plate and put the chocolate pudding to the right of the plate",
-            "put both the alphabet soup and the cream cheese box in the basket",
-            "put both moka pots on the stove",
-            "put the yellow and white mug in the microwave and close it",
-        ),
-    ),
-)
+# LIBERO-90 官方 max_steps（TASK_SUITE_MAX_STEPS）。
+LIBERO90_MAX_STEPS = 400
 
-_STANDARD_LIBERO_TASK_LOOKUP = {
-    suite: {
-        task_id: description
-        for task_id, description in enumerate(descriptions)
-    }
-    for suite, _, descriptions in _STANDARD_LIBERO_TASKS
-}
-
-# 使用完整的 LIBERO-10 长程套件（位于已发表微调分布内），避免手挑跨套件面板。
-_JITRL_BENCHMARK_TASK_IDS = (("libero_10", tuple(range(10))),)
-
+# JitRL 默认评测任务池 = LIBERO-90 预注册候选池。正式评测前先用 static-free
+# 在筛选状态范围做难度筛选，再用筛选出的难任务面板做四方法正式比较。
+# 任务描述由环境在运行时提供（env.call("task_description")），此处留空占位。
 JITRL_TASKS = tuple(
     {
-        "name": f"{suite}_task{task_id}",
-        "suite": suite,
+        "name": f"libero_90_task{task_id}",
+        "suite": "libero_90",
         "task_id": task_id,
-        "description": _STANDARD_LIBERO_TASK_LOOKUP[suite][task_id],
-        "max_steps": next(
-            max_steps
-            for configured_suite, max_steps, _ in _STANDARD_LIBERO_TASKS
-            if configured_suite == suite
-        ),
-        "zero_shot": False,
+        "description": "",
+        "max_steps": LIBERO90_MAX_STEPS,
+        "zero_shot": True,
     }
-    for suite, task_ids in _JITRL_BENCHMARK_TASK_IDS
-    for task_id in task_ids
+    for task_id in CYCLE_EVALUATION.libero90_candidates
 )
 
 SIM_TASKS = (

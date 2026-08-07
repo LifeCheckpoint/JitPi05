@@ -39,12 +39,24 @@ from jitpi05.policy import conditioned_task
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 
-def make_single_env(task_spec: dict, episode_index: int):
-    """创建 batch=1 环境，并把唯一子环境固定到指定 LIBERO init state。"""
+def make_single_env(
+    task_spec: dict,
+    episode_index: int,
+    budget_max_steps: int | None = None,
+):
+    """创建 batch=1 环境，并把唯一子环境固定到指定 LIBERO init state。
+
+    ``budget_max_steps`` 覆盖任务的官方 ``max_steps`` 作为环境 episode_length
+    （JitRL 评测用它为 Cycle 回溯叠加统一预算；SIM/离线对比不传则保持原值）。
+    """
     config = LiberoEnvConfig(
         task=task_spec["suite"],
         task_ids=[task_spec["task_id"]],
-        episode_length=task_spec["max_steps"],
+        episode_length=(
+            budget_max_steps
+            if budget_max_steps is not None
+            else task_spec["max_steps"]
+        ),
         observation_height=256,
         observation_width=256,
     )

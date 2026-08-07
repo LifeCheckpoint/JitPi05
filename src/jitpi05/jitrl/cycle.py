@@ -288,7 +288,18 @@ def select_recovery_anchor(
     return min(matches, key=lambda anchor: anchor.high_level_step_index) if matches else None
 
 
-def _vlm_evidence_is_strong(vlm: Mapping[str, Any]) -> bool:
+def _vlm_evidence_is_strong(
+    vlm: Mapping[str, Any],
+    *,
+    backtrack_likelihoods: Sequence[str] = ("low",),
+) -> bool:
+    """Return True only when the VLM request meets the two-view evidence bar.
+
+    ``backtrack_likelihoods`` is the set of ``success_likelihood`` values that can
+    support a backtrack (transit-default: anything outside the set is ignored).
+    The default is the strict single value; a run may widen it (e.g. add
+    ``medium``) to raise recall at the cost of more false-positive backtracks.
+    """
     assessment = vlm.get("assessment")
     assessment_map = assessment if isinstance(assessment, Mapping) else {}
     likelihood = str(
@@ -299,7 +310,12 @@ def _vlm_evidence_is_strong(vlm: Mapping[str, Any]) -> bool:
     wrist = vlm.get("wrist_view_evidence", ())
     front_count = len(front) if isinstance(front, Sequence) and not isinstance(front, str) else 0
     wrist_count = len(wrist) if isinstance(wrist, Sequence) and not isinstance(wrist, str) else 0
-    return likelihood == "low" and agreement != "disagree" and front_count >= 1 and wrist_count >= 1
+    return (
+        likelihood in backtrack_likelihoods
+        and agreement != "disagree"
+        and front_count >= 1
+        and wrist_count >= 1
+    )
 
 
 def resolve_cycle_decision(
@@ -310,6 +326,7 @@ def resolve_cycle_decision(
     current_anchor: SemanticAnchor,
     retry_count: int,
     max_retries: int = 3,
+    backtrack_likelihoods: Sequence[str] = ("low",),
 ) -> CycleDecision:
     """Fuse evidence with transit-default and bounded, reversible recovery.
 
@@ -379,7 +396,11 @@ def resolve_cycle_decision(
             retry_count=retry_count,
             max_retries=max_retries,
         )
-    if vlm_requested and target_anchor is not None and _vlm_evidence_is_strong(vlm or {}):
+    if (
+        vlm_requested
+        and target_anchor is not None
+        and _vlm_evidence_is_strong(vlm or {}, backtrack_likelihoods=backtrack_likelihoods)
+    ):
         return CycleDecision(
             decision="backtrack",
             next_anchor_id=target_anchor.anchor_id,

@@ -15,6 +15,8 @@ from typing import Any
 
 import numpy as np
 
+from jitpi05.jitrl.cycle import PhysicalEvidence
+
 
 @dataclass(frozen=True)
 class RobotConfigurationSnapshot:
@@ -233,4 +235,62 @@ def restore_robot_configuration(
         robot_qvel_max_abs=robot_qvel_max_abs,
         non_robot_qpos_max_change=non_robot_change,
         controller_resynchronized=resynchronized,
+    )
+
+
+def _robosuite_success(control: Any) -> bool:
+    """Safely query the robosuite task success check; never raises."""
+
+    check = getattr(control, "check_success", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+
+def _gripper_qpos_from_observation(observation: Any) -> tuple[float, ...] | None:
+    """Read the batched gripper qpos from a formatted LeRobot observation."""
+
+    robot_state = observation.get("robot_state") if isinstance(observation, Mapping) else None
+    gripper = robot_state.get("gripper") if isinstance(robot_state, Mapping) else None
+    qpos = gripper.get("qpos") if isinstance(gripper, Mapping) else None
+    if qpos is None:
+        return None
+    try:
+        return tuple(float(value) for value in np.asarray(qpos, dtype=np.float64).reshape(-1))
+    except Exception:
+        return None
+
+
+def build_physical_evidence(
+    vector_env: Any,
+    observation: Any,
+    *,
+    success: bool,
+    gripper_closed_threshold: float | None = None,
+) -> PhysicalEvidence:
+    """Construct conservative physical evidence from the live LIBERO state.
+
+    Only facts that can be read safely are filled in:
+    - ``postcondition_satisfied`` is True exactly when the robosuite success
+      check passes (a mid-episode False is treated as unknown, never failure);
+    - ``gripper_closed`` is derived from the formatted observation when a
+      threshold is configured (calibrate per gripper type first).
+    All other facts stay None (unknown) instead of guessing, matching the
+    CycleVLA contract of never fabricating evidence.
+    """
+
+    control = _control_env(_single_libero_env(vector_env))
+    postcondition_satisfied = True if (success or _robosuite_success(control)) else None
+    gripper_closed = None
+    if gripper_closed_threshold is not None:
+        gripper_qpos = _gripper_qpos_from_observation(observation)
+        if gripper_qpos:
+            gripper_closed = float(sum(gripper_qpos)) <= gripper_closed_threshold
+    return PhysicalEvidence(
+        action_type="",
+        gripper_closed=gripper_closed,
+        postcondition_satisfied=postcondition_satisfied,
     )

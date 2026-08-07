@@ -4,8 +4,11 @@ from jitpi05.config import (
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
+    CYCLE_MAX_RETRIES,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_PROGRESS_THRESHOLD,
+    CYCLE_RETRY_BUDGET_PER_BACKTRACK,
+    CYCLE_RETRY_TOTAL_BUDGET,
 )
 from jitpi05.jitrl.cycle import (
     CycleGate,
@@ -35,6 +38,11 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
     assert CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS == 3
     assert CYCLE_MBR_HYPOTHESES == 8
     assert 59 in CYCLE_EVALUATION.libero90_candidates
+    assert (
+        CYCLE_RETRY_TOTAL_BUDGET
+        == CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
+    )
+    assert CYCLE_RETRY_TOTAL_BUDGET > 0
 
 
 def test_proxy_gate_triggers_at_three_of_four_chunks() -> None:
@@ -124,6 +132,41 @@ def test_vlm_needs_strong_two_view_evidence_and_exact_anchor() -> None:
     assert strong.decision == "backtrack"
     assert strong.next_anchor_id == "a1"
     assert strong.retry_count == 1
+
+
+def test_vlm_medium_backtracks_when_likelihood_set_is_widened() -> None:
+    widened = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "grasp the mug",
+            "assessment": {"success_likelihood": "medium", "view_agreement": "agree"},
+            "front_view_evidence": ["gripper drifting past the mug"],
+            "wrist_view_evidence": ["no stable contact"],
+        },
+        physical=PhysicalEvidence(action_type="grasp"),
+        anchors=anchors(),
+        current_anchor=anchors()[2],
+        retry_count=0,
+        backtrack_likelihoods=("low", "medium"),
+    )
+    strict = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "grasp the mug",
+            "assessment": {"success_likelihood": "medium", "view_agreement": "agree"},
+            "front_view_evidence": ["gripper drifting past the mug"],
+            "wrist_view_evidence": ["no stable contact"],
+        },
+        physical=PhysicalEvidence(action_type="grasp"),
+        anchors=anchors(),
+        current_anchor=anchors()[2],
+        retry_count=0,
+    )
+
+    assert widened.decision == "backtrack"
+    assert widened.next_anchor_id == "a1"
+    assert widened.retry_count == 1
+    assert strict.decision == "transit"
 
 
 def test_retry_limit_forces_transit() -> None:

@@ -6,6 +6,7 @@ import torch
 
 from jitpi05.cli.jitrl import resolve_tasks
 from jitpi05.config import (
+    CYCLE_EVALUATION,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
     JITRL_EPISODES,
@@ -375,12 +376,13 @@ def test_experiment_configuration_is_qwen_workspace_only() -> None:
     assert JITRL_TERMINATION_MODE == "environment_only_no_stop_v1"
     assert JITRL_LOGIT_CALIBRATION == "raw_qwen_fixed_workspace_v1"
     assert JITRL_EPISODES == 10
-    assert len(JITRL_TASKS) == 10
+    assert len(JITRL_TASKS) == len(CYCLE_EVALUATION.libero90_candidates)
     assert [task["name"] for task in JITRL_TASKS] == [
-        f"libero_10_task{task_id}" for task_id in range(10)
+        f"libero_90_task{task_id}"
+        for task_id in CYCLE_EVALUATION.libero90_candidates
     ]
-    assert {task["suite"] for task in JITRL_TASKS} == {"libero_10"}
-    assert all(task["zero_shot"] is False for task in JITRL_TASKS)
+    assert {task["suite"] for task in JITRL_TASKS} == {"libero_90"}
+    assert all(task["zero_shot"] is True for task in JITRL_TASKS)
     assert JITRL_HIGH_LEVEL_STEPS == 40
     assert JITRL_BETA == 0.40
     assert JITRL_PLANNER_RETRIES == 7
@@ -400,10 +402,10 @@ def test_gemini_is_evaluator_only_and_method_order_is_paired() -> None:
 
 
 def test_task_resolution_and_summary_paths() -> None:
-    selected = resolve_tasks(["libero_10_task5", "libero_10_task0"])
-    assert [task["task_id"] for task in selected] == [5, 0]
+    selected = resolve_tasks(["libero_90_task59", "libero_90_task19"])
+    assert [task["task_id"] for task in selected] == [59, 19]
     first = run_dir_for(Path("artifacts/test"), selected[0], "jitrl", 17)
-    assert first == Path("artifacts/test/libero_10_task5/jitrl/seed_17")
+    assert first == Path("artifacts/test/libero_90_task59/jitrl/seed_17")
 
     tasks = [dict(task) for task in JITRL_TASKS[:2]]
     rows = []

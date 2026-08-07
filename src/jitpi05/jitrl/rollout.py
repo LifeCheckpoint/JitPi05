@@ -21,12 +21,15 @@ from jitpi05.config import (
     ALL_METHODS,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
+    CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
     CYCLE_MAX_RETRIES,
     CYCLE_MBR_ACTION_STEPS,
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_METHODS,
     CYCLE_PROGRESS_THRESHOLD,
+    CYCLE_RETRY_TOTAL_BUDGET,
+    CYCLE_VLM_BACKTRACK_LIKELIHOODS,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
     JITRL_EPISODES,
@@ -63,6 +66,7 @@ from jitpi05.jitrl.cycle import (
     semantic_action_type,
 )
 from jitpi05.jitrl.libero_recovery import (
+    build_physical_evidence,
     capture_robot_configuration,
     refresh_libero_observation,
     restore_robot_configuration,
@@ -441,7 +445,9 @@ def _run_episode_cycle(
 
     cycle_wall_start = time.perf_counter()
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
-        task_spec, episode_index
+        task_spec,
+        episode_index,
+        budget_max_steps=task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET,
     )
     episode_seed = int(seed) + episode_index
     video_path = run_dir / "videos" / f"episode_{episode_index}.mp4"
@@ -606,6 +612,12 @@ def _run_episode_cycle(
         return event
 
     def _physical_evidence(anchor: SemanticAnchor) -> PhysicalEvidence:
+        base = build_physical_evidence(
+            env,
+            observation,
+            success=success,
+            gripper_closed_threshold=CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
+        )
         raw = last_info.get("cycle_physical_evidence") if isinstance(last_info, dict) else None
         values = raw if isinstance(raw, dict) else {}
         success_fact = success or values.get("postcondition_satisfied") is True
@@ -615,12 +627,24 @@ def _run_episode_cycle(
             reasons = (reasons,)
         return PhysicalEvidence(
             action_type=anchor.action_type,
-            gripper_closed=values.get("gripper_closed"),
+            gripper_closed=(
+                base.gripper_closed
+                if values.get("gripper_closed") is None
+                else values.get("gripper_closed")
+            ),
             object_following_gripper=values.get("object_following_gripper"),
             target_identity_ok=values.get("target_identity_ok"),
             destination_reached=values.get("destination_reached"),
             released=values.get("released"),
-            postcondition_satisfied=True if success_fact else values.get("postcondition_satisfied"),
+            postcondition_satisfied=(
+                True
+                if success_fact
+                else (
+                    base.postcondition_satisfied
+                    if values.get("postcondition_satisfied") is None
+                    else values.get("postcondition_satisfied")
+                )
+            ),
             failure_detected=failure_fact,
             failure_reasons=tuple(str(reason) for reason in reasons),
         )
@@ -831,6 +855,7 @@ def _run_episode_cycle(
                     current_anchor=active_anchor,
                     retry_count=cycle_retry_count,
                     max_retries=CYCLE_MAX_RETRIES,
+                    backtrack_likelihoods=CYCLE_VLM_BACKTRACK_LIKELIHOODS,
                 )
                 trace_event = {
                     "event": "cycle_check",
@@ -988,7 +1013,9 @@ def _run_episode(
             step_progress=step_progress,
         )
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
-        task_spec, episode_index
+        task_spec,
+        episode_index,
+        budget_max_steps=task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET,
     )
     episode_seed = int(seed) + episode_index
 
@@ -1439,6 +1466,7 @@ def run_jitrl_experiment(
     episodes: int = JITRL_EPISODES,
     output_dir: Path = JITRL_OUTPUT_DIR,
     models: dict | None = None,
+    init_state_start: int = 0,
 ) -> dict:
     """Run one task/method/seed pairing from an independent empty memory.
 
@@ -1451,6 +1479,12 @@ def run_jitrl_experiment(
         raise ValueError(f"method must be one of {ALL_METHODS}; got {method!r}")
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
         raise ValueError("episodes must be a positive integer")
+    if (
+        isinstance(init_state_start, bool)
+        or not isinstance(init_state_start, int)
+        or init_state_start < 0
+    ):
+        raise ValueError("init_state_start must be a non-negative integer")
     task_name = str(task_spec.get("name", "")).strip()
     if not task_name:
         raise ValueError("task_spec must contain a non-empty name")
@@ -1531,14 +1565,16 @@ def run_jitrl_experiment(
             f"[ready] task={task_name} method={method} seed={seed}: models loaded"
         )
 
-        for episode_index in range(episodes):
+        for local_index, episode_index in enumerate(
+            range(init_state_start, init_state_start + episodes)
+        ):
             current_episode = episode_index
-            max_steps = int(task_spec["max_steps"])
+            max_steps = int(task_spec["max_steps"]) + CYCLE_RETRY_TOTAL_BUDGET
             step_progress = tqdm(
                 total=max_steps,
                 desc=(
                     f"{task_name} {method} seed={seed} episode "
-                    f"{episode_index + 1}/{episodes} steps"
+                    f"{local_index + 1}/{episodes} steps"
                 ),
                 unit="step",
                 dynamic_ncols=True,

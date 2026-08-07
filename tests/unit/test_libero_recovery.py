@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from jitpi05.jitrl.libero_recovery import (
+    build_physical_evidence,
     capture_robot_configuration,
     inspect_recovery_environment,
     restore_robot_configuration,
@@ -47,11 +48,12 @@ class FakeRobot:
 
 
 class FakeControlEnv:
-    def __init__(self) -> None:
+    def __init__(self, check_success_result: bool = False) -> None:
         self.sim = FakeSim()
         self.robots = [FakeRobot(self.sim)]
         self.post_process_calls = 0
         self.update_observables_calls = 0
+        self.check_success_result = check_success_result
 
     def _post_process(self) -> None:
         self.post_process_calls += 1
@@ -60,15 +62,18 @@ class FakeControlEnv:
         assert force is True
         self.update_observables_calls += 1
 
+    def check_success(self) -> bool:
+        return self.check_success_result
+
 
 class FakeLiberoEnv:
-    def __init__(self) -> None:
-        self._env = FakeControlEnv()
+    def __init__(self, check_success: bool = False) -> None:
+        self._env = FakeControlEnv(check_success_result=check_success)
 
 
 class FakeVectorEnv:
-    def __init__(self) -> None:
-        self.envs = [FakeLiberoEnv()]
+    def __init__(self, check_success: bool = False) -> None:
+        self.envs = [FakeLiberoEnv(check_success)]
 
 
 def test_inspection_exposes_robot_only_recovery_chain() -> None:
@@ -126,3 +131,33 @@ def test_recovery_requires_batch_one_vector_env() -> None:
 
     with pytest.raises(TypeError, match="batch-one"):
         inspect_recovery_environment(EmptyVectorEnv())
+
+
+def test_build_physical_evidence_reads_only_safe_facts() -> None:
+    closed_obs = {"robot_state": {"gripper": {"qpos": np.array([0.01, 0.01])}}}
+    open_obs = {"robot_state": {"gripper": {"qpos": np.array([0.04, 0.04])}}}
+
+    # 无 gripper 阈值 + check_success 失败 → 所有事实 unknown（绝不臆测失败）
+    env_unknown = FakeVectorEnv(check_success=False)
+    evidence = build_physical_evidence(env_unknown, closed_obs, success=False)
+    assert evidence.gripper_closed is None
+    assert evidence.postcondition_satisfied is None
+    assert evidence.explicit_failure is False
+
+    # 传入 success=True → postcondition 明确成功
+    assert build_physical_evidence(
+        env_unknown, closed_obs, success=True
+    ).postcondition_satisfied is True
+
+    # robosuite check_success 通过 → 即便 success 标志为 False 也判定成功
+    assert build_physical_evidence(
+        FakeVectorEnv(check_success=True), closed_obs, success=False
+    ).postcondition_satisfied is True
+
+    # 配置 gripper 阈值后：闭合小 qpos → True，张开大 qpos → False
+    assert build_physical_evidence(
+        env_unknown, closed_obs, success=False, gripper_closed_threshold=0.05
+    ).gripper_closed is True
+    assert build_physical_evidence(
+        env_unknown, open_obs, success=False, gripper_closed_threshold=0.05
+    ).gripper_closed is False

@@ -12,6 +12,7 @@ from typing import Any
 from tqdm.auto import tqdm
 
 from jitpi05.config import (
+    CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
     JITRL_EPISODES,
     JITRL_METHODS,
@@ -89,17 +90,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read existing episodes.json and memory.json without running models.",
     )
+    parser.add_argument(
+        "--screen",
+        action="store_true",
+        help="Run the static-free difficulty screen over the candidate pool "
+        "using CYCLE_EVALUATION.difficulty_screen_state_range/episodes.",
+    )
+    parser.add_argument(
+        "--init-state-start",
+        type=int,
+        default=0,
+        help="First init-state id of each run; episode i uses init-state "
+        "start + i (default: 0).",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     tasks = resolve_tasks(args.task)
-    methods = _deduplicate(args.method or JITRL_METHODS)
+    if args.screen:
+        methods = ("static-free",)
+        episodes = CYCLE_EVALUATION.difficulty_screen_episodes
+        init_state_start = CYCLE_EVALUATION.difficulty_screen_state_range[0]
+    else:
+        methods = _deduplicate(args.method or JITRL_METHODS)
+        episodes = args.episodes
+        init_state_start = args.init_state_start
     seeds = _deduplicate(args.seed or JITRL_SEEDS)
     output_dir = Path(args.output_dir)
     total_runs = len(tasks) * len(methods) * len(seeds)
-    total_rollouts = total_runs * args.episodes
+    total_rollouts = total_runs * episodes
 
     run_experiment = None
     models = None
@@ -134,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     tqdm.write(
         f"[experiment] mode={mode} tasks={len(tasks)} methods={len(methods)} "
         f"seeds={len(seeds)} runs={total_runs} "
-        f"episodes_per_run={args.episodes} total_rollouts={total_rollouts} "
+        f"episodes_per_run={episodes} total_rollouts={total_rollouts} "
         "order=task->method->seed"
     )
     run_progress = tqdm(
@@ -164,9 +185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 task_spec,
                                 method,
                                 seed,
-                                args.episodes,
+                                episodes,
                                 output_dir,
                                 models=models,
+                                init_state_start=init_state_start,
                             )
                         metrics = load_and_write_run_metrics(
                             output_dir,
@@ -212,7 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         requested_tasks=tasks,
         requested_methods=methods,
         requested_seeds=seeds,
-        requested_episodes=args.episodes,
+        requested_episodes=episodes,
         output_dir=output_dir,
     )
     summary_path = output_dir / "summary.json"
