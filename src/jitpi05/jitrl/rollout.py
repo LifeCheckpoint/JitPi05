@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 
 from jitpi05.config import (
     ALL_METHODS,
+    CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
     CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
@@ -27,8 +28,13 @@ from jitpi05.config import (
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_METHODS,
+    CYCLE_PREDICTOR_RETRIES,
     CYCLE_PROGRESS_THRESHOLD,
+    CYCLE_PROXY_PROGRESS_THRESHOLD,
     CYCLE_RETRY_TOTAL_BUDGET,
+    CYCLE_SIGNAL_CONFIRM_CONSECUTIVE,
+    CYCLE_SIGNAL_CONFIRM_GAP,
+    CYCLE_STOP_SIGNAL_THRESHOLD,
     CYCLE_VLM_BACKTRACK_LIKELIHOODS,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
@@ -59,8 +65,14 @@ from jitpi05.config import (
 )
 from jitpi05.jitrl.cycle import (
     CycleGate,
+    CyclePhase,
+    CycleSignalConfirmation,
     PhysicalEvidence,
     SemanticAnchor,
+    adapt_cycle_policy_output,
+    build_cycle_subtask_program,
+    format_cycle_subtask_program,
+    match_cycle_subtask,
     resolve_cycle_decision,
     select_mbr_chunk,
     semantic_action_type,
@@ -444,10 +456,15 @@ def _run_episode_cycle(
     """
 
     cycle_wall_start = time.perf_counter()
+    budget_max_steps = (
+        task_spec["max_steps"]
+        if CYCLE_BUDGET_MODE == "official"
+        else task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET
+    )
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec,
         episode_index,
-        budget_max_steps=task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET,
+        budget_max_steps=budget_max_steps,
     )
     episode_seed = int(seed) + episode_index
     video_path = run_dir / "videos" / f"episode_{episode_index}.mp4"
@@ -472,6 +489,22 @@ def _run_episode_cycle(
     active_attempt_chunks = 0
     active_attempt_is_recovery = False
     active_attempt_checked = False
+    phase = CyclePhase.IN_PROGRESS
+    cycle_program = ()
+    cycle_program_text: tuple[str, ...] = ()
+    cycle_signal_mode = "unknown"
+    cycle_trigger_mode = "not_triggered"
+    progress_confirmation = CycleSignalConfirmation(
+        threshold=CYCLE_PROGRESS_THRESHOLD,
+        required_consecutive=CYCLE_SIGNAL_CONFIRM_CONSECUTIVE,
+        required_gap=CYCLE_SIGNAL_CONFIRM_GAP,
+    )
+    stop_confirmation = CycleSignalConfirmation(
+        threshold=CYCLE_STOP_SIGNAL_THRESHOLD,
+        required_consecutive=CYCLE_SIGNAL_CONFIRM_CONSECUTIVE,
+        required_gap=CYCLE_SIGNAL_CONFIRM_GAP,
+    )
+    retry_counts: dict[str, int] = {}
     last_info: dict = {}
     overall_task = ""
     success = False
@@ -483,11 +516,29 @@ def _run_episode_cycle(
     cycle_veto_count = 0
     mbr_events: list[dict] = []
     low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
-    gate = CycleGate(threshold=CYCLE_PROGRESS_THRESHOLD)
+    gate = CycleGate(threshold=CYCLE_PROXY_PROGRESS_THRESHOLD)
 
     def _current_images() -> list:
         current_frame = policy_frame(observation, overall_task, env_preprocessor)
         return [image.copy() for image in planning_images(current_frame)]
+
+    def _finish_active_subtask() -> None:
+        """Close one anchor only after completion is confirmed or fallback ends."""
+
+        nonlocal active_anchor, active_trace, active_condition
+        nonlocal active_attempt_chunks, active_attempt_is_recovery
+        nonlocal active_attempt_checked, phase, active_before_images
+        _finalize_evaluator_images()
+        active_anchor = None
+        active_trace = None
+        active_condition = ""
+        active_attempt_chunks = 0
+        active_attempt_is_recovery = False
+        active_attempt_checked = False
+        active_before_images = None
+        progress_confirmation.reset()
+        stop_confirmation.reset()
+        phase = CyclePhase.IN_PROGRESS
 
     def _finalize_evaluator_images() -> None:
         nonlocal active_before_images
@@ -503,17 +554,30 @@ def _run_episode_cycle(
         active_before_images = None
 
     def _execute_action_chunk(
-        action_chunk: torch.Tensor,
+        policy_output,
         *,
         source: str,
         anchor_id: str,
     ) -> dict:
-        nonlocal observation, episode_done, success, termination_reason, last_info
+        nonlocal observation, episode_done, success, termination_reason, last_info, phase
+        nonlocal cycle_signal_mode
         chunk_index = len(action_chunks)
         action_start_step = len(actions)
-        cpu_chunk = action_chunk.detach().cpu().clone()
+        adapted = (
+            policy_output
+            if hasattr(policy_output, "robot_action_chunk")
+            else adapt_cycle_policy_output(policy_output)
+        )
+        if cycle_signal_mode == "unknown":
+            cycle_signal_mode = adapted.signal_source
+        elif cycle_signal_mode != adapted.signal_source:
+            cycle_signal_mode = "mixed"
+        cpu_chunk = adapted.robot_action_chunk.detach().cpu().clone()
         action_chunks.append(cpu_chunk)
-        for action in cpu_chunk[:SIM_ACTION_STEPS]:
+        progress_confirmed = False
+        stop_confirmed = False
+        executed_steps = min(SIM_ACTION_STEPS, adapted.horizon)
+        for local_index, action in enumerate(cpu_chunk[:SIM_ACTION_STEPS]):
             action_transition = env_postprocessor({"action": action.unsqueeze(0)})
             env_action = action_transition["action"].detach().cpu()
             observation, reward, terminated, truncated, info = env.step(
@@ -523,6 +587,15 @@ def _run_episode_cycle(
             rewards.append(float(reward[0]))
             frames.append(env.render()[0])
             last_info = info if isinstance(info, dict) else {}
+            if adapted.has_policy_signals:
+                progress_confirmed = (
+                    progress_confirmation.update(adapted.progress_signal(local_index))
+                    or progress_confirmed
+                )
+                stop_confirmed = (
+                    stop_confirmation.update(adapted.stop_signal(local_index))
+                    or stop_confirmed
+                )
             if step_progress is not None:
                 step_progress.update(1)
             episode_done = bool(terminated[0] or truncated[0])
@@ -541,9 +614,13 @@ def _run_episode_cycle(
             "action_end_step": len(actions),
             "source": source,
             "anchor_id": anchor_id,
+            "signal_source": adapted.signal_source,
+            "progress_confirmed": progress_confirmed,
+            "stop_confirmed": stop_confirmed,
+            "executed_steps": executed_steps,
         }
 
-    def _predict_action_chunk(frame: dict, condition: str, noise: torch.Tensor) -> torch.Tensor:
+    def _predict_action_chunk(frame: dict, condition: str, noise: torch.Tensor):
         conditioned_frame = dict(frame)
         conditioned_frame["task"] = [condition]
         batch = preprocessor(conditioned_frame)
@@ -555,10 +632,10 @@ def _run_episode_cycle(
             raise ValueError(
                 "predict_action_chunk must return the complete configured action chunk"
             )
-        return action_chunk.detach().cpu()
+        return adapt_cycle_policy_output(action_chunk)
 
     def _run_mbr_retry(anchor: SemanticAnchor, restored_frame: dict) -> dict:
-        candidates: list[torch.Tensor] = []
+        candidates = []
         candidate_seeds: list[int] = []
         mbr_retry_index = max(0, cycle_retry_count - 1)
         mbr_coordinate = (
@@ -579,13 +656,15 @@ def _run_episode_cycle(
                 kind="mbr_flow_noise",
             )
             candidates.append(_predict_action_chunk(restored_frame, anchor.condition, noise))
-        selected_chunk, selection = select_mbr_chunk(
-            torch.stack(candidates),
+        robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
+        _, selection = select_mbr_chunk(
+            robot_chunks,
             action_steps=CYCLE_MBR_ACTION_STEPS,
             delta_dims=CYCLE_MBR_DELTA_DIMS,
         )
+        selected_output = candidates[selection.selected_index]
         action_record = _execute_action_chunk(
-            selected_chunk,
+            selected_output,
             source="mbr_retry",
             anchor_id=anchor.anchor_id,
         )
@@ -653,6 +732,8 @@ def _run_episode_cycle(
         reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
         observation, _ = env.reset(seed=[episode_seed])
         overall_task = list(env.call("task_description"))[0]
+        cycle_program = build_cycle_subtask_program(overall_task)
+        cycle_program_text = format_cycle_subtask_program(cycle_program)
         max_steps = int(env.call("_max_episode_steps")[0])
         frames.append(env.render()[0])
 
@@ -745,12 +826,20 @@ def _run_episode_cycle(
                 selected_candidate = candidates[selected_index]
                 active_condition = conditioned_task(overall_task, selected_candidate["text"])
                 anchor_id = f"anchor-{high_level_step_index}"
+                program_node = match_cycle_subtask(
+                    selected_candidate,
+                    cycle_program,
+                    preferred_position=high_level_step_index,
+                    used_ids=[anchor.program_id for anchor in anchors if anchor.program_id],
+                )
                 active_anchor = SemanticAnchor(
                     anchor_id=anchor_id,
                     action_text=selected_candidate["text"],
                     condition=active_condition,
                     high_level_step_index=high_level_step_index,
                     action_type=semantic_action_type(selected_candidate),
+                    program_id=program_node.subtask_id,
+                    program_position=program_node.position,
                 )
                 anchors.append(active_anchor)
                 snapshots[anchor_id] = capture_robot_configuration(env)
@@ -763,9 +852,14 @@ def _run_episode_cycle(
                     }
                 )
                 selected_subtasks.append(selected_candidate["text"])
+                progress_confirmation.reset()
+                stop_confirmation.reset()
+                phase = CyclePhase.IN_PROGRESS
                 active_trace = {
                     "chunk_index": high_level_step_index,
                     "anchor_id": anchor_id,
+                    "program_id": active_anchor.program_id,
+                    "program_position": active_anchor.program_position,
                     "planner_attempts": planner_attempts,
                     "binding_prompt": planning["binding_prompt"],
                     "binding_raw_output": planning["binding_raw_output"],
@@ -825,45 +919,67 @@ def _run_episode_cycle(
                 active_anchor = None
                 break
 
-            if (
-                not active_attempt_checked
-                and active_attempt_chunks >= CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS
-                and gate.triggered(active_attempt_chunks, low_level_chunks_per_plan)
-            ):
+            signal_source = action_record["signal_source"]
+            progress_triggered = False
+            trigger_mode = None
+            if not active_attempt_checked and phase == CyclePhase.IN_PROGRESS:
+                if signal_source == "policy_9d":
+                    progress_triggered = bool(action_record["progress_confirmed"])
+                    trigger_mode = "learned_progress_confirmed"
+                else:
+                    progress_triggered = (
+                        active_attempt_chunks >= CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS
+                        and gate.triggered(active_attempt_chunks, low_level_chunks_per_plan)
+                    )
+                    trigger_mode = "fixed_horizon_degraded"
+            if progress_triggered:
                 active_attempt_checked = True
+                phase = CyclePhase.CHECK
+                cycle_trigger_mode = trigger_mode or cycle_trigger_mode
                 cycle_check_count += 1
                 current_images = _current_images()
                 physical = _physical_evidence(active_anchor)
                 prediction = None
                 prediction_error = None
                 if cycle_predictor is not None:
-                    try:
-                        prediction = predict_cycle_failure(
-                            cycle_predictor,
-                            current_images,
-                            overall_task,
-                            [anchor.action_text for anchor in anchors],
-                            active_anchor.action_text,
-                            attempt=cycle_check_count,
-                        )
-                    except Exception as error:
-                        prediction_error = f"{type(error).__name__}: {error}"
+                    for predictor_attempt in range(1, CYCLE_PREDICTOR_RETRIES + 1):
+                        try:
+                            prediction = predict_cycle_failure(
+                                cycle_predictor,
+                                current_images,
+                                overall_task,
+                                cycle_program_text,
+                                f"{active_anchor.program_id}: {active_anchor.action_text}",
+                                attempt=cycle_check_count,
+                            )
+                            break
+                        except Exception as error:
+                            if predictor_attempt == CYCLE_PREDICTOR_RETRIES:
+                                prediction_error = f"{type(error).__name__}: {error}"
+                            else:
+                                time.sleep(min(2.0**predictor_attempt, 10.0))
                 decision = resolve_cycle_decision(
                     vlm=prediction,
                     physical=physical,
                     anchors=anchors,
                     current_anchor=active_anchor,
-                    retry_count=cycle_retry_count,
+                    retry_count=0,
+                    retry_counts=retry_counts,
                     max_retries=CYCLE_MAX_RETRIES,
                     backtrack_likelihoods=CYCLE_VLM_BACKTRACK_LIKELIHOODS,
                 )
                 trace_event = {
                     "event": "cycle_check",
-                    "phase": "check",
+                    "phase": phase.value,
+                    "trigger_mode": trigger_mode,
+                    "signal_source": signal_source,
                     "anchor_id": active_anchor.anchor_id,
+                    "program_id": active_anchor.program_id,
                     "completed_chunks": active_attempt_chunks,
                     "total_chunks": low_level_chunks_per_plan,
                     "proxy_progress": gate.proxy_progress(active_attempt_chunks, low_level_chunks_per_plan),
+                    "progress_confirmed": action_record["progress_confirmed"],
+                    "stop_confirmed": action_record["stop_confirmed"],
                     "physical_evidence": {
                         "action_type": physical.action_type,
                         "postcondition_satisfied": physical.postcondition_satisfied,
@@ -885,6 +1001,7 @@ def _run_episode_cycle(
                 if decision.vetoed:
                     cycle_veto_count += 1
                 if decision.decision == "backtrack" and decision.next_anchor_id is not None:
+                    phase = CyclePhase.BACKTRACK
                     target_anchor = next(
                         anchor for anchor in anchors if anchor.anchor_id == decision.next_anchor_id
                     )
@@ -907,27 +1024,41 @@ def _run_episode_cycle(
                     }
                     recovery_events.append(recovery_event)
                     cycle_backtrack_count += 1
-                    cycle_retry_count = decision.retry_count
+                    retry_counts[target_anchor.anchor_id] = decision.retry_count
+                    cycle_retry_count = max(retry_counts.values(), default=0)
                     active_anchor = target_anchor
                     active_trace = anchor_traces[target_anchor.anchor_id]
                     active_condition = target_anchor.condition
                     active_attempt_chunks = 0
                     active_attempt_is_recovery = True
                     active_attempt_checked = False
+                    progress_confirmation.reset()
+                    stop_confirmation.reset()
+                    phase = CyclePhase.MBR_RETRY
                     _run_mbr_retry(target_anchor, restored_frame)
+                    phase = CyclePhase.IN_PROGRESS
                     active_attempt_chunks = 1
                     if success or episode_done or len(actions) >= max_steps:
                         _finalize_evaluator_images()
                         break
+                else:
+                    # Transit is not completion. In 9-D mode the current subtask
+                    # remains active until the confirmed stop signal arrives.
+                    # The 7-D path reaches this phase too, then uses its explicit
+                    # fixed-horizon fallback below.
+                    phase = CyclePhase.COMPLETE
 
-            if active_attempt_chunks >= low_level_chunks_per_plan:
-                _finalize_evaluator_images()
-                active_anchor = None
-                active_trace = None
-                active_condition = ""
-                active_attempt_chunks = 0
-                active_attempt_is_recovery = False
-                active_attempt_checked = False
+            if phase == CyclePhase.COMPLETE:
+                if action_record["stop_confirmed"] or (
+                    signal_source == "missing_7d"
+                    and active_attempt_chunks >= low_level_chunks_per_plan
+                ):
+                    _finish_active_subtask()
+            elif (
+                signal_source == "missing_7d"
+                and active_attempt_chunks >= low_level_chunks_per_plan
+            ):
+                _finish_active_subtask()
 
     finally:
         video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -961,8 +1092,15 @@ def _run_episode_cycle(
         "video_path": str(video_path),
         "chunks": chunks,
         "cycle_enabled": True,
+        "cycle_signal_mode": cycle_signal_mode,
+        "cycle_trigger_mode": cycle_trigger_mode,
+        "cycle_program": list(cycle_program_text),
+        "cycle_budget_mode": CYCLE_BUDGET_MODE,
+        "cycle_budget_max_steps": int(budget_max_steps),
+        "cycle_retry_counts": dict(retry_counts),
         "cycle_config_version": CYCLE_CONFIG_VERSION,
         "cycle_progress_threshold": CYCLE_PROGRESS_THRESHOLD,
+        "cycle_proxy_progress_threshold": CYCLE_PROXY_PROGRESS_THRESHOLD,
         "cycle_check_after_low_level_chunks": CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
         "cycle_checks": cycle_check_count,
         "cycle_backtracks": cycle_backtrack_count,

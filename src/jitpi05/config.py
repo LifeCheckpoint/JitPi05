@@ -100,23 +100,27 @@ JITRL_GEMINI_TIMEOUT_SECONDS = 120.0
 # =========================================================================
 # CycleVLA-lite 包装（零训练推理包装，不改变 JitRL 学习边界）
 # =========================================================================
-CYCLE_CONFIG_VERSION = "cyclevla_lite_zero_shot_v1"
-CYCLE_PROGRESS_THRESHOLD = 0.75  # 代理进度门控（3/4 chunk）
-CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3  # 每次尝试的第 N 个 chunk 后触发检查
-CYCLE_MAX_RETRIES = 3  # 每个锚点的回溯/重试上限
-# 为 Cycle 回溯预留的统一步数预算：所有方法共用同一 max_steps =
-# 任务官方上限 + CYCLE_RETRY_TOTAL_BUDGET，保证回退链有足够步数执行完，
-# 且不因预算不同而破坏配对公平。单次回溯实际成本约 40 步，120 留三倍裕量。
+CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p0_v2"
+# 论文 progress/stop 阈值；当前 stock 7-D 策略没有 learned signals，不能伪造。
+CYCLE_PROGRESS_THRESHOLD = 0.90
+CYCLE_PROXY_PROGRESS_THRESHOLD = 0.75
+CYCLE_STOP_SIGNAL_THRESHOLD = 0.50
+CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3
+CYCLE_SIGNAL_CONFIRM_CONSECUTIVE = 2
+CYCLE_SIGNAL_CONFIRM_GAP = 2
+CYCLE_MAX_RETRIES = 3
+# Formal P0 evaluation uses the official task horizon. The expanded budget is
+# retained only for a future explicit diagnostic mode.
+CYCLE_BUDGET_MODE = "official"
 CYCLE_RETRY_BUDGET_PER_BACKTRACK = 120
 CYCLE_RETRY_TOTAL_BUDGET = CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
-CYCLE_MBR_HYPOTHESES = 8  # MBR 采样假设数
-CYCLE_MBR_ACTION_STEPS = 10  # MBR 轨迹特征使用的前缀动作步数
-CYCLE_MBR_DELTA_DIMS = 6  # MBR 累积轨迹的平移/旋转维度
-# 可接受的回溯低置信集合（transit-default 的召回调节）。默认含 medium 以激活
-# 回溯；若误回溯（harm）过高可收紧为 ("low",)。
-CYCLE_VLM_BACKTRACK_LIKELIHOODS = ("low", "medium")
-# 夹爪闭合的 qpos 阈值（两指 qpos 之和）。None 表示不启用 gripper 物理失败判断
-# （该阈值依赖夹爪型号，需在真实环境校准后再启用）。
+CYCLE_MBR_HYPOTHESES = 8
+CYCLE_MBR_ACTION_STEPS = 10
+CYCLE_MBR_DELTA_DIMS = 6
+CYCLE_PREDICTOR_RETRIES = 3
+# Paper-faithful anti-sycophancy default: only low likelihood can backtrack.
+CYCLE_VLM_BACKTRACK_LIKELIHOODS = ("low",)
+# None keeps simulator-side gripper inference disabled until calibrated.
 CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD = None
 
 

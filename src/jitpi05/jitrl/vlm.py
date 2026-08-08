@@ -15,6 +15,7 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
 
 from jitpi05.config import (
+    CYCLE_PREDICTOR_RETRIES,
     JITRL_EVALUATOR_MODEL,
     JITRL_GEMINI_BASE_URL,
     JITRL_GEMINI_CREDENTIALS_PATH,
@@ -54,29 +55,19 @@ class ChunkEvaluation(BaseModel):
         return "useful" if self.score > 0 else "neutral"
 
 
-class CycleAssessment(BaseModel):
-    """Compact structured assessment for an in-loop CycleVLA check."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    success_likelihood: Literal["high", "medium", "low"]
-    key_risks: str = Field(min_length=1)
-    view_agreement: Literal["agree", "partial", "disagree"]
-    view_dominance: str = Field(min_length=1)
-    decision_basis: str = Field(min_length=1)
-
-
 class CycleFailurePrediction(BaseModel):
-    """Appendix-G-compatible VLM failure prediction and recovery target."""
+    """Flat, transit-default failure forecast with auditable view evidence."""
 
     model_config = ConfigDict(extra="ignore")
 
-    next_subtask: str = Field(min_length=1)
-    type: Literal["transit", "backtrack"]
-    reason: str = Field(min_length=1)
-    front_view_evidence: list[str] = Field(min_length=1, max_length=4)
-    wrist_view_evidence: list[str] = Field(min_length=1, max_length=4)
-    assessment: CycleAssessment
+    type: Literal["transit", "backtrack"] = "transit"
+    success_likelihood: Literal["high", "medium", "low"] = "medium"
+    next_subtask: str = Field(
+        default="", description="Exact stable subtask ID when backtracking, else empty."
+    )
+    reason: str = Field(default="", description="One short sentence of observable evidence.")
+    front_evidence: str = Field(default="", description="Observable FRONT-view evidence.")
+    wrist_evidence: str = Field(default="", description="Observable WRIST-view evidence.")
 
 
 def validate_cycle_prediction_target(
@@ -90,11 +81,18 @@ def validate_cycle_prediction_target(
         if isinstance(prediction, CycleFailurePrediction)
         else CycleFailurePrediction.model_validate(prediction)
     )
-    allowed = {str(subtask).strip() for subtask in valid_subtasks if str(subtask).strip()}
-    if validated.next_subtask not in allowed:
+    allowed: set[str] = set()
+    for subtask in valid_subtasks:
+        value = str(subtask).strip()
+        if not value:
+            continue
+        allowed.add(value)
+        if ":" in value:
+            allowed.add(value.split(":", 1)[0].strip())
+    if validated.type == "backtrack" and validated.next_subtask not in allowed:
         raise ValueError(
-            "Cycle VLM returned a next_subtask that is not an exact recorded "
-            f"anchor: {validated.next_subtask!r}"
+            "Cycle VLM returned a next_subtask that is not an exact stable "
+            f"program target: {validated.next_subtask!r}"
         )
     return validated
 
@@ -137,7 +135,7 @@ def load_cycle_failure_predictor() -> Agent[None, CycleFailurePrediction]:
     return Agent(
         model,
         output_type=CycleFailurePrediction,
-        retries=0,
+        retries=CYCLE_PREDICTOR_RETRIES,
         model_settings=GoogleModelSettings(
             temperature=0.0,
             max_tokens=JITRL_MAX_EVALUATOR_TOKENS,
@@ -200,36 +198,37 @@ def cycle_failure_predictor_prompt(
     *,
     attempt: int = 1,
 ) -> str:
-    """Build a transit-default, evidence-constrained CycleVLA prompt."""
+    """Build the paper-style FRONT/WRIST, transit-default failure prompt."""
 
     retry = (
         ""
         if attempt == 1
-        else "The previous output was invalid; return only the requested schema.\n"
+        else "The previous output was invalid; return exactly one flat JSON object.\n"
     )
-    subtask_lines = "\n".join(f"{index + 1}. {subtask}" for index, subtask in enumerate(subtasks))
+    subtask_lines = "\n".join(
+        f"{index + 1}. {subtask}" for index, subtask in enumerate(subtasks)
+    )
     return (
-        "You are an expert robot behavior annotator performing an in-loop failure "
-        "forecast, not a post-hoc success report. The robot is approximately 75% "
-        "through its current semantic subtask.\n"
+        "You are an expert robot behavior annotator doing an in-loop failure "
+        "forecast at approximately 90% of the current subtask, not a post-hoc "
+        "success report. Image 1 is FRONT; image 2 is WRIST.\n"
         f"Overall task: {task}\n"
         f"Current subtask: {current_subtask}\n"
-        f"Recorded semantic subtask anchors:\n{subtask_lines}\n"
+        f"Complete immutable subtask program (targets are exact IDs):\n{subtask_lines}\n"
         f"{retry}"
-        "Default to transit when success appears reasonably likely. Choose "
-        "backtrack only when strong, unambiguous visual evidence indicates that "
-        "continuing will fail without repositioning. Never terminate the episode.\n"
-        "FRONT view is authoritative for object identity, global pose, reachability, "
-        "destination alignment, and path clearance. WRIST view is authoritative for "
-        "gripper alignment, contact, slip, and local affordance geometry. Fuse both "
-        "views; do not treat a partial valid affordance contact as failure.\n"
-        "If backtracking, next_subtask must be copied exactly from the recorded "
-        "anchors and must be the earliest anchor restoring the missing precondition. "
-        "Return concise observable evidence only; do not include hidden reasoning.\n"
-        "Return one JSON object with exactly these fields: next_subtask, type, reason, "
-        "front_view_evidence, wrist_view_evidence, assessment. type must be transit "
-        "or backtrack. assessment must contain success_likelihood, key_risks, "
-        "view_agreement, view_dominance, decision_basis."
+        "FRONT provides global object identity, spatial alignment, reachability, "
+        "and path context. WRIST provides local gripper alignment, contact, slip, "
+        "and affordance evidence. Fuse both views. Default to type=transit unless "
+        "strong, unambiguous observable evidence says continuing will fail without "
+        "repositioning. Never terminate the episode. If backtracking, choose the "
+        "earliest already-reached program ID that restores the missing precondition.\n"
+        "Return exactly ONE flat JSON object with ONLY these six fields and no text "
+        'outside it: {"type": "transit"|"backtrack", '
+        '"success_likelihood": "high"|"medium"|"low", '
+        '"next_subtask": "<exact program ID, or empty string>", '
+        '"reason": "<one short sentence>", '
+        '"front_evidence": "<observable FRONT cue>", '
+        '"wrist_evidence": "<observable WRIST cue>"}'
     )
 
 
@@ -253,13 +252,15 @@ def predict_cycle_failure(
         attempt=attempt,
     )
     result = predictor.run_sync([prompt, *(_image_content(image) for image in images)]).output
-    validated = validate_cycle_prediction_target(result, subtasks)
+    if result.type == "backtrack":
+        result = validate_cycle_prediction_target(result, subtasks)
     return {
         "backend": "pydantic_ai_google",
         "model": JITRL_EVALUATOR_MODEL,
         "prompt": prompt,
-        "raw_output": validated.model_dump_json(),
-        **validated.model_dump(mode="json"),
+        "raw_output": result.model_dump_json(),
+        "schema_valid": True,
+        **result.model_dump(mode="json"),
     }
 
 

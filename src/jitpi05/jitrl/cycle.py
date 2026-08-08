@@ -1,6 +1,6 @@
 """Pure inference-time utilities for the CycleVLA-lite wrapper.
 
-This module intentionally has no MuJoCo, model, or network dependencies.  The
+This module intentionally has no MuJoCo, model, or network dependencies. The
 MBR implementation follows CycleVLA Appendix C: candidate action chunks are
 converted to cumulative six-dimensional end-effector trajectories, the full
 pairwise L2 risk matrix is computed, and the medoid candidate is selected.
@@ -8,6 +8,7 @@ pairwise L2 risk matrix is computed, and the medoid candidate is selected.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -60,16 +61,12 @@ def cumulative_trajectory_features(
     action_steps: int | None = None,
     delta_dims: int = 6,
 ) -> torch.Tensor:
-    """Build CycleVLA's cumulative 6D trajectory feature for each hypothesis.
-
-    The first ``action_steps`` actions are used because JitPi05 executes only a
-    prefix of each predicted chunk.  Each translational/rotational delta is
-    cumulatively summed before flattening, so early deviations compound over
-    the horizon as in CycleVLA Appendix C.
-    """
+    """Build CycleVLA's cumulative 6D trajectory feature for each hypothesis."""
 
     chunks = _as_action_tensor(action_chunks)
-    if isinstance(action_steps, bool) or (action_steps is not None and action_steps <= 0):
+    if isinstance(action_steps, bool) or (
+        action_steps is not None and action_steps <= 0
+    ):
         raise ValueError("action_steps must be a positive integer or None")
     if isinstance(delta_dims, bool) or delta_dims <= 0 or delta_dims > chunks.shape[2]:
         raise ValueError("delta_dims must be in [1, action_dim]")
@@ -95,12 +92,7 @@ def select_mbr_medoid(
     action_steps: int | None = None,
     delta_dims: int = 6,
 ) -> MBRSelection:
-    """Select the minimum-risk action hypothesis and expose its audit matrix.
-
-    Risk is the mean distance to all sampled hypotheses, including the
-    candidate's zero self-distance.  ``torch.argmin`` makes ties deterministic
-    by selecting the first candidate, which is important for paired runs.
-    """
+    """Select the minimum-risk action hypothesis and expose its audit matrix."""
 
     features = cumulative_trajectory_features(
         action_chunks,
@@ -136,12 +128,211 @@ def select_mbr_chunk(
 
 
 class CyclePhase(StrEnum):
-    """Inference phases used by the CycleVLA-lite rollout state machine."""
+    """Inference phases used by the CycleVLA state machine."""
 
     IN_PROGRESS = "in_progress"
     CHECK = "check"
+    COMPLETE = "complete"
     BACKTRACK = "backtrack"
     MBR_RETRY = "mbr_retry"
+
+
+@dataclass(frozen=True)
+class CyclePolicyOutput:
+    """One policy chunk plus optional learned CycleVLA signals.
+
+    The stock LeRobot policy emits seven robot-action dimensions, so its stop
+    and progress signals are represented as ``None`` rather than fabricated
+    values. A CycleVLA/OpenPI policy emits nine dimensions and is adapted here.
+    """
+
+    robot_action_chunk: torch.Tensor
+    stop_signals: tuple[float | None, ...]
+    progress_signals: tuple[float | None, ...]
+    signal_source: Literal["policy_9d", "missing_7d"]
+
+    @property
+    def has_policy_signals(self) -> bool:
+        return self.signal_source == "policy_9d"
+
+    @property
+    def horizon(self) -> int:
+        return int(self.robot_action_chunk.shape[0])
+
+    def stop_signal(self, index: int) -> float | None:
+        return self.stop_signals[index] if 0 <= index < len(self.stop_signals) else None
+
+    def progress_signal(self, index: int) -> float | None:
+        return (
+            self.progress_signals[index]
+            if 0 <= index < len(self.progress_signals)
+            else None
+        )
+
+
+def adapt_cycle_policy_output(action_chunk: torch.Tensor) -> CyclePolicyOutput:
+    """Adapt a 7-D LeRobot or 9-D CycleVLA action chunk.
+
+    Any other dimensionality is rejected instead of silently truncating model
+    output, because truncation can turn a future policy mismatch into a false
+    Cycle transition.
+    """
+
+    values = torch.as_tensor(action_chunk, dtype=torch.float32).detach().cpu()
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values.squeeze(0)
+    if values.ndim != 2 or values.shape[0] == 0:
+        raise ValueError(
+            "policy action chunk must have shape [horizon, action_dim] or "
+            "[1, horizon, action_dim]"
+        )
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("policy action chunk must contain only finite values")
+    action_dim = int(values.shape[1])
+    horizon = int(values.shape[0])
+    if action_dim == 7:
+        return CyclePolicyOutput(
+            robot_action_chunk=values,
+            stop_signals=(None,) * horizon,
+            progress_signals=(None,) * horizon,
+            signal_source="missing_7d",
+        )
+    if action_dim == 9:
+        return CyclePolicyOutput(
+            robot_action_chunk=values[:, :7].contiguous(),
+            stop_signals=tuple(float(value) for value in values[:, 7].tolist()),
+            progress_signals=tuple(float(value) for value in values[:, 8].tolist()),
+            signal_source="policy_9d",
+        )
+    raise ValueError(
+        "Cycle policy output must expose exactly 7 robot dimensions or 9 "
+        f"CycleVLA dimensions; got action_dim={action_dim}"
+    )
+
+
+@dataclass
+class CycleSignalConfirmation:
+    """Appendix-D confirmation rule for noisy stop/progress signals."""
+
+    threshold: float = 0.9
+    required_consecutive: int = 2
+    required_gap: int = 2
+    first_seen: bool = False
+    consecutive_high: int = 0
+    low_gap: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.threshold <= 1.0:
+            raise ValueError("CycleSignalConfirmation.threshold must be in (0, 1]")
+        if self.required_consecutive <= 0 or self.required_gap <= 0:
+            raise ValueError("confirmation counts must be positive")
+
+    def reset(self) -> None:
+        self.first_seen = False
+        self.consecutive_high = 0
+        self.low_gap = 0
+
+    def update(self, signal: float | bool | None) -> bool:
+        """Consume one signal and return whether the condition is confirmed."""
+
+        if signal is None:
+            self.consecutive_high = 0
+            return False
+        high = bool(signal) if isinstance(signal, bool) else float(signal) >= self.threshold
+        if high:
+            confirmed = (
+                self.consecutive_high + 1 >= self.required_consecutive
+                or (self.first_seen and self.low_gap >= self.required_gap)
+            )
+            self.first_seen = True
+            self.consecutive_high += 1
+            self.low_gap = 0
+            return confirmed
+        if self.first_seen:
+            self.low_gap += 1
+        self.consecutive_high = 0
+        return False
+
+
+@dataclass(frozen=True)
+class CycleSubtask:
+    """Stable, immutable subtask node used by the VLM recovery planner."""
+
+    subtask_id: str
+    text: str
+    action_type: str
+    position: int
+
+    def __post_init__(self) -> None:
+        if not self.subtask_id.strip() or not self.text.strip():
+            raise ValueError("Cycle subtasks require non-empty id and text")
+        if self.position < 0:
+            raise ValueError("Cycle subtask position must be non-negative")
+
+
+def format_cycle_subtask_program(program: Sequence[CycleSubtask]) -> tuple[str, ...]:
+    """Serialize a program as exact ``id: text`` targets for the VLM."""
+
+    return tuple(f"{item.subtask_id}: {item.text}" for item in program)
+
+
+def build_cycle_subtask_program(task: str) -> tuple[CycleSubtask, ...]:
+    """Build a deterministic inference-only fallback subtask program."""
+
+    normalized = " ".join(str(task).strip().split())
+    lower = normalized.lower()
+    match = re.search(
+        r"(?:pick up|grasp|get|take|move)\s+(?P<object>.+?)\s+"
+        r"(?:and\s+)?(?:place|put|set)\s+(?:it\s+)?"
+        r"(?:in|on|at|into)\s+(?P<destination>.+)$",
+        lower,
+    )
+    if match:
+        object_text = match.group("object").strip(" .")
+        destination = match.group("destination").strip(" .")
+        texts = (
+            ("approach", f"Move above {object_text}"),
+            ("grasp", f"Grasp {object_text}"),
+            ("transport", f"Move above {destination} while holding {object_text}"),
+            ("release", f"Release {object_text} at {destination}"),
+        )
+    else:
+        texts = ((semantic_action_type(normalized), normalized or "complete the task"),)
+    return tuple(
+        CycleSubtask(
+            subtask_id=f"subtask-{index:02d}",
+            text=text,
+            action_type=action_type,
+            position=index,
+        )
+        for index, (action_type, text) in enumerate(texts)
+    )
+
+
+def match_cycle_subtask(
+    action: str | Mapping[str, Any],
+    program: Sequence[CycleSubtask],
+    *,
+    preferred_position: int = 0,
+    used_ids: Sequence[str] = (),
+) -> CycleSubtask:
+    """Map a live Qwen action to the closest immutable program node."""
+
+    if not program:
+        raise ValueError("Cycle subtask program cannot be empty")
+    action_text = str(action.get("text", "") if isinstance(action, Mapping) else action)
+    action_type = semantic_action_type(action)
+    tokens = set(re.findall(r"[a-z0-9]+", action_text.lower()))
+    used = set(used_ids)
+
+    def score(item: CycleSubtask) -> tuple[int, int, int, int]:
+        overlap = len(tokens & set(re.findall(r"[a-z0-9]+", item.text.lower())))
+        unused = int(item.subtask_id not in used)
+        type_match = int(action_type == item.action_type)
+        distance = -abs(item.position - preferred_position)
+        return type_match, unused, overlap, distance
+
+    return max(program, key=score)
 
 
 @dataclass(frozen=True)
@@ -165,19 +356,23 @@ class CycleGate:
 
 @dataclass(frozen=True)
 class SemanticAnchor:
-    """The language and history identity of one high-level Qwen decision."""
+    """The language and stable program identity of one high-level decision."""
 
     anchor_id: str
     action_text: str
     condition: str
     high_level_step_index: int
     action_type: str
+    program_id: str = ""
+    program_position: int = -1
 
     def __post_init__(self) -> None:
         if not self.anchor_id.strip() or not self.action_text.strip():
             raise ValueError("semantic anchors require non-empty id and action_text")
         if self.high_level_step_index < 0:
             raise ValueError("high_level_step_index must be non-negative")
+        if self.program_position < -1:
+            raise ValueError("program_position must be -1 or non-negative")
 
 
 @dataclass(frozen=True)
@@ -274,8 +469,10 @@ def physical_failure_signal(evidence: PhysicalEvidence) -> bool | None:
 def select_recovery_anchor(
     target: str | None,
     anchors: Sequence[SemanticAnchor],
+    *,
+    current_anchor: SemanticAnchor | None = None,
 ) -> SemanticAnchor | None:
-    """Resolve an exact VLM target to the earliest matching recorded anchor."""
+    """Resolve an exact stable program target to a previously reached anchor."""
 
     requested = "" if target is None else str(target).strip()
     if not requested:
@@ -283,8 +480,14 @@ def select_recovery_anchor(
     matches = [
         anchor
         for anchor in anchors
-        if requested in {anchor.anchor_id, anchor.action_text}
+        if requested in {anchor.anchor_id, anchor.action_text, anchor.program_id}
     ]
+    if current_anchor is not None:
+        matches = [
+            anchor
+            for anchor in matches
+            if anchor.high_level_step_index <= current_anchor.high_level_step_index
+        ]
     return min(matches, key=lambda anchor: anchor.high_level_step_index) if matches else None
 
 
@@ -293,29 +496,10 @@ def _vlm_evidence_is_strong(
     *,
     backtrack_likelihoods: Sequence[str] = ("low",),
 ) -> bool:
-    """Return True only when the VLM request meets the two-view evidence bar.
+    """Return whether the VLM likelihood passes the configured strict gate."""
 
-    ``backtrack_likelihoods`` is the set of ``success_likelihood`` values that can
-    support a backtrack (transit-default: anything outside the set is ignored).
-    The default is the strict single value; a run may widen it (e.g. add
-    ``medium``) to raise recall at the cost of more false-positive backtracks.
-    """
-    assessment = vlm.get("assessment")
-    assessment_map = assessment if isinstance(assessment, Mapping) else {}
-    likelihood = str(
-        vlm.get("success_likelihood", assessment_map.get("success_likelihood", ""))
-    ).lower()
-    agreement = str(vlm.get("view_agreement", assessment_map.get("view_agreement", ""))).lower()
-    front = vlm.get("front_view_evidence", ())
-    wrist = vlm.get("wrist_view_evidence", ())
-    front_count = len(front) if isinstance(front, Sequence) and not isinstance(front, str) else 0
-    wrist_count = len(wrist) if isinstance(wrist, Sequence) and not isinstance(wrist, str) else 0
-    return (
-        likelihood in backtrack_likelihoods
-        and agreement != "disagree"
-        and front_count >= 1
-        and wrist_count >= 1
-    )
+    likelihood = str(vlm.get("success_likelihood", "")).lower()
+    return likelihood in {str(value).lower() for value in backtrack_likelihoods}
 
 
 def resolve_cycle_decision(
@@ -324,52 +508,55 @@ def resolve_cycle_decision(
     physical: PhysicalEvidence,
     anchors: Sequence[SemanticAnchor],
     current_anchor: SemanticAnchor,
-    retry_count: int,
+    retry_count: int = 0,
+    retry_counts: Mapping[str, int] | None = None,
     max_retries: int = 3,
     backtrack_likelihoods: Sequence[str] = ("low",),
 ) -> CycleDecision:
-    """Fuse evidence with transit-default and bounded, reversible recovery.
-
-    A VLM cannot terminate an episode.  Its backtrack request is accepted only
-    with strong two-view evidence and an exact recorded target, unless an
-    explicit physical postcondition failure already proves the need to retry.
-    """
+    """Fuse evidence with transit-default and bounded per-target recovery."""
 
     if retry_count < 0 or max_retries <= 0:
         raise ValueError("retry_count must be non-negative and max_retries positive")
-    if retry_count >= max_retries:
-        return CycleDecision(
-            decision="transit",
-            next_anchor_id=None,
-            reason="retry limit reached; force transit without another rewind",
-            physical_failure=physical_failure_signal(physical) is True,
-            vlm_requested_backtrack=False,
-            accepted=False,
-            vetoed=True,
-            retry_count=retry_count,
-            max_retries=max_retries,
-        )
+    if retry_counts is not None and any(value < 0 for value in retry_counts.values()):
+        raise ValueError("retry_counts must contain non-negative values")
 
     physical_signal = physical_failure_signal(physical)
     raw_type = str((vlm or {}).get("type", (vlm or {}).get("decision", "transit"))).lower()
     vlm_requested = raw_type == "backtrack"
     target = (vlm or {}).get("next_subtask", (vlm or {}).get("next_anchor_id"))
-    target_anchor = select_recovery_anchor(target, anchors)
+    target_anchor = select_recovery_anchor(target, anchors, current_anchor=current_anchor)
     physical_failure = physical_signal is True
     physical_contradiction = physical_signal is False
 
-    # A deterministic physical failure must still be recoverable when the VLM
-    # is unavailable. Prefer the earliest anchor of the failed semantic stage;
-    # the current anchor is the last safe fallback.
     if physical_failure and target_anchor is None:
         failed_type = semantic_action_type(physical.action_type)
         same_stage = [
-            anchor for anchor in anchors if semantic_action_type(anchor.action_type) == failed_type
+            anchor
+            for anchor in anchors
+            if semantic_action_type(anchor.action_type) == failed_type
+            and anchor.high_level_step_index <= current_anchor.high_level_step_index
         ]
         target_anchor = (
             min(same_stage, key=lambda anchor: anchor.high_level_step_index)
             if same_stage
             else current_anchor
+        )
+
+    target_retry_count = retry_count
+    if target_anchor is not None and retry_counts is not None:
+        target_retry_count = retry_counts.get(target_anchor.anchor_id, 0)
+
+    if target_retry_count >= max_retries:
+        return CycleDecision(
+            decision="transit",
+            next_anchor_id=None,
+            reason="target subtask retry limit reached; force transit without another rewind",
+            physical_failure=physical_failure,
+            vlm_requested_backtrack=False,
+            accepted=False,
+            vetoed=True,
+            retry_count=target_retry_count,
+            max_retries=max_retries,
         )
 
     if physical_failure and target_anchor is not None:
@@ -381,9 +568,10 @@ def resolve_cycle_decision(
             vlm_requested_backtrack=vlm_requested,
             accepted=True,
             vetoed=False,
-            retry_count=retry_count + 1,
+            retry_count=target_retry_count + 1,
             max_retries=max_retries,
         )
+
     if physical_contradiction and vlm_requested:
         return CycleDecision(
             decision="transit",
@@ -393,9 +581,10 @@ def resolve_cycle_decision(
             vlm_requested_backtrack=True,
             accepted=False,
             vetoed=True,
-            retry_count=retry_count,
+            retry_count=target_retry_count,
             max_retries=max_retries,
         )
+
     if (
         vlm_requested
         and target_anchor is not None
@@ -404,14 +593,15 @@ def resolve_cycle_decision(
         return CycleDecision(
             decision="backtrack",
             next_anchor_id=target_anchor.anchor_id,
-            reason="strong two-view low-success evidence with exact recovery anchor",
+            reason="strong low-success evidence with exact prior subtask target",
             physical_failure=False,
             vlm_requested_backtrack=True,
             accepted=True,
             vetoed=False,
-            retry_count=retry_count + 1,
+            retry_count=target_retry_count + 1,
             max_retries=max_retries,
         )
+
     return CycleDecision(
         decision="transit",
         next_anchor_id=None,
@@ -420,6 +610,6 @@ def resolve_cycle_decision(
         vlm_requested_backtrack=vlm_requested,
         accepted=False,
         vetoed=vlm_requested,
-        retry_count=retry_count,
+        retry_count=target_retry_count,
         max_retries=max_retries,
     )

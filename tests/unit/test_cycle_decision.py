@@ -34,7 +34,7 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
         "static-free-cycle",
         "jitrl-free-cycle",
     )
-    assert CYCLE_PROGRESS_THRESHOLD == pytest.approx(0.75)
+    assert CYCLE_PROGRESS_THRESHOLD == pytest.approx(0.90)
     assert CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS == 3
     assert CYCLE_MBR_HYPOTHESES == 8
     assert 59 in CYCLE_EVALUATION.libero90_candidates
@@ -99,14 +99,12 @@ def test_physical_success_vetoes_vlm_backtrack() -> None:
     assert "contradicts" in decision.reason
 
 
-def test_vlm_needs_strong_two_view_evidence_and_exact_anchor() -> None:
+def test_vlm_needs_strong_likelihood_and_exact_anchor() -> None:
     weak = resolve_cycle_decision(
         vlm={
             "type": "backtrack",
             "next_subtask": "grasp the mug",
-            "assessment": {"success_likelihood": "medium", "view_agreement": "agree"},
-            "front_view_evidence": ["unclear pose"],
-            "wrist_view_evidence": [],
+            "success_likelihood": "medium",
         },
         physical=PhysicalEvidence(action_type="grasp"),
         anchors=anchors(),
@@ -117,9 +115,7 @@ def test_vlm_needs_strong_two_view_evidence_and_exact_anchor() -> None:
         vlm={
             "type": "backtrack",
             "next_subtask": "grasp the mug",
-            "assessment": {"success_likelihood": "low", "view_agreement": "agree"},
-            "front_view_evidence": ["gripper is beside mug"],
-            "wrist_view_evidence": ["no stable contact"],
+            "success_likelihood": "low",
         },
         physical=PhysicalEvidence(action_type="grasp"),
         anchors=anchors(),
@@ -135,14 +131,13 @@ def test_vlm_needs_strong_two_view_evidence_and_exact_anchor() -> None:
 
 
 def test_vlm_medium_backtracks_when_likelihood_set_is_widened() -> None:
+    medium_vlm = {
+        "type": "backtrack",
+        "next_subtask": "grasp the mug",
+        "success_likelihood": "medium",
+    }
     widened = resolve_cycle_decision(
-        vlm={
-            "type": "backtrack",
-            "next_subtask": "grasp the mug",
-            "assessment": {"success_likelihood": "medium", "view_agreement": "agree"},
-            "front_view_evidence": ["gripper drifting past the mug"],
-            "wrist_view_evidence": ["no stable contact"],
-        },
+        vlm=medium_vlm,
         physical=PhysicalEvidence(action_type="grasp"),
         anchors=anchors(),
         current_anchor=anchors()[2],
@@ -150,13 +145,7 @@ def test_vlm_medium_backtracks_when_likelihood_set_is_widened() -> None:
         backtrack_likelihoods=("low", "medium"),
     )
     strict = resolve_cycle_decision(
-        vlm={
-            "type": "backtrack",
-            "next_subtask": "grasp the mug",
-            "assessment": {"success_likelihood": "medium", "view_agreement": "agree"},
-            "front_view_evidence": ["gripper drifting past the mug"],
-            "wrist_view_evidence": ["no stable contact"],
-        },
+        vlm=medium_vlm,
         physical=PhysicalEvidence(action_type="grasp"),
         anchors=anchors(),
         current_anchor=anchors()[2],
@@ -183,6 +172,22 @@ def test_retry_limit_forces_transit() -> None:
     assert decision.vetoed is True
     assert "retry limit" in decision.reason
     assert decision.retry_count == 3
+
+
+def test_retry_limit_is_scoped_to_selected_target() -> None:
+    retry_counts = {"a1": 3}
+    decision = resolve_cycle_decision(
+        vlm={"type": "backtrack", "next_subtask": "a0", "success_likelihood": "low"},
+        physical=PhysicalEvidence(action_type="grasp"),
+        anchors=anchors(),
+        current_anchor=anchors()[2],
+        retry_counts=retry_counts,
+        max_retries=3,
+    )
+
+    assert decision.decision == "backtrack"
+    assert decision.next_anchor_id == "a0"
+    assert decision.retry_count == 1
 
 
 def test_anchor_requires_exact_recorded_target() -> None:

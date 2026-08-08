@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+from jitpi05.jitrl.cycle import (
+    build_cycle_subtask_program,
+    format_cycle_subtask_program,
+)
 from jitpi05.jitrl.vlm import (
     CycleFailurePrediction,
     cycle_failure_predictor_prompt,
@@ -11,49 +15,46 @@ from jitpi05.jitrl.vlm import (
 )
 
 
-def prediction(next_subtask: str = "grasp the mug") -> CycleFailurePrediction:
+def prediction(next_subtask: str = "subtask-01") -> CycleFailurePrediction:
     return CycleFailurePrediction.model_validate(
         {
-            "next_subtask": next_subtask,
             "type": "backtrack",
+            "success_likelihood": "low",
+            "next_subtask": next_subtask,
             "reason": "The gripper is not aligned with the target.",
-            "front_view_evidence": ["The gripper is offset from the mug."],
-            "wrist_view_evidence": ["No stable contact is visible."],
-            "assessment": {
-                "success_likelihood": "low",
-                "key_risks": "misalignment",
-                "view_agreement": "agree",
-                "view_dominance": "wrist confirms contact risk",
-                "decision_basis": "low likelihood with matching evidence",
-            },
+            "front_evidence": "The target is not centered in FRONT.",
+            "wrist_evidence": "WRIST shows unstable contact.",
         }
     )
 
 
-def test_cycle_prompt_is_transit_default_and_two_view_explicit() -> None:
+def test_cycle_prompt_is_transit_default_and_minimal_schema() -> None:
+    program = format_cycle_subtask_program(
+        build_cycle_subtask_program("pick up the mug and place it in the basket")
+    )
     prompt = cycle_failure_predictor_prompt(
-        "put the mug in the basket",
-        ["approach the mug", "grasp the mug", "place the mug at the basket"],
-        "place the mug at the basket",
+        "pick up the mug and place it in the basket",
+        program,
+        "subtask-02: Move above the basket while holding the mug",
     )
 
-    assert "approximately 75%" in prompt
-    assert "Default to transit" in prompt
-    assert "FRONT view" in prompt
-    assert "WRIST view" in prompt
+    assert "Default to type=transit" in prompt
     assert "Never terminate the episode" in prompt
-    assert "copied exactly" in prompt
+    assert "FRONT" in prompt and "WRIST" in prompt
     assert "next_subtask" in prompt
+    assert '"success_likelihood"' in prompt
+    assert "six fields" in prompt
+    assert "subtask-00" in prompt or "exact IDs" in prompt
 
 
-def test_cycle_target_validation_requires_exact_recorded_anchor() -> None:
+def test_cycle_target_validation_requires_exact_stable_program_target() -> None:
     valid = prediction()
-    assert validate_cycle_prediction_target(valid, ["approach the mug", "grasp the mug"]) is valid
+    assert validate_cycle_prediction_target(valid, ["subtask-00: approach the mug", "subtask-01: grasp the mug"]) is valid
 
-    with pytest.raises(ValueError, match="exact recorded anchor"):
+    with pytest.raises(ValueError, match="exact stable program target"):
         validate_cycle_prediction_target(
-            prediction("grasp the mug with extra reasoning"),
-            ["approach the mug", "grasp the mug"],
+            prediction("subtask-01: grasp the mug with extra reasoning"),
+            ["subtask-00: approach the mug", "subtask-01: grasp the mug"],
         )
 
 
@@ -72,15 +73,18 @@ def test_cycle_prediction_sends_exactly_two_views_and_serializes_result() -> Non
         predictor,
         images,
         "put the mug in the basket",
-        ["approach the mug", "grasp the mug"],
-        "grasp the mug",
+        ["subtask-00: approach the mug", "subtask-01: grasp the mug"],
+        "subtask-01: grasp the mug",
     )
 
     assert len(predictor.arguments) == 3
-    assert result["next_subtask"] == "grasp the mug"
+    assert result["next_subtask"] == "subtask-01"
     assert result["type"] == "backtrack"
     assert result["backend"] == "pydantic_ai_google"
-    assert "front_view_evidence" in result["raw_output"]
+    assert result["schema_valid"] is True
+    assert result["front_evidence"]
+    assert result["wrist_evidence"]
+    assert "success_likelihood" in result["raw_output"]
 
 
 def test_cycle_prediction_rejects_wrong_image_count() -> None:
@@ -93,13 +97,15 @@ def test_cycle_prediction_rejects_wrong_image_count() -> None:
             UnusedPredictor(),
             [Image.new("RGB", (8, 8))],
             "task",
-            ["approach the mug"],
-            "approach the mug",
+            ["subtask-00: approach the mug"],
+            "subtask-00: approach the mug",
         )
 
 
-def test_cycle_schema_rejects_empty_evidence() -> None:
-    value = prediction().model_dump()
-    value["front_view_evidence"] = []
-    with pytest.raises(ValueError):
-        CycleFailurePrediction.model_validate(value)
+def test_cycle_schema_accepts_partial_model_output() -> None:
+    value = CycleFailurePrediction.model_validate({"type": "transit"})
+    assert value.success_likelihood == "medium"
+    assert value.next_subtask == ""
+    assert value.reason == ""
+    assert value.front_evidence == ""
+    assert value.wrist_evidence == ""
