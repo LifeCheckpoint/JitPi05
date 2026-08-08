@@ -100,7 +100,7 @@ JITRL_GEMINI_TIMEOUT_SECONDS = 120.0
 # =========================================================================
 # CycleVLA-lite 包装（零训练推理包装，不改变 JitRL 学习边界）
 # =========================================================================
-CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p0_v2"
+CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p0_v3_unified_800"
 # 论文 progress/stop 阈值；当前 stock 7-D 策略没有 learned signals，不能伪造。
 CYCLE_PROGRESS_THRESHOLD = 0.90
 CYCLE_PROXY_PROGRESS_THRESHOLD = 0.75
@@ -109,9 +109,11 @@ CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3
 CYCLE_SIGNAL_CONFIRM_CONSECUTIVE = 2
 CYCLE_SIGNAL_CONFIRM_GAP = 2
 CYCLE_MAX_RETRIES = 3
-# Formal P0 evaluation uses the official task horizon. The expanded budget is
-# retained only for a future explicit diagnostic mode.
-CYCLE_BUDGET_MODE = "official"
+# Keep baseline and Cycle comparable while allowing enough time for bounded
+# recovery attempts. The official LIBERO horizon remains 400; this experiment
+# explicitly selects the same unified 800-step budget for both methods.
+CYCLE_BUDGET_MODE = "unified_800"
+CYCLE_UNIFIED_MAX_STEPS = 800
 CYCLE_RETRY_BUDGET_PER_BACKTRACK = 120
 CYCLE_RETRY_TOTAL_BUDGET = CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
 CYCLE_MBR_HYPOTHESES = 8

@@ -45,6 +45,10 @@ def test_cycle_prompt_is_transit_default_and_minimal_schema() -> None:
     assert '"success_likelihood"' in prompt
     assert "six fields" in prompt
     assert "subtask-00" in prompt or "exact IDs" in prompt
+    assert '"type": "transit"' in prompt
+    assert '"next_subtask": ""' in prompt
+    assert "complete valid output example" in prompt
+    assert "do not emit Markdown fences" in prompt
 
 
 def test_cycle_target_validation_requires_exact_stable_program_target() -> None:

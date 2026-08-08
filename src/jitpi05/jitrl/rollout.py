@@ -31,10 +31,10 @@ from jitpi05.config import (
     CYCLE_PREDICTOR_RETRIES,
     CYCLE_PROGRESS_THRESHOLD,
     CYCLE_PROXY_PROGRESS_THRESHOLD,
-    CYCLE_RETRY_TOTAL_BUDGET,
     CYCLE_SIGNAL_CONFIRM_CONSECUTIVE,
     CYCLE_SIGNAL_CONFIRM_GAP,
     CYCLE_STOP_SIGNAL_THRESHOLD,
+    CYCLE_UNIFIED_MAX_STEPS,
     CYCLE_VLM_BACKTRACK_LIKELIHOODS,
     JITRL_ACTION_WORKSPACE_VERSION,
     JITRL_BETA,
@@ -292,6 +292,29 @@ def _low_level_chunks_per_high_level_plan() -> int:
     return JITRL_HIGH_LEVEL_STEPS // SIM_ACTION_STEPS
 
 
+def evaluation_budget_max_steps(task_spec: dict[str, Any]) -> int:
+    """Return the single episode budget shared by baseline and Cycle rollouts."""
+
+    try:
+        official_max_steps = int(task_spec["max_steps"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("task_spec must contain an integer max_steps") from error
+    if official_max_steps <= 0:
+        raise ValueError("task_spec max_steps must be positive")
+    if CYCLE_BUDGET_MODE == "official":
+        return official_max_steps
+    if CYCLE_BUDGET_MODE == "unified_800":
+        if CYCLE_UNIFIED_MAX_STEPS < official_max_steps:
+            raise ValueError(
+                "CYCLE_UNIFIED_MAX_STEPS must be at least the task's official max_steps"
+            )
+        return CYCLE_UNIFIED_MAX_STEPS
+    raise ValueError(
+        "CYCLE_BUDGET_MODE must be 'official' or 'unified_800'; "
+        f"got {CYCLE_BUDGET_MODE!r}"
+    )
+
+
 def _plan_and_score_with_retry(
     planner_model,
     planner_processor,
@@ -456,11 +479,7 @@ def _run_episode_cycle(
     """
 
     cycle_wall_start = time.perf_counter()
-    budget_max_steps = (
-        task_spec["max_steps"]
-        if CYCLE_BUDGET_MODE == "official"
-        else task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET
-    )
+    budget_max_steps = evaluation_budget_max_steps(task_spec)
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec,
         episode_index,
@@ -1150,10 +1169,11 @@ def _run_episode(
             cycle_predictor=cycle_predictor,
             step_progress=step_progress,
         )
+    budget_max_steps = evaluation_budget_max_steps(task_spec)
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec,
         episode_index,
-        budget_max_steps=task_spec["max_steps"] + CYCLE_RETRY_TOTAL_BUDGET,
+        budget_max_steps=budget_max_steps,
     )
     episode_seed = int(seed) + episode_index
 
@@ -1486,6 +1506,9 @@ def _run_episode(
         "low_level_chunk_count": len(action_chunks),
         "video_path": str(video_path),
         "chunks": chunks,
+        "cycle_enabled": False,
+        "cycle_budget_mode": CYCLE_BUDGET_MODE,
+        "cycle_budget_max_steps": int(budget_max_steps),
     }
     return episode_result, episode_records, tensors, evaluator_images
 
@@ -1540,6 +1563,8 @@ def summarize_run(
         "termination_mode": JITRL_TERMINATION_MODE,
         "logit_calibration": JITRL_LOGIT_CALIBRATION,
         "reward_version": JITRL_REWARD_VERSION,
+        "budget_mode": CYCLE_BUDGET_MODE,
+        "budget_max_steps": evaluation_budget_max_steps(task_spec),
         "episode_results": episode_rows,
         "successes": [row["success"] for row in episode_rows],
         "steps": [row["steps"] for row in episode_rows],
@@ -1707,7 +1732,7 @@ def run_jitrl_experiment(
             range(init_state_start, init_state_start + episodes)
         ):
             current_episode = episode_index
-            max_steps = int(task_spec["max_steps"]) + CYCLE_RETRY_TOTAL_BUDGET
+            max_steps = evaluation_budget_max_steps(task_spec)
             step_progress = tqdm(
                 total=max_steps,
                 desc=(

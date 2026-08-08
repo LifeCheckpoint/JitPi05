@@ -1,6 +1,7 @@
 import pytest
 
 from jitpi05.config import (
+    CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
@@ -28,6 +29,7 @@ def anchors() -> list[SemanticAnchor]:
 
 
 def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
+    assert CYCLE_BUDGET_MODE == "unified_800"
     assert CYCLE_JITRL_METHODS == (
         "static-free",
         "jitrl-free",
@@ -43,6 +45,13 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
         == CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
     )
     assert CYCLE_RETRY_TOTAL_BUDGET > 0
+
+
+def test_official_budget_helper_keeps_both_rollout_paths_equal() -> None:
+    from jitpi05.jitrl.rollout import evaluation_budget_max_steps
+
+    task = {"max_steps": 400}
+    assert evaluation_budget_max_steps(task) == 800
 
 
 def test_proxy_gate_triggers_at_three_of_four_chunks() -> None:

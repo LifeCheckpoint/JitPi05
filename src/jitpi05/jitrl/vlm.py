@@ -222,8 +222,18 @@ def cycle_failure_predictor_prompt(
         "strong, unambiguous observable evidence says continuing will fail without "
         "repositioning. Never terminate the episode. If backtracking, choose the "
         "earliest already-reached program ID that restores the missing precondition.\n"
-        "Return exactly ONE flat JSON object with ONLY these six fields and no text "
-        'outside it: {"type": "transit"|"backtrack", '
+        "Use this complete valid output example only as a formatting guide; do not "
+        "copy its evidence, and do not emit Markdown fences or explanatory text:\n"
+        '{"type": "transit", "success_likelihood": "medium", '
+        '"next_subtask": "", '
+        '"reason": "Both views show a reachable and stable continuation.", '
+        '"front_evidence": "FRONT shows the intended object and path clearly.", '
+        '"wrist_evidence": "WRIST shows stable gripper alignment and contact."}\n'
+        "For type=transit, next_subtask MUST be the empty string. For type=backtrack, "
+        "next_subtask MUST be copied exactly from one stable program ID above; never "
+        "invent, paraphrase, or include the subtask text. Return exactly ONE flat JSON "
+        "object with ONLY these six fields and no text outside it:\n"
+        '{"type": "transit"|"backtrack", '
         '"success_likelihood": "high"|"medium"|"low", '
         '"next_subtask": "<exact program ID, or empty string>", '
         '"reason": "<one short sentence>", '
