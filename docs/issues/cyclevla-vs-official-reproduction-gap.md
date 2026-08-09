@@ -152,6 +152,15 @@
 2. ✅ **replan 一致性修复**：回溯后 replan 若与回溯目标程序节点不一致（`replan_program_id != target_anchor.program_id`），强制丢弃 replan 的自由 condition，回退到回溯目标节点的官方模板 condition（`format_cycle_condition(overall_task, cycle_program[target_anchor.program_position].text)`），即「重做目标子任务」；recovery_event 新增 `forced_alignment` 标记。官方本身就是直接沿用回溯目标模板重 rollout，不自由 replan。
 3. 抓错物体问题属**策略本身**（7D 无 subtask 感知），仅靠推理侧 Cycle 无法根治——仍指向训练侧 9D subtask-aware policy（P2）。
 
+### 6.5 v7 结果与新根因（2026-08-09）
+
+**v7（task79, seed 17, 10 eps, 仅 cycle）：success_rate = 0/10**（v6 为 1/10）。所有 episode 均 800 步耗尽。
+
+- ✅ 两个修复均生效：`cycle_proxy_stop_finish_count` 0→**13**（P0-5 子任务级物理判定开始触发）；replan `forced_alignment` 出现 **27 次**（不一致时强制对齐目标节点）。
+- ❌ 但成功率未提升反而微降。**新根因**：`SemanticAnchor.action_type` 此前用 **Qwen 自由文本分类**（`semantic_action_type(selected_candidate)` → "place"），而程序节点是模板类型（transport/release）——v7 中 **29 次 transport 被误标成 place、17 次 release 被误标成 place、4 次 grasp 被误标成 place**。这使 `proxy_subtask_stop`/`physical_failure_signal`/gripper 特判全部按错误动作语义判断（place 分支要求 released/destination，transport 阶段物体仍在跟随 → 判定逻辑错乱）。
+- ✅ **已修复**（2026-08-09）：anchor 的 `action_type` 改为使用 `program_node.action_type`（模板类型 approach/grasp/transport/release），与官方模板文本语义一致。
+- 抓错物体（`red coffee mug` vs `black book`）仍出现 17 次——这是 7D 策略本身行为，物理证据已检测但回溯+MBR 未根治。
+
 ---
 
 ## 7. 最终全面对照表（官方 CycleVLA vs 本实现，2026-08-09）

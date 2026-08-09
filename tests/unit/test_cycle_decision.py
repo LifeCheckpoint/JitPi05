@@ -365,3 +365,41 @@ def test_proxy_subtask_stop_is_scoped_to_current_subtask_physics() -> None:
         )
         is None
     )
+
+
+def test_proxy_subtask_stop_uses_template_types_not_free_text_place() -> None:
+    # v7 根因回归测试：transport 阶段物体仍在跟随夹爪是正常搬运状态，
+    # 未到位时既不能确认完成也不能确认失败 → 保持 None（不臆断）；若
+    # action_type 被误标成 place，proxy stop 会错误地走「未释放」逻辑。
+    assert (
+        proxy_subtask_stop(
+            PhysicalEvidence(
+                action_type="transport",
+                object_following_gripper=True,
+                destination_reached=False,
+                postcondition_satisfied=None,
+            )
+        )
+        is None
+    )
+    # release 且物体仍跟随（未真正释放）→ 未完成。
+    assert (
+        proxy_subtask_stop(
+            PhysicalEvidence(
+                action_type="release",
+                object_following_gripper=True,
+                released=False,
+                destination_reached=False,
+                postcondition_satisfied=None,
+            )
+        )
+        is False
+    )
+    # grasp 抓稳（目标在夹爪下）→ 完成。
+    assert proxy_subtask_stop(
+        PhysicalEvidence(
+            action_type="grasp",
+            target_identity_ok=True,
+            postcondition_satisfied=None,
+        )
+    ) is True

@@ -77,7 +77,6 @@ from jitpi05.jitrl.cycle import (
     proxy_subtask_stop,
     resolve_cycle_decision,
     select_mbr_chunk,
-    semantic_action_type,
 )
 from jitpi05.jitrl.libero_recovery import (
     build_physical_evidence,
@@ -1004,7 +1003,14 @@ def _run_episode_cycle(
                     action_text=selected_candidate["text"],
                     condition=active_condition,
                     high_level_step_index=high_level_step_index,
-                    action_type=semantic_action_type(selected_candidate),
+                    # action_type 必须用程序节点的模板类型（approach/grasp/
+                    # transport/release），而不是 Qwen 自由文本分类：官方模板
+                    # 文本语义（如 "Move ... while holding the book" = transport）
+                    # 与 Qwen 自由文本（如 "place the book at the caddy" = place）
+                    # 不一致，用 Qwen 分类会让 proxy_subtask_stop / 物理失败信号
+                    # / gripper 特判全部用错动作语义（v7 中 transport/release 被
+                    # 误标成 place 数十次，是 0/10 的直接原因）。
+                    action_type=program_node.action_type,
                     program_id=program_node.subtask_id,
                     program_position=program_node.position,
                     target_object=anchor_target_object,
