@@ -15,6 +15,7 @@ from jitpi05.jitrl.cycle import (
     CycleGate,
     PhysicalEvidence,
     SemanticAnchor,
+    proxy_subtask_stop,
     resolve_cycle_decision,
     semantic_action_type,
 )
@@ -199,6 +200,80 @@ def test_retry_limit_is_scoped_to_selected_target() -> None:
     assert decision.retry_count == 1
 
 
+def test_recovery_target_binds_to_current_object_identity() -> None:
+    folded_anchors = [
+        SemanticAnchor(
+            "a0", "approach the mug", "condition-a0", 0, "approach",
+            program_id="subtask-00", target_object="mug",
+        ),
+        SemanticAnchor(
+            "a1", "grasp the bowl", "condition-a1", 1, "grasp",
+            program_id="subtask-00", target_object="bowl",
+        ),
+        SemanticAnchor(
+            "a2", "place the mug at the basket", "condition-a2", 2, "place",
+            program_id="subtask-00", target_object="mug",
+        ),
+    ]
+    # 粗粒度 program 把三个动作都折叠到 subtask-00。当前失败的是 place mug，
+    # 因此回溯必须落在同样针对 mug 的 a0，而不是针对 bowl 的 a1。
+    decision = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "subtask-00",
+            "success_likelihood": "low",
+        },
+        physical=PhysicalEvidence(action_type="place"),
+        anchors=folded_anchors,
+        current_anchor=folded_anchors[2],
+        retry_count=0,
+    )
+
+    assert decision.decision == "backtrack"
+    assert decision.next_anchor_id == "a0"
+
+
+def test_self_target_backtrack_is_rejected() -> None:
+    decision = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "grasp the mug",
+            "success_likelihood": "low",
+        },
+        physical=PhysicalEvidence(action_type="grasp"),
+        anchors=anchors(),
+        current_anchor=anchors()[1],
+        retry_count=0,
+    )
+
+    # current_anchor (a1, "grasp the mug") requested itself as the rewind target;
+    # rewinding onto the current anchor is not a recovery and must be rejected,
+    # otherwise a broken subtask loops to its own state forever.
+    assert decision.decision == "transit"
+    assert decision.next_anchor_id is None
+    assert decision.accepted is False
+    assert decision.vetoed is True
+
+
+def test_backtrack_to_strictly_earlier_anchor_is_allowed() -> None:
+    decision = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "grasp the mug",
+            "success_likelihood": "low",
+        },
+        physical=PhysicalEvidence(action_type="place"),
+        anchors=anchors(),
+        current_anchor=anchors()[2],
+        retry_count=0,
+    )
+
+    # a1 is strictly earlier than the current a2, so it remains a valid target.
+    assert decision.decision == "backtrack"
+    assert decision.next_anchor_id == "a1"
+    assert decision.retry_count == 1
+
+
 def test_anchor_requires_exact_recorded_target() -> None:
     decision = resolve_cycle_decision(
         vlm={
@@ -221,3 +296,72 @@ def test_anchor_requires_exact_recorded_target() -> None:
 def test_invalid_gate_threshold_is_rejected() -> None:
     with pytest.raises(ValueError, match="threshold"):
         CycleGate(threshold=0.0)
+
+
+def test_rotate_action_type_is_classified_from_text() -> None:
+    assert semantic_action_type("Rotate the gripper to turn on the stove.") == "rotate"
+    assert semantic_action_type("turn the knob clockwise") == "rotate"
+
+
+def test_retry_limit_forces_transit_without_vetoed_backtrack() -> None:
+    decision = resolve_cycle_decision(
+        vlm={
+            "type": "backtrack",
+            "next_subtask": "a0",
+            "success_likelihood": "low",
+        },
+        physical=PhysicalEvidence(action_type="grasp", gripper_closed=True),
+        anchors=anchors(),
+        current_anchor=anchors()[2],
+        retry_counts={"a0": 3},
+        max_retries=3,
+    )
+
+    assert decision.decision == "transit"
+    assert decision.next_anchor_id is None
+    assert decision.vetoed is True
+    assert "retry limit" in decision.reason
+
+
+def test_proxy_subtask_stop_is_scoped_to_current_subtask_physics() -> None:
+    # 全局 success 未知（中途）时，grasp 抓稳仍应触发子任务级完成。
+    assert proxy_subtask_stop(
+        PhysicalEvidence(
+            action_type="grasp",
+            object_following_gripper=True,
+            postcondition_satisfied=None,
+        )
+    ) is True
+    # grasp 但物体没跟随（抓空）不应判定完成。
+    assert proxy_subtask_stop(
+        PhysicalEvidence(
+            action_type="grasp",
+            object_following_gripper=False,
+            gripper_closed=False,
+            postcondition_satisfied=None,
+        )
+    ) is False
+    # transport 到位即完成。
+    assert proxy_subtask_stop(
+        PhysicalEvidence(
+            action_type="transport",
+            destination_reached=True,
+            postcondition_satisfied=None,
+        )
+    ) is True
+    # release 释放即完成。
+    assert proxy_subtask_stop(
+        PhysicalEvidence(
+            action_type="release",
+            released=True,
+            destination_reached=True,
+            postcondition_satisfied=None,
+        )
+    ) is True
+    # 事实未知时保持 None（不臆断）。
+    assert (
+        proxy_subtask_stop(
+            PhysicalEvidence(action_type="approach", postcondition_satisfied=None)
+        )
+        is None
+    )

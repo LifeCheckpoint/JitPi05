@@ -96,7 +96,17 @@ def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
                 "cycle_backtracks": 1,
                 "cycle_vetoes": 1,
                 "cycle_retries": 1,
+                "cycle_self_target_request_count": 1,
+                "cycle_replan_count": 1,
+                "cycle_proxy_stop_finish_count": 1,
                 "cycle_wall_time_seconds": 0.5,
+                "cycle_rewind_steps": 20,
+                "recovery_events": [
+                    {
+                        "event": "backtrack",
+                        "max_waypoint_qpos_delta": 0.04,
+                    }
+                ],
                 "mbr_hypothesis_count": 8,
                 "mbr_events": [
                     {"selected_risk": 1.25, "mean_pairwise_distance": 2.5}
@@ -126,11 +136,19 @@ def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
     )
 
     assert metrics["cycle_enabled_rate"] == 1.0
+    assert metrics["mean_cycle_rewind_steps"] == 10.0
+    assert metrics["cycle_rewind_step_rate"] == 0.0625
+    assert metrics["max_cycle_rewind_waypoint_qpos_delta"] == 0.04
     assert metrics["cycle_check_count"] == 3.0
     assert metrics["cycle_backtrack_count"] == 1.0
     assert metrics["cycle_backtrack_rate"] == 1 / 3
     assert metrics["cycle_veto_count"] == 2.0
     assert metrics["cycle_veto_rate"] == 2 / 3
+    assert metrics["cycle_self_target_request_count"] == 1.0
+    assert metrics["cycle_self_target_request_rate"] == 1 / 3
+    assert metrics["cycle_replan_count"] == 1.0
+    assert metrics["cycle_replan_rate"] == 1.0
+    assert metrics["cycle_proxy_stop_finish_count"] == 1.0
     assert metrics["cycle_success_after_backtrack_rate"] == 1.0
     assert metrics["cycle_failure_after_backtrack_rate"] == 0.0
     assert metrics["mbr_hypothesis_count"] == 8.0

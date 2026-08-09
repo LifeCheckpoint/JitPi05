@@ -47,11 +47,19 @@ SCALAR_METRICS = (
     "cycle_veto_count",
     "cycle_veto_rate",
     "cycle_retry_count",
+    "cycle_self_target_request_count",
+    "cycle_self_target_request_rate",
+    "cycle_replan_count",
+    "cycle_replan_rate",
+    "cycle_proxy_stop_finish_count",
     "cycle_success_after_backtrack_rate",
     "cycle_failure_after_backtrack_rate",
     "mbr_hypothesis_count",
     "mean_mbr_selected_risk",
     "mean_mbr_pairwise_distance",
+    "mean_cycle_rewind_steps",
+    "cycle_rewind_step_rate",
+    "max_cycle_rewind_waypoint_qpos_delta",
     "mean_cycle_wall_time_seconds",
 )
 # Success rate remains an auxiliary health metric. The primary JitRL effect is
@@ -163,6 +171,17 @@ def compute_run_metrics(
     )
     cycle_vetoes = sum(int(episode.get("cycle_vetoes", 0)) for episode in episodes)
     cycle_retries = sum(int(episode.get("cycle_retries", 0)) for episode in episodes)
+    cycle_self_target_requests = sum(
+        int(episode.get("cycle_self_target_request_count", 0))
+        for episode in cycle_episodes
+    )
+    cycle_replans = sum(
+        int(episode.get("cycle_replan_count", 0)) for episode in cycle_episodes
+    )
+    cycle_proxy_stop_finishes = sum(
+        int(episode.get("cycle_proxy_stop_finish_count", 0))
+        for episode in cycle_episodes
+    )
     mbr_hypotheses = sum(
         int(episode.get("mbr_hypothesis_count", 0)) for episode in episodes
     )
@@ -177,6 +196,16 @@ def compute_run_metrics(
         for episode in episodes
         for event in episode.get("mbr_events", [])
         if event.get("mean_pairwise_distance") is not None
+    ]
+    cycle_rewind_steps = sum(
+        int(episode.get("cycle_rewind_steps", 0)) for episode in cycle_episodes
+    )
+    cycle_rewind_waypoint_deltas = [
+        float(event["max_waypoint_qpos_delta"])
+        for episode in cycle_episodes
+        for event in episode.get("recovery_events", [])
+        if event.get("event") == "backtrack"
+        and event.get("max_waypoint_qpos_delta") is not None
     ]
     cycle_wall_times = [
         float(episode.get("cycle_wall_time_seconds", 0.0))
@@ -318,6 +347,13 @@ def compute_run_metrics(
         "cycle_veto_count": float(cycle_vetoes),
         "cycle_veto_rate": _rate(cycle_vetoes, cycle_checks),
         "cycle_retry_count": float(cycle_retries),
+        "cycle_self_target_request_count": float(cycle_self_target_requests),
+        "cycle_self_target_request_rate": _rate(
+            cycle_self_target_requests, cycle_checks
+        ),
+        "cycle_replan_count": float(cycle_replans),
+        "cycle_replan_rate": _rate(cycle_replans, cycle_backtracks),
+        "cycle_proxy_stop_finish_count": float(cycle_proxy_stop_finishes),
         "mbr_hypothesis_count": float(mbr_hypotheses),
         "mean_mbr_selected_risk": (
             float(np.mean(mbr_risks)) if mbr_risks else None
@@ -325,6 +361,15 @@ def compute_run_metrics(
         "mean_mbr_pairwise_distance": (
             float(np.mean(mbr_pairwise_distances))
             if mbr_pairwise_distances
+            else None
+        ),
+        "mean_cycle_rewind_steps": (
+            float(cycle_rewind_steps / len(cycle_episodes)) if cycle_episodes else None
+        ),
+        "cycle_rewind_step_rate": _rate(cycle_rewind_steps, sum(steps)),
+        "max_cycle_rewind_waypoint_qpos_delta": (
+            max(cycle_rewind_waypoint_deltas)
+            if cycle_rewind_waypoint_deltas
             else None
         ),
         "mean_cycle_wall_time_seconds": (

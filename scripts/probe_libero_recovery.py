@@ -19,7 +19,7 @@ import numpy as np
 from jitpi05.jitrl.libero_recovery import (
     capture_robot_configuration,
     inspect_recovery_environment,
-    restore_robot_configuration,
+    rewind_robot_configuration_history,
 )
 from jitpi05.simulation import close_envs, make_single_env
 
@@ -70,19 +70,28 @@ def main() -> int:
         ]
         object_before = np.asarray(control.sim.data.qpos[object_indices]).copy()
 
-        # Deliberately perturb only the robot configuration.  No object qpos or
-        # qvel is changed by this diagnostic setup.
-        control.sim.data.qpos[list(snapshot.arm_qpos_indices)] += 0.01
-        control.sim.data.qvel[list(snapshot.qvel_indices)] = 0.25
+        # Build a short real-history path. The probe intentionally uses the
+        # recovery API itself so it verifies waypoint replay, not direct qpos
+        # assignment at the call site.
+        history = [snapshot]
+        control.sim.data.qpos[list(snapshot.arm_qpos_indices)] += 0.005
         control.sim.forward()
+        history.append(capture_robot_configuration(vector_env))
+        control.sim.data.qpos[list(snapshot.arm_qpos_indices)] += 0.005
+        control.sim.forward()
+        history.append(capture_robot_configuration(vector_env))
 
-        report = restore_robot_configuration(vector_env, snapshot)
+        report = rewind_robot_configuration_history(vector_env, history, 0)
         object_after = np.asarray(control.sim.data.qpos[object_indices]).copy()
         object_change = _max_abs(object_after - object_before)
-        print("restore_report:", report)
+        print("rewind_report:", report)
         print("object_qpos_max_change:", object_change)
         print("sim_forward_calls: completed")
 
+        if not report.completed:
+            raise AssertionError("robot history replay did not reach the requested waypoint")
+        if report.replayed_steps != 2:
+            raise AssertionError(f"unexpected replay length: {report.replayed_steps}")
         if report.qpos_max_error >= 1e-6:
             raise AssertionError(f"robot qpos restore error too large: {report.qpos_max_error}")
         if report.robot_qvel_max_abs >= 1e-10:

@@ -276,25 +276,126 @@ def format_cycle_subtask_program(program: Sequence[CycleSubtask]) -> tuple[str, 
     return tuple(f"{item.subtask_id}: {item.text}" for item in program)
 
 
-def build_cycle_subtask_program(task: str) -> tuple[CycleSubtask, ...]:
-    """Build a deterministic inference-only fallback subtask program."""
+def format_cycle_condition(task: str, subtask: str) -> str:
+    """Build the official paper prompt for the low-level policy.
+
+    The released ``pi05_libero_cyclevla`` model and the OpenVLA-OFT
+    ``libero_sub_decomposed_progress`` checkpoint were both trained with
+    ``prompt_from_task=True`` where the prompt is exactly
+    ``Task: <task>. The current subtask: <subtask>``.  Reusing that template
+    keeps the 7-D condition distribution aligned with the training distribution
+    instead of injecting free-text Qwen output.
+    """
+
+    return f"Task: {str(task).strip()}. The current subtask: {str(subtask).strip()}"
+
+
+def _extract_pick_place_objects(task: str) -> tuple[str, str] | None:
+    """Extract ``(pick_object, place_object)`` following the paper's FSM utils.
+
+    Mirrors ``fsm_utils/utils.py``: for ``pick up the X and place it in/on the
+    Y`` and ``put the X in/on the Y`` the two objects are read back verbatim so
+    the resulting program texts match the subtask prompt distribution the
+    released ``libero_decomposed_progress`` checkpoints were trained on.
+    """
 
     normalized = " ".join(str(task).strip().split())
     lower = normalized.lower()
     match = re.search(
-        r"(?:pick up|grasp|get|take|move)\s+(?P<object>.+?)\s+"
-        r"(?:and\s+)?(?:place|put|set)\s+(?:it\s+)?"
-        r"(?:in|on|at|into)\s+(?P<destination>.+)$",
+        r"^(?:pick up|grasp|take|get)\s+the\s+(?P<pick>.+?)\s+and\s+"
+        r"(?:place|put|set)\s+it\s+(?:in|on|at|into)\s+the\s+(?P<place>.+)$",
         lower,
     )
     if match:
-        object_text = match.group("object").strip(" .")
-        destination = match.group("destination").strip(" .")
+        return match.group("pick").strip(), match.group("place").strip()
+    match = re.search(
+        r"^put\s+the\s+(?P<pick>.+?)\s+(?:in|on|at|into)\s+the\s+(?P<place>.+)$",
+        lower,
+    )
+    if match:
+        return match.group("pick").strip(), match.group("place").strip()
+    return None
+
+
+_COMPLEX_TASK_STATES: dict[str, tuple[str, ...]] = {
+    "open the middle drawer of the cabinet": (
+        "Move the gripper toward the handle of the middle drawer of the cabinet.",
+        "Close the gripper to grasp the drawer handle.",
+        "Move the gripper to pull the drawer outward.",
+    ),
+    "open the top drawer and put the bowl inside": (
+        "Move the gripper above the handle of the top drawer and insert it into the gap.",
+        "Move the gripper to pull the drawer outward.",
+        "Move the gripper above the bowl.",
+        "Close the gripper to grasp the bowl.",
+        "Move the gripper above the open top drawer while holding the bowl.",
+        "Open the gripper to release the bowl.",
+    ),
+    "push the plate to the front of the stove": (
+        "Move the gripper toward the plate and make contact.",
+        "Close the gripper to secure attachment to the plate.",
+        "Move the gripper forward to push the plate toward the front of the stove while maintaining contact.",
+    ),
+    "turn on the stove": (
+        "Move the gripper above the stove knob.",
+        "Close the gripper to grasp the stove knob.",
+        "Rotate the gripper to turn on the stove.",
+    ),
+    "turn on the stove and put the moka pot on it": (
+        "Move the gripper above the stove knob.",
+        "Close the gripper to grasp the stove knob.",
+        "Rotate the gripper to turn on the stove.",
+        "Open the gripper to release the stove knob.",
+        "Move the gripper above the moka pot.",
+        "Close the gripper to grasp the moka pot.",
+        "Move the gripper above the stove while holding the moka pot.",
+        "Open the gripper to release the moka pot.",
+    ),
+    "put the black bowl in the bottom drawer of the cabinet and close it": (
+        "Move the gripper above the black bowl.",
+        "Close the gripper to grasp the black bowl.",
+        "Move the gripper above the bottom drawer of the cabinet while holding the black bowl.",
+        "Open the gripper to release the black bowl.",
+        "Move the gripper to close the bottom drawer of the cabinet.",
+    ),
+    "put the yellow and white mug in the microwave and close it": (
+        "Move the gripper above the yellow and white mug.",
+        "Close the gripper to grasp the yellow and white mug.",
+        "Move the gripper inside the microwave while holding the yellow and white mug.",
+        "Open the gripper to release the yellow and white mug.",
+        "Move the gripper to close the microwave.",
+    ),
+}
+
+
+def build_cycle_subtask_program(task: str) -> tuple[CycleSubtask, ...]:
+    """Build an official-style deterministic subtask program.
+
+    Precedence mirrors the paper's eval entry point
+    (``pick_place_states`` -> ``complex_states``):
+      1. a pick-place task expands to the official four-state template
+         (Move above -> Close to grasp -> Move above the place while holding ->
+         Open to release);
+      2. otherwise a known complex task uses its hard-coded state sequence;
+      3. as a last resort a single semantic node keeps the program non-empty.
+    The texts are verbatim from ``fsm_utils/build.py`` so the condition
+    distribution stays aligned with the released decomposed checkpoints.
+    """
+
+    normalized = " ".join(str(task).strip().split())
+    lower = normalized.lower()
+    pick_place = _extract_pick_place_objects(normalized)
+    if pick_place is not None:
+        pick_object, place_object = pick_place
         texts = (
-            ("approach", f"Move above {object_text}"),
-            ("grasp", f"Grasp {object_text}"),
-            ("transport", f"Move above {destination} while holding {object_text}"),
-            ("release", f"Release {object_text} at {destination}"),
+            ("approach", f"Move the gripper above the {pick_object}."),
+            ("grasp", f"Close the gripper to grasp the {pick_object}."),
+            ("transport", f"Move the gripper above the {place_object} while holding the {pick_object}."),
+            ("release", f"Open the gripper to release the {pick_object}."),
+        )
+    elif lower in _COMPLEX_TASK_STATES:
+        texts = tuple(
+            (semantic_action_type(state), state) for state in _COMPLEX_TASK_STATES[lower]
         )
     else:
         texts = ((semantic_action_type(normalized), normalized or "complete the task"),)
@@ -365,6 +466,7 @@ class SemanticAnchor:
     action_type: str
     program_id: str = ""
     program_position: int = -1
+    target_object: str = ""
 
     def __post_init__(self) -> None:
         if not self.anchor_id.strip() or not self.action_text.strip():
@@ -396,6 +498,51 @@ class PhysicalEvidence:
     @property
     def explicit_success(self) -> bool:
         return self.postcondition_satisfied is True
+
+
+def proxy_subtask_stop(evidence: PhysicalEvidence) -> bool | None:
+    """Return whether the *current subtask* is physically complete.
+
+    The 7-D stock policy has no learned stop signal, so the official stop
+    semantics (subtask done) must be proxied from simulator object-level
+    evidence.  Unlike ``explicit_success`` (which is only True when the whole
+    task succeeded and therefore never fires mid-episode), this judgment is
+    scoped to the current action type:
+
+    - grasp / lift: complete when the object follows the gripper (or the
+      gripper holds the target identity);
+    - transport: complete when the destination is reached;
+    - place / release: complete when the object is released at the
+      destination;
+    - approach / align: complete when the target is under the gripper.
+
+    Returns True/False when decidable and None when the facts are unknown.
+    """
+
+    action_type = semantic_action_type(evidence.action_type)
+    if action_type in {"grasp", "lift"}:
+        if evidence.object_following_gripper is True or evidence.target_identity_ok is True:
+            return True
+        if evidence.gripper_closed is False:
+            return False
+        return None
+    if action_type in {"transport"}:
+        if evidence.destination_reached is True:
+            return True
+        if evidence.object_following_gripper is False:
+            return False
+        return None
+    if action_type in {"place", "release"}:
+        if evidence.released is True or evidence.destination_reached is True:
+            return True
+        if evidence.object_following_gripper is True:
+            return False
+        return None
+    if action_type in {"approach", "align"}:
+        if evidence.target_identity_ok is True:
+            return True
+        return None
+    return evidence.explicit_success
 
 
 @dataclass(frozen=True)
@@ -438,6 +585,8 @@ def semantic_action_type(action: str | Mapping[str, Any]) -> str:
         return "lift"
     if any(token in normalized for token in ("align", "center", "position over")):
         return "align"
+    if any(token in normalized for token in ("rotate", "turn the knob", "turn the handle")):
+        return "rotate"
     if any(token in normalized for token in ("retract", "move away", "back away")):
         return "retract"
     if any(token in normalized for token in ("move", "approach", "reach")):
@@ -472,7 +621,21 @@ def select_recovery_anchor(
     *,
     current_anchor: SemanticAnchor | None = None,
 ) -> SemanticAnchor | None:
-    """Resolve an exact stable program target to a previously reached anchor."""
+    """Resolve an exact stable program target to a previously reached anchor.
+
+    Recovery must always move *backwards*: the target is required to be strictly
+    earlier than the current anchor.  Rewinding onto the current anchor itself
+    (self-target) is never a recovery and is rejected here, so a broken subtask
+    cannot repeatedly rewind to its own state and loop forever.  Only explicit
+    physical-failure retries may target the current anchor, and those are still
+    bounded by the per-target retry limit.
+
+    When several anchors share the same coarse program node (coarse fallback
+    programs fold many actions onto one ``subtask-00``), the resolved target is
+    additionally bound to the current anchor's ``target_object``: the recovery
+    point must concern the same object as the failing step, so a ``grasp the mug``
+    failure cannot rewind into an earlier ``approach the bowl`` step.
+    """
 
     requested = "" if target is None else str(target).strip()
     if not requested:
@@ -486,8 +649,17 @@ def select_recovery_anchor(
         matches = [
             anchor
             for anchor in matches
-            if anchor.high_level_step_index <= current_anchor.high_level_step_index
+            if anchor.high_level_step_index < current_anchor.high_level_step_index
         ]
+    if current_anchor is not None and current_anchor.target_object and matches:
+        same_object = [
+            anchor
+            for anchor in matches
+            if anchor.target_object
+            and anchor.target_object == current_anchor.target_object
+        ]
+        if same_object:
+            return min(same_object, key=lambda anchor: anchor.high_level_step_index)
     return min(matches, key=lambda anchor: anchor.high_level_step_index) if matches else None
 
 

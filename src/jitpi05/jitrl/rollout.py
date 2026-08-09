@@ -71,8 +71,10 @@ from jitpi05.jitrl.cycle import (
     SemanticAnchor,
     adapt_cycle_policy_output,
     build_cycle_subtask_program,
+    format_cycle_condition,
     format_cycle_subtask_program,
     match_cycle_subtask,
+    proxy_subtask_stop,
     resolve_cycle_decision,
     select_mbr_chunk,
     semantic_action_type,
@@ -80,8 +82,12 @@ from jitpi05.jitrl.cycle import (
 from jitpi05.jitrl.libero_recovery import (
     build_physical_evidence,
     capture_robot_configuration,
+    gripper_pose,
+    held_object_name,
+    inspect_scene_objects,
+    match_target_object,
     refresh_libero_observation,
-    restore_robot_configuration,
+    rewind_robot_configuration_history,
 )
 from jitpi05.jitrl.memory import JitRLMemory, discounted_returns
 from jitpi05.jitrl.planner import (
@@ -496,7 +502,8 @@ def _run_episode_cycle(
     episode_records: list[dict] = []
     selected_subtasks: list[str] = []
     anchors: list[SemanticAnchor] = []
-    snapshots: dict[str, Any] = {}
+    robot_history: list[Any] = []
+    anchor_history_indices: dict[str, int] = {}
     anchor_traces: dict[str, dict] = {}
     evaluated_anchor_ids: set[str] = set()
     recovery_events: list[dict] = []
@@ -508,6 +515,9 @@ def _run_episode_cycle(
     active_attempt_chunks = 0
     active_attempt_is_recovery = False
     active_attempt_checked = False
+    # 回溯后 MBR 选定的 rollout 坐标基址：恢复期间后续 chunk 沿用同一 MBR seed
+    # 系列滚动生成（重 rollout 整个子任务），而不是每个 chunk 用全局递增坐标。
+    mbr_rollout_coordinate: int | None = None
     phase = CyclePhase.IN_PROGRESS
     cycle_program = ()
     cycle_program_text: tuple[str, ...] = ()
@@ -533,9 +543,12 @@ def _run_episode_cycle(
     cycle_check_count = 0
     cycle_backtrack_count = 0
     cycle_veto_count = 0
+    cycle_proxy_stop_finish_count = 0
     mbr_events: list[dict] = []
+    cycle_rewind_steps = 0
     low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
     gate = CycleGate(threshold=CYCLE_PROXY_PROGRESS_THRESHOLD)
+    last_held_relative: tuple[float, float, float] | None = None
 
     def _current_images() -> list:
         current_frame = policy_frame(observation, overall_task, env_preprocessor)
@@ -572,6 +585,9 @@ def _run_episode_cycle(
         evaluated_anchor_ids.add(active_anchor.anchor_id)
         active_before_images = None
 
+    def _budget_steps() -> int:
+        return len(actions) + cycle_rewind_steps
+
     def _execute_action_chunk(
         policy_output,
         *,
@@ -595,8 +611,9 @@ def _run_episode_cycle(
         action_chunks.append(cpu_chunk)
         progress_confirmed = False
         stop_confirmed = False
-        executed_steps = min(SIM_ACTION_STEPS, adapted.horizon)
         for local_index, action in enumerate(cpu_chunk[:SIM_ACTION_STEPS]):
+            if _budget_steps() >= max_steps:
+                break
             action_transition = env_postprocessor({"action": action.unsqueeze(0)})
             env_action = action_transition["action"].detach().cpu()
             observation, reward, terminated, truncated, info = env.step(
@@ -604,6 +621,7 @@ def _run_episode_cycle(
             )
             actions.append(env_action.squeeze(0).clone())
             rewards.append(float(reward[0]))
+            robot_history.append(capture_robot_configuration(env))
             frames.append(env.render()[0])
             last_info = info if isinstance(info, dict) else {}
             if adapted.has_policy_signals:
@@ -623,9 +641,9 @@ def _run_episode_cycle(
                 termination_reason = "environment_success"
             elif episode_done:
                 termination_reason = "environment_done"
-            elif len(actions) >= max_steps:
+            elif _budget_steps() >= max_steps:
                 termination_reason = "max_steps"
-            if episode_done or success or len(actions) >= max_steps:
+            if episode_done or success or _budget_steps() >= max_steps:
                 break
         return {
             "chunk_index": chunk_index,
@@ -636,7 +654,7 @@ def _run_episode_cycle(
             "signal_source": adapted.signal_source,
             "progress_confirmed": progress_confirmed,
             "stop_confirmed": stop_confirmed,
-            "executed_steps": executed_steps,
+            "executed_steps": len(actions) - action_start_step,
         }
 
     def _predict_action_chunk(frame: dict, condition: str, noise: torch.Tensor):
@@ -653,7 +671,13 @@ def _run_episode_cycle(
             )
         return adapt_cycle_policy_output(action_chunk)
 
-    def _run_mbr_retry(anchor: SemanticAnchor, restored_frame: dict) -> dict:
+    def _run_mbr_retry(
+        anchor: SemanticAnchor,
+        restored_frame: dict,
+        condition: str | None = None,
+    ) -> dict:
+        nonlocal mbr_rollout_coordinate
+        exec_condition = anchor.condition if condition is None else condition
         candidates = []
         candidate_seeds: list[int] = []
         mbr_retry_index = max(0, cycle_retry_count - 1)
@@ -674,7 +698,7 @@ def _run_episode_cycle(
                 device="cuda",
                 kind="mbr_flow_noise",
             )
-            candidates.append(_predict_action_chunk(restored_frame, anchor.condition, noise))
+            candidates.append(_predict_action_chunk(restored_frame, exec_condition, noise))
         robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
         _, selection = select_mbr_chunk(
             robot_chunks,
@@ -687,14 +711,20 @@ def _run_episode_cycle(
             source="mbr_retry",
             anchor_id=anchor.anchor_id,
         )
+        # 官方 MBR 是在回溯后选定代表 seed 然后重新 rollout 整个子任务（多个
+        # chunk 连续执行），而不是只修正一个动作块。记录选中 seed 的坐标基址，
+        # 主循环恢复期间沿用该基址滚动生成后续 chunk，实现「重 rollout 子任务」。
+        mbr_rollout_coordinate = mbr_coordinate + selection.selected_index
         event = {
             "event": "mbr_retry",
             "anchor_id": anchor.anchor_id,
             "high_level_step_index": anchor.high_level_step_index,
+            "condition": exec_condition,
             "hypothesis_count": CYCLE_MBR_HYPOTHESES,
             "action_steps": CYCLE_MBR_ACTION_STEPS,
             "delta_dims": CYCLE_MBR_DELTA_DIMS,
             "candidate_flow_noise_seeds": candidate_seeds,
+            "rollout_coordinate": mbr_rollout_coordinate,
             "selected_index": selection.selected_index,
             "selected_risk": selection.selected_risk,
             "mean_pairwise_distance": selection.mean_pairwise_distance,
@@ -709,13 +739,106 @@ def _run_episode_cycle(
         recovery_events.append(event)
         return event
 
+    def _replan_after_rewind(anchor: SemanticAnchor) -> dict:
+        """Re-confirm the high-level target from the post-rewind observation.
+
+        The arm and gripper have been rewound to an earlier state but the object
+        scene is deliberately *not* rolled back.  Reusing the stale
+        ``anchor.condition`` against the changed scene is exactly what lets the
+        7-D policy grab the wrong object after a backtrack.  We therefore plan
+        once more from the current observation and return a fresh execution
+        condition.  Recovery never queries JitRL memory and never appends an
+        experience record, keeping this an inference-only intervention.
+        """
+
+        replan_images = planning_images(
+            policy_frame(observation, overall_task, env_preprocessor)
+        )
+        planning, planner_attempts = _plan_and_score_with_retry(
+            planner_model,
+            planner_processor,
+            replan_images,
+            overall_task,
+            selected_subtasks[-JITRL_HISTORY_SIZE:],
+            method=method,
+            seed=seed,
+            episode_index=episode_index,
+            high_level_step_index=anchor.high_level_step_index,
+        )
+        replan_candidates = planning["candidates"]
+        value_estimate = _trace_value_estimate(
+            _static_value_estimate(
+                [candidate["semantic_key"] for candidate in replan_candidates]
+            )
+        )
+        update = apply_jitrl_update(
+            planning["base_logits"],
+            [item["normalized_advantage"] for item in value_estimate["candidates"]],
+            beta=0.0,
+            temperature=JITRL_TEMPERATURE,
+            uniform=coordinate_uniform(seed, episode_index, anchor.high_level_step_index),
+        )
+        selected_index = update["base_choice_index"]
+        selected_candidate = replan_candidates[selected_index]
+        program_node = match_cycle_subtask(
+            selected_candidate,
+            cycle_program,
+            preferred_position=anchor.program_position,
+            used_ids=[existing.program_id for existing in anchors if existing.program_id],
+        )
+        # 与 anchor 创建一致：condition 用官方模板（程序节点文本），避免自由文本
+        # 导致的 prompt 分布漂移。
+        condition = format_cycle_condition(overall_task, program_node.text)
+        return {
+            "planning": planning,
+            "planner_attempts": planner_attempts,
+            "value_estimate": value_estimate,
+            "update": update,
+            "selected_candidate": selected_candidate,
+            "selected_index": selected_index,
+            "condition": condition,
+            "program_node": program_node,
+        }
+
     def _physical_evidence(anchor: SemanticAnchor) -> PhysicalEvidence:
+        nonlocal last_held_relative
+        objects = inspect_scene_objects(env)
+        target_object = match_target_object(anchor.action_text, objects)
         base = build_physical_evidence(
             env,
             observation,
             success=success,
             gripper_closed_threshold=CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
+            action_type=anchor.action_type,
+            target_object=target_object,
+            previous_held_relative=last_held_relative,
         )
+        gripper_position = gripper_pose(env)
+        held = (
+            held_object_name(env, objects=objects, gripper_position=gripper_position)
+            if gripper_position is not None
+            else None
+        )
+        if held and gripper_position is not None:
+            held_position = next(
+                (
+                    scene_object.position
+                    for scene_object in objects
+                    if scene_object.canonical_name == held
+                ),
+                None,
+            )
+            last_held_relative = (
+                (
+                    held_position[0] - gripper_position[0],
+                    held_position[1] - gripper_position[1],
+                    held_position[2] - gripper_position[2],
+                )
+                if held_position is not None
+                else None
+            )
+        else:
+            last_held_relative = None
         raw = last_info.get("cycle_physical_evidence") if isinstance(last_info, dict) else None
         values = raw if isinstance(raw, dict) else {}
         success_fact = success or values.get("postcondition_satisfied") is True
@@ -723,6 +846,8 @@ def _run_episode_cycle(
         reasons = values.get("failure_reasons", ())
         if isinstance(reasons, str):
             reasons = (reasons,)
+        if failure_fact is None:
+            reasons = (*reasons, *base.failure_reasons)
         return PhysicalEvidence(
             action_type=anchor.action_type,
             gripper_closed=(
@@ -730,9 +855,21 @@ def _run_episode_cycle(
                 if values.get("gripper_closed") is None
                 else values.get("gripper_closed")
             ),
-            object_following_gripper=values.get("object_following_gripper"),
-            target_identity_ok=values.get("target_identity_ok"),
-            destination_reached=values.get("destination_reached"),
+            object_following_gripper=(
+                values.get("object_following_gripper")
+                if values.get("object_following_gripper") is not None
+                else base.object_following_gripper
+            ),
+            target_identity_ok=(
+                values.get("target_identity_ok")
+                if values.get("target_identity_ok") is not None
+                else base.target_identity_ok
+            ),
+            destination_reached=(
+                values.get("destination_reached")
+                if values.get("destination_reached") is not None
+                else base.destination_reached
+            ),
             released=values.get("released"),
             postcondition_satisfied=(
                 True
@@ -750,13 +887,14 @@ def _run_episode_cycle(
     try:
         reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
         observation, _ = env.reset(seed=[episode_seed])
+        robot_history.append(capture_robot_configuration(env))
         overall_task = list(env.call("task_description"))[0]
         cycle_program = build_cycle_subtask_program(overall_task)
         cycle_program_text = format_cycle_subtask_program(cycle_program)
         max_steps = int(env.call("_max_episode_steps")[0])
         frames.append(env.render()[0])
 
-        while len(actions) < max_steps and not success and not episode_done:
+        while _budget_steps() < max_steps and not success and not episode_done:
             if active_anchor is None:
                 low_level_chunk_index = len(action_chunks)
                 high_level_step_index = len(chunks)
@@ -843,13 +981,23 @@ def _run_episode_cycle(
                     else update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
-                active_condition = conditioned_task(overall_task, selected_candidate["text"])
                 anchor_id = f"anchor-{high_level_step_index}"
                 program_node = match_cycle_subtask(
                     selected_candidate,
                     cycle_program,
                     preferred_position=high_level_step_index,
                     used_ids=[anchor.program_id for anchor in anchors if anchor.program_id],
+                )
+                # 官方模板 condition：低层 7-D policy 的训练 prompt 分布就是
+                # ``Task: ... The current subtask: ...``，且 subtask 文本取自确定性
+                # 程序节点（与 released decomposed checkpoint 训练分布一致），
+                # 而不是注入 Qwen 自由文本（避免分布漂移导致抓错物体）。
+                active_condition = format_cycle_condition(overall_task, program_node.text)
+                anchor_target_object = (
+                    match_target_object(
+                        selected_candidate["text"], inspect_scene_objects(env)
+                    )
+                    or ""
                 )
                 active_anchor = SemanticAnchor(
                     anchor_id=anchor_id,
@@ -859,9 +1007,10 @@ def _run_episode_cycle(
                     action_type=semantic_action_type(selected_candidate),
                     program_id=program_node.subtask_id,
                     program_position=program_node.position,
+                    target_object=anchor_target_object,
                 )
                 anchors.append(active_anchor)
-                snapshots[anchor_id] = capture_robot_configuration(env)
+                anchor_history_indices[anchor_id] = len(robot_history) - 1
                 episode_records.append(
                     {
                         "state": planning["state_summary"],
@@ -917,8 +1066,16 @@ def _run_episode_cycle(
 
             frame = policy_frame(observation, overall_task, env_preprocessor)
             low_level_chunk_index = len(action_chunks)
+            # 回溯恢复期间沿用 MBR 选定的 seed 基址滚动生成后续 chunk，重新
+            # rollout 整个子任务；非恢复路径保持全局递增坐标（确定性配对）。
+            if active_attempt_is_recovery and mbr_rollout_coordinate is not None:
+                noise_coordinate = mbr_rollout_coordinate + active_attempt_chunks
+                noise_kind = "mbr_rollout_noise"
+            else:
+                noise_coordinate = low_level_chunk_index
+                noise_kind = "flow_noise"
             noise = coordinate_flow_noise(
-                policy, seed, episode_index, low_level_chunk_index, device="cuda"
+                policy, seed, episode_index, noise_coordinate, device="cuda", kind=noise_kind
             )
             action_chunk = _predict_action_chunk(frame, active_condition, noise)
             action_record = _execute_action_chunk(
@@ -933,7 +1090,7 @@ def _run_episode_cycle(
             active_trace[low_level_key].append(action_record)
             active_attempt_chunks += 1
 
-            if episode_done or success or len(actions) >= max_steps:
+            if episode_done or success or _budget_steps() >= max_steps:
                 _finalize_evaluator_images()
                 active_anchor = None
                 break
@@ -958,9 +1115,23 @@ def _run_episode_cycle(
                 cycle_check_count += 1
                 current_images = _current_images()
                 physical = _physical_evidence(active_anchor)
+                # 官方对 gripper 子任务（close/open the gripper）跳过 VLM 检查，
+                # 直接进入完成阶段。这里沿用该特判：不再把预测成本花在纯夹爪
+                # 开合上，但物理证据检查仍然保留（抓空/夹爪未闭合仍可触发回溯）。
+                is_gripper_subtask = (
+                    active_anchor.action_type in {"grasp", "release"}
+                    or "close the gripper to grasp" in active_anchor.action_text.lower()
+                    or "open the gripper to release" in active_anchor.action_text.lower()
+                )
+                # 官方 per-subtask retry 达上限后强制 to_complete（跳过 VLM 检查
+                # 直接推进），避免对同一子任务无限回溯。resolve_cycle_decision 的
+                # retry-limit 分支会返回 transit，此处提前跳过 VLM 预测成本。
+                retry_limit_reached = (
+                    retry_counts.get(active_anchor.anchor_id, 0) >= CYCLE_MAX_RETRIES
+                )
                 prediction = None
                 prediction_error = None
-                if cycle_predictor is not None:
+                if cycle_predictor is not None and not is_gripper_subtask and not retry_limit_reached:
                     for predictor_attempt in range(1, CYCLE_PREDICTOR_RETRIES + 1):
                         try:
                             prediction = predict_cycle_failure(
@@ -987,6 +1158,19 @@ def _run_episode_cycle(
                     max_retries=CYCLE_MAX_RETRIES,
                     backtrack_likelihoods=CYCLE_VLM_BACKTRACK_LIKELIHOODS,
                 )
+                raw_vlm_target = ""
+                if isinstance(prediction, dict):
+                    raw_vlm_target = prediction.get(
+                        "next_subtask", prediction.get("next_anchor_id", "")
+                    )
+                self_target_requested = bool(
+                    raw_vlm_target
+                    and (
+                        raw_vlm_target == active_anchor.anchor_id
+                        or raw_vlm_target == active_anchor.action_text
+                        or raw_vlm_target == active_anchor.program_id
+                    )
+                )
                 trace_event = {
                     "event": "cycle_check",
                     "phase": phase.value,
@@ -1001,12 +1185,19 @@ def _run_episode_cycle(
                     "stop_confirmed": action_record["stop_confirmed"],
                     "physical_evidence": {
                         "action_type": physical.action_type,
+                        "gripper_closed": physical.gripper_closed,
+                        "target_identity_ok": physical.target_identity_ok,
+                        "object_following_gripper": physical.object_following_gripper,
+                        "destination_reached": physical.destination_reached,
                         "postcondition_satisfied": physical.postcondition_satisfied,
                         "failure_detected": physical.failure_detected,
                         "failure_reasons": list(physical.failure_reasons),
                     },
                     "prediction": prediction,
                     "prediction_error": prediction_error,
+                    "gripper_subtask": is_gripper_subtask,
+                    "retry_limit_reached": retry_limit_reached,
+                    "self_target_requested": self_target_requested,
                     "decision": decision.decision,
                     "decision_reason": decision.reason,
                     "next_anchor_id": decision.next_anchor_id,
@@ -1025,39 +1216,169 @@ def _run_episode_cycle(
                         anchor for anchor in anchors if anchor.anchor_id == decision.next_anchor_id
                     )
                     _finalize_evaluator_images()
-                    restore_report = restore_robot_configuration(env, snapshots[target_anchor.anchor_id])
+                    target_history_index = anchor_history_indices[target_anchor.anchor_id]
+                    rewind_budget = max(0, max_steps - _budget_steps())
+
+                    def _record_rewind_waypoint(
+                        _history_index: int,
+                        _restore_report,
+                    ) -> None:
+                        nonlocal cycle_rewind_steps
+                        cycle_rewind_steps += 1
+                        frames.append(env.render()[0])
+                        if step_progress is not None:
+                            step_progress.update(1)
+
+                    rewind_report = rewind_robot_configuration_history(
+                        env,
+                        robot_history,
+                        target_history_index,
+                        max_steps=rewind_budget,
+                        on_waypoint=_record_rewind_waypoint,
+                    )
                     observation = refresh_libero_observation(env)
-                    restored_frame = policy_frame(observation, overall_task, env_preprocessor)
                     recovery_event = {
                         "event": "backtrack",
                         "phase": "backtrack",
+                        "mode": "reverse_robot_state_replay",
                         "from_anchor_id": active_anchor.anchor_id,
+                        "from_target_object": active_anchor.target_object,
                         "to_anchor_id": target_anchor.anchor_id,
+                        "to_target_object": target_anchor.target_object,
                         "decision_reason": decision.reason,
+                        "target_history_index": target_history_index,
+                        "final_history_index": rewind_report.final_history_index,
+                        "source_history_steps": rewind_report.source_history_steps,
+                        "replayed_steps": rewind_report.replayed_steps,
+                        "completed": rewind_report.completed,
+                        "waypoint_indices": list(rewind_report.waypoint_indices),
+                        "max_waypoint_qpos_delta": rewind_report.max_waypoint_qpos_delta,
                         "restore_report": {
-                            "qpos_max_error": restore_report.qpos_max_error,
-                            "robot_qvel_max_abs": restore_report.robot_qvel_max_abs,
-                            "non_robot_qpos_max_change": restore_report.non_robot_qpos_max_change,
-                            "controller_resynchronized": restore_report.controller_resynchronized,
+                            "qpos_max_error": rewind_report.qpos_max_error,
+                            "robot_qvel_max_abs": rewind_report.robot_qvel_max_abs,
+                            "non_robot_qpos_max_change": rewind_report.non_robot_qpos_max_change,
+                            "controller_resynchronized": rewind_report.controller_resynchronized,
                         },
                     }
                     recovery_events.append(recovery_event)
+                    if not rewind_report.completed:
+                        termination_reason = "max_steps"
+                        break
+                    del robot_history[target_history_index + 1 :]
+                    valid_anchor_ids = {
+                        anchor.anchor_id
+                        for anchor in anchors
+                        if anchor_history_indices[anchor.anchor_id] <= target_history_index
+                    }
+                    anchors[:] = [
+                        anchor for anchor in anchors if anchor.anchor_id in valid_anchor_ids
+                    ]
+                    anchor_history_indices = {
+                        anchor_id: history_index
+                        for anchor_id, history_index in anchor_history_indices.items()
+                        if anchor_id in valid_anchor_ids
+                    }
+                    recovery_event["invalidated_anchor_ids"] = sorted(
+                        set(anchor_traces) - valid_anchor_ids
+                    )
                     cycle_backtrack_count += 1
                     retry_counts[target_anchor.anchor_id] = decision.retry_count
                     cycle_retry_count = max(retry_counts.values(), default=0)
                     active_anchor = target_anchor
                     active_trace = anchor_traces[target_anchor.anchor_id]
-                    active_condition = target_anchor.condition
                     active_attempt_chunks = 0
                     active_attempt_is_recovery = True
                     active_attempt_checked = False
                     progress_confirmation.reset()
                     stop_confirmation.reset()
+                    if _budget_steps() >= max_steps:
+                        termination_reason = "max_steps"
+                        break
+                    # 回溯后重新进行高层目标确认/规划：机器人已回到旧姿态，但
+                    # 物体场景未回滚，旧 anchor.condition 与新场景错配正是回溯后
+                    # 抓错物体的直接原因。必须基于当前观测重新确认目标，再把新的
+                    # 执行条件交给 MBR 重试，而不是直接沿用旧条件。
+                    target_anchor_list_index = next(
+                        index
+                        for index, existing_anchor in enumerate(anchors)
+                        if existing_anchor.anchor_id == target_anchor.anchor_id
+                    )
+                    selected_subtasks[:] = selected_subtasks[
+                        : target_anchor_list_index + 1
+                    ]
+                    replan = None
+                    replan_error = None
+                    try:
+                        replan = _replan_after_rewind(target_anchor)
+                    except Exception as error:
+                        replan_error = f"{type(error).__name__}: {error}"
+                    if replan is not None:
+                        replan_program_node = replan["program_node"]
+                        replan_attempts = replan["planner_attempts"]
+                        replan_candidate = replan["selected_candidate"]["text"]
+                        replan_selected_index = replan["selected_index"]
+                        replan_program_id = replan_program_node.subtask_id
+                        replan_program_position = replan_program_node.position
+                        if replan_program_id == target_anchor.program_id:
+                            # replan 与回溯目标一致：采用 replan 的 condition。
+                            replanned_condition = replan["condition"]
+                            replan_forced_alignment = False
+                        else:
+                            # 官方语义：回溯后就是重做回溯目标子任务本身，不自由
+                            # 切换到其它节点。当 replan 与目标不一致时强制对齐到
+                            # 回溯目标节点的官方模板 condition，避免 condition 与
+                            # 场景错配导致抓错物体。
+                            if (
+                                target_anchor.program_position >= 0
+                                and target_anchor.program_position < len(cycle_program)
+                            ):
+                                target_template = cycle_program[
+                                    target_anchor.program_position
+                                ].text
+                                replanned_condition = format_cycle_condition(
+                                    overall_task, target_template
+                                )
+                            else:
+                                replanned_condition = target_anchor.condition
+                            replan_forced_alignment = True
+                    else:
+                        # Planner outage must not crash the episode: fall back to
+                        # the recovered anchor's original condition and audit the
+                        # degraded re-confirmation in the recovery event.
+                        replanned_condition = target_anchor.condition
+                        replan_attempts = 0
+                        replan_candidate = target_anchor.action_text
+                        replan_selected_index = None
+                        replan_program_id = target_anchor.program_id
+                        replan_program_position = target_anchor.program_position
+                        replan_forced_alignment = True
+                    active_condition = replanned_condition
+                    recovery_event["replanned"] = {
+                        "triggered": replan is not None,
+                        "error": replan_error,
+                        "planner_attempts": replan_attempts,
+                        "selected_candidate": replan_candidate,
+                        "selected_index": replan_selected_index,
+                        "program_id": replan_program_id,
+                        "program_position": replan_program_position,
+                        "target_program_id": target_anchor.program_id,
+                        "consistent_with_target": (
+                            replan_program_id == target_anchor.program_id
+                        ),
+                        "forced_alignment": replan_forced_alignment,
+                        "condition": replanned_condition,
+                        "previous_condition": target_anchor.condition,
+                    }
+                    restored_frame = policy_frame(observation, overall_task, env_preprocessor)
                     phase = CyclePhase.MBR_RETRY
-                    _run_mbr_retry(target_anchor, restored_frame)
+                    _run_mbr_retry(
+                        target_anchor,
+                        restored_frame,
+                        condition=replanned_condition,
+                    )
                     phase = CyclePhase.IN_PROGRESS
                     active_attempt_chunks = 1
-                    if success or episode_done or len(actions) >= max_steps:
+                    if success or episode_done or _budget_steps() >= max_steps:
                         _finalize_evaluator_images()
                         break
                 else:
@@ -1068,9 +1389,28 @@ def _run_episode_cycle(
                     phase = CyclePhase.COMPLETE
 
             if phase == CyclePhase.COMPLETE:
-                if action_record["stop_confirmed"] or (
-                    signal_source == "missing_7d"
-                    and active_attempt_chunks >= low_level_chunks_per_plan
+                # 7-D 代理没有 learned stop 信号，官方用 stop 信号推进子任务。
+                # 这里用子任务级物理完成判定作为代理 stop：按当前动作类型检查
+                # 场景物理状态（抓稳/到位/释放），而不是绑定全局任务 success
+                # （全局 success 中途恒为 False，proxy stop 永远不会触发）。
+                proxy_stop_finish = False
+                if active_anchor is not None:
+                    try:
+                        complete_evidence = _physical_evidence(active_anchor)
+                        proxy_stop_finish = bool(
+                            proxy_subtask_stop(complete_evidence)
+                        )
+                    except Exception:
+                        proxy_stop_finish = False
+                if proxy_stop_finish:
+                    cycle_proxy_stop_finish_count += 1
+                if (
+                    action_record["stop_confirmed"]
+                    or proxy_stop_finish
+                    or (
+                        signal_source == "missing_7d"
+                        and active_attempt_chunks >= low_level_chunks_per_plan
+                    )
                 ):
                     _finish_active_subtask()
             elif (
@@ -1095,6 +1435,12 @@ def _run_episode_cycle(
     if termination_reason is None:
         termination_reason = "max_steps"
     tensors = _episode_tensors(action_chunks, actions, rewards, policy)
+    cycle_self_target_request_count = sum(
+        1 for event in cycle_trace if event.get("self_target_requested")
+    )
+    cycle_replan_count = sum(
+        1 for event in recovery_events if event.get("replanned", {}).get("triggered")
+    )
     episode_result = {
         "episode_index": episode_index,
         "init_state_id": episode_index,
@@ -1102,7 +1448,9 @@ def _run_episode_cycle(
         "success": bool(success),
         "termination_mode": JITRL_TERMINATION_MODE,
         "termination_reason": termination_reason,
-        "steps": len(actions),
+        "steps": _budget_steps(),
+        "policy_action_steps": len(actions),
+        "cycle_rewind_steps": cycle_rewind_steps,
         "sum_reward": float(sum(rewards)),
         "max_reward": float(max(rewards, default=0.0)),
         "chunk_count": len(chunks),
@@ -1117,6 +1465,7 @@ def _run_episode_cycle(
         "cycle_budget_mode": CYCLE_BUDGET_MODE,
         "cycle_budget_max_steps": int(budget_max_steps),
         "cycle_retry_counts": dict(retry_counts),
+        "cycle_rewind_mode": "reverse_robot_state_replay",
         "cycle_config_version": CYCLE_CONFIG_VERSION,
         "cycle_progress_threshold": CYCLE_PROGRESS_THRESHOLD,
         "cycle_proxy_progress_threshold": CYCLE_PROXY_PROGRESS_THRESHOLD,
@@ -1126,6 +1475,9 @@ def _run_episode_cycle(
         "cycle_vetoes": cycle_veto_count,
         "cycle_retries": cycle_retry_count,
         "cycle_max_retries": CYCLE_MAX_RETRIES,
+        "cycle_self_target_request_count": cycle_self_target_request_count,
+        "cycle_replan_count": cycle_replan_count,
+        "cycle_proxy_stop_finish_count": cycle_proxy_stop_finish_count,
         "cycle_trace": cycle_trace,
         "recovery_events": recovery_events,
         "mbr_events": mbr_events,

@@ -100,7 +100,7 @@ JITRL_GEMINI_TIMEOUT_SECONDS = 120.0
 # =========================================================================
 # CycleVLA-lite 包装（零训练推理包装，不改变 JitRL 学习边界）
 # =========================================================================
-CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p0_v3_unified_800"
+CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p1_v4_smooth_rewind_unified_800"
 # 论文 progress/stop 阈值；当前 stock 7-D 策略没有 learned signals，不能伪造。
 CYCLE_PROGRESS_THRESHOLD = 0.90
 CYCLE_PROXY_PROGRESS_THRESHOLD = 0.75

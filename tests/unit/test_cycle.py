@@ -7,6 +7,7 @@ from jitpi05.jitrl.cycle import (
     adapt_cycle_policy_output,
     build_cycle_subtask_program,
     cumulative_trajectory_features,
+    format_cycle_condition,
     format_cycle_subtask_program,
     match_cycle_subtask,
     pairwise_l2_distances,
@@ -141,3 +142,45 @@ def test_cycle_program_has_stable_ids_and_matches_unused_nodes() -> None:
     assert matched.subtask_id == "subtask-01"
     assert repeated.subtask_id == matched.subtask_id
     assert all(isinstance(item, CycleSubtask) for item in program)
+
+
+def test_cycle_program_uses_official_template_text() -> None:
+    program = build_cycle_subtask_program("pick up the mug and place it in the basket")
+    texts = [item.text for item in program]
+    assert texts == [
+        "Move the gripper above the mug.",
+        "Close the gripper to grasp the mug.",
+        "Move the gripper above the basket while holding the mug.",
+        "Open the gripper to release the mug.",
+    ]
+    types = [item.action_type for item in program]
+    assert types == ["approach", "grasp", "transport", "release"]
+
+
+def test_cycle_program_handles_put_and_complex_tasks() -> None:
+    program = build_cycle_subtask_program("put the red block on the wooden cabinet")
+    assert program[0].text == "Move the gripper above the red block."
+    assert program[-1].action_type == "release"
+
+    complex_program = build_cycle_subtask_program("turn on the stove")
+    assert [item.text for item in complex_program] == [
+        "Move the gripper above the stove knob.",
+        "Close the gripper to grasp the stove knob.",
+        "Rotate the gripper to turn on the stove.",
+    ]
+    assert [item.action_type for item in complex_program] == [
+        "approach",
+        "grasp",
+        "rotate",
+    ]
+
+
+def test_cycle_condition_uses_official_prompt_template() -> None:
+    condition = format_cycle_condition(
+        "pick up the mug and place it in the basket",
+        "Move the gripper above the mug.",
+    )
+    assert condition == (
+        "Task: pick up the mug and place it in the basket. "
+        "The current subtask: Move the gripper above the mug."
+    )
