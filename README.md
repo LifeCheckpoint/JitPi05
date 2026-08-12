@@ -88,23 +88,35 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 
 运行要求 Linux、NVIDIA CUDA；无桌面服务器建议使用 EGL。4-bit NF4 Qwen3.5-2B 与 bf16 π₀.₅ 同时驻留显存；Gemini 仅通过网络 API 执行 episode 后 evaluator。凭据位于被忽略的 `.secrets/gemini.json`，格式为 `{"api_key":"..."}`，也可通过 `JITPI05_GEMINI_CREDENTIALS` 覆盖。
 
-默认 benchmark 从完整四套件缩减为覆盖四个标准 LIBERO suite 的 10-task 固定面板：`libero_spatial` 任务 0、1；`libero_object` 任务 0、5、9；`libero_goal` 任务 0、1；`libero_10` 任务 0、5、9。默认规模为 `10 tasks × 2 methods × 10 episodes × 1 seed = 200 rollouts`，默认产物写入 `artifacts/jitrl_eval_libero_standard10_seed17_qwen4b_workspace_v2_no_stop_diagnostic/`。该面板覆盖社区公开验证的四个标准 suite，但不是完整 40-task suite；结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
+评测面板可选，通过环境变量 `JITPI05_JITRL_PANEL` 控制（默认 `libero90`）：
 
-建议先运行一个小型标准 suite 子集，确认环境、checkpoint 和高层接口正常：
+- `libero10`：完整 LIBERO-10 长任务 suite 全 10 任务（published pi0.5-LIBERO benchmark，max_steps 520），对应 HarnessVLA × JitRL 消融报告的四格配置。
+- `libero90`：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较，max_steps 400）。
+
+默认规模为 `tasks × methods × 10 episodes × 1 seed`；四方法完整面板（`jitrl-free`、`static-free`、`jitrl`、`static`）为 `10 tasks × 4 methods × 10 episodes = 400 rollouts`。结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
+
+建议先运行一个小型子集，确认环境、checkpoint 和高层接口正常（LIBERO-10 面板下固定工作集方法 `jitrl`/`static`）：
 
 ```bash
 uv sync
-MUJOCO_GL=egl uv run jitpi05-eval-jitrl \
+MUJOCO_GL=egl JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
   --task libero_10_task0 \
   --task libero_10_task1 \
   --method jitrl --method static --seed 17 --episodes 3
 ```
 
-完整 10-task 标准面板：
+完整 LIBERO-10 四方法面板（`jitrl-free`、`static-free`、`jitrl`、`static`，每方法 100 episodes）。建议用独立 `--output-dir`，避免与默认 `jitrl_cycle` 目录中的 CycleVLA 数据混淆：
 
 ```bash
-MUJOCO_GL=egl uv run jitpi05-eval-jitrl
-uv run jitpi05-eval-jitrl --summarize-only
+OUT=artifacts/jitrl_eval_libero10_long_seed17_qwen2b_workspace_v2_rerun
+MUJOCO_GL=egl JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
+  --method jitrl-free --method static-free --method jitrl --method static \
+  --seed 17 --episodes 10 --output-dir "$OUT"
+
+# 汇总必须与运行时使用相同的 method/seed/episodes/output-dir 参数
+JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
+  --method jitrl-free --method static-free --method jitrl --method static \
+  --seed 17 --episodes 10 --output-dir "$OUT" --summarize-only
 ```
 
 每条 run 写入 `videos/`、`episodes.json`、`memory.json`、`memory_snapshots/`、`tensors/`、`run_summary.json`、`metrics.json` 和 `progress.json`。高层 trace 保存 Qwen binding prompt/原始 JSON、九类工作集、Qwen 原始有效实例、部署后实例、终止模式、原始/更新 logits 和概率、`V/Q/A`、UCB、选择变化、熵、KL，以及 Gemini evaluator 记录。指标额外报告 Qwen `stop` 被部署掩码的比例、最终 `stop` 选择率、`qwen_stop` 终止率和最大步数终止率；no-stop 诊断中后两项里的 `stop` 指标应严格为零。

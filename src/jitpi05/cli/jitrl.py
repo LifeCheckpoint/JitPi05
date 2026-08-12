@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 
 from jitpi05.config import (
     CYCLE_EVALUATION,
-    CYCLE_JITRL_METHODS,
+    JITRL_CLI_METHODS,
     JITRL_EPISODES,
     JITRL_METHODS,
     JITRL_OUTPUT_DIR,
@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--method",
         action="append",
-        choices=CYCLE_JITRL_METHODS,
+        choices=JITRL_CLI_METHODS,
         help="Method to run or summarize; repeat for multiple methods (default: all).",
     )
     parser.add_argument(

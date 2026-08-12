@@ -5,6 +5,7 @@
 设计集中在一个 ``frozen`` 数据类 ``CYCLE_EVALUATION`` 中，避免散落的扁平常量。
 """
 
+import os
 from dataclasses import dataclass
 
 from jitpi05.paths import artifact_root, gemini_credentials_path
@@ -45,15 +46,23 @@ SIM_ACTION_STEPS = 10  # 每个底层 chunk 执行的动作步数
 # =========================================================================
 # 历史默认两方法；四方法二因素比较（Cycle × JitRL）通过 CLI --method 显式开启。
 JITRL_METHODS = ("jitrl-free", "static-free")
+# 固定工作集（HarnessVLA 固定原语）方法：jitrl（在线记忆调制）/ static（无调制）。
+JITRL_FIXED_METHODS = ("jitrl", "static")
 CYCLE_JITRL_METHODS = (
     "static-free",
     "jitrl-free",
     "static-free-cycle",
     "jitrl-free-cycle",
 )
-# Cycle 包装方法 = 后缀为 "-cycle" 的方法；全部方法 = 默认方法 + Cycle 方法。
+# Cycle 包装方法 = 后缀为 "-cycle" 的方法。
 CYCLE_METHODS = tuple(method for method in CYCLE_JITRL_METHODS if method.endswith("-cycle"))
-ALL_METHODS = tuple(dict.fromkeys((*JITRL_METHODS, *CYCLE_METHODS)))
+# 全部方法 = 自由候选 + 固定工作集 + Cycle 包装方法。
+# rollout.run_jitrl_experiment 使用本常量校验 method，因此必须包含固定工作集方法。
+ALL_METHODS = tuple(
+    dict.fromkeys((*JITRL_METHODS, *JITRL_FIXED_METHODS, *CYCLE_METHODS))
+)
+# CLI --method 可选全集与 ALL_METHODS 保持一致（含自由候选、固定工作集与 Cycle 方法）。
+JITRL_CLI_METHODS = ALL_METHODS
 
 # =========================================================================
 # JitRL 学习器
@@ -62,7 +71,7 @@ JITRL_SEEDS = (17,)
 JITRL_EPISODES = 10
 JITRL_HIGH_LEVEL_STEPS = 40  # 高层决策总步数（须能被 SIM_ACTION_STEPS 整除）
 JITRL_PLANNER_RETRIES = 7  # 高层规划重试（free 与固定工作区统一）
-JITRL_EVALUATOR_RETRIES = 10  # 每个 chunk 的 Gemini 评估重试（指数退避）
+JITRL_EVALUATOR_RETRIES = 15  # 每个 chunk 的 Gemini 评估重试（指数退避）
 JITRL_HISTORY_SIZE = 2
 JITRL_TOP_K = 10
 JITRL_GAMMA = 0.95
@@ -147,21 +156,60 @@ CYCLE_EVALUATION = CycleEvaluationDesign()
 # =========================================================================
 # LIBERO-90 官方 max_steps（TASK_SUITE_MAX_STEPS）。
 LIBERO90_MAX_STEPS = 400
+# LIBERO-10 官方 max_steps（与 published pi0.5-LIBERO 一致）。
+LIBERO10_MAX_STEPS = 520
 
-# JitRL 默认评测任务池 = LIBERO-90 预注册候选池。正式评测前先用 static-free
-# 在筛选状态范围做难度筛选，再用筛选出的难任务面板做四方法正式比较。
-# 任务描述由环境在运行时提供（env.call("task_description")），此处留空占位。
-JITRL_TASKS = tuple(
-    {
-        "name": f"libero_90_task{task_id}",
-        "suite": "libero_90",
-        "task_id": task_id,
-        "description": "",
-        "max_steps": LIBERO90_MAX_STEPS,
-        "zero_shot": True,
-    }
-    for task_id in CYCLE_EVALUATION.libero90_candidates
+# 评测面板可选：环境变量 JITPI05_JITRL_PANEL=libero10 | libero90（默认 libero90）。
+# - libero10：完整 LIBERO-10 长任务 suite 全 10 任务，对应 ablation 报告的
+#   HarnessVLA × JitRL 四格配置。
+# - libero90：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较）。
+JITRL_BENCHMARK_PANEL = os.environ.get("JITPI05_JITRL_PANEL", "libero90").strip().lower()
+if JITRL_BENCHMARK_PANEL not in ("libero10", "libero90"):
+    raise ValueError(
+        "JITPI05_JITRL_PANEL must be 'libero10' or 'libero90'; "
+        f"got {JITRL_BENCHMARK_PANEL!r}"
+    )
+
+# 完整 LIBERO-10 长任务 suite 的任务描述（published pi0.5-LIBERO benchmark）。
+_LIBERO10_TASK_DESCRIPTIONS = (
+    "put both the alphabet soup and the tomato sauce in the basket",
+    "put both the cream cheese box and the butter in the basket",
+    "turn on the stove and put the moka pot on it",
+    "put the black bowl in the bottom drawer of the cabinet and close it",
+    "put the white mug on the left plate and put the yellow and white mug on the right plate",
+    "pick up the book and place it in the back compartment of the caddy",
+    "put the white mug on the plate and put the chocolate pudding to the right of the plate",
+    "put both the alphabet soup and the cream cheese box in the basket",
+    "put both moka pots on the stove",
+    "put the yellow and white mug in the microwave and close it",
 )
+
+if JITRL_BENCHMARK_PANEL == "libero10":
+    JITRL_TASKS = tuple(
+        {
+            "name": f"libero_10_task{task_id}",
+            "suite": "libero_10",
+            "task_id": task_id,
+            "description": _LIBERO10_TASK_DESCRIPTIONS[task_id],
+            "max_steps": LIBERO10_MAX_STEPS,
+            "zero_shot": False,
+        }
+        for task_id in range(10)
+    )
+else:
+    # LIBERO-90 预注册候选池。任务描述由环境在运行时提供
+    # （env.call("task_description")），此处留空占位。
+    JITRL_TASKS = tuple(
+        {
+            "name": f"libero_90_task{task_id}",
+            "suite": "libero_90",
+            "task_id": task_id,
+            "description": "",
+            "max_steps": LIBERO90_MAX_STEPS,
+            "zero_shot": True,
+        }
+        for task_id in CYCLE_EVALUATION.libero90_candidates
+    )
 
 SIM_TASKS = (
     {
