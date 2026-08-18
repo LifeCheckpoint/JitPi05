@@ -159,16 +159,40 @@ LIBERO90_MAX_STEPS = 400
 # LIBERO-10 官方 max_steps（与 published pi0.5-LIBERO 一致）。
 LIBERO10_MAX_STEPS = 520
 
-# 评测面板可选：环境变量 JITPI05_JITRL_PANEL=libero10 | libero90（默认 libero90）。
+# 评测面板可选：环境变量 JITPI05_JITRL_PANEL=libero10 | libero90 | libero_pro
+# （默认 libero90）。
 # - libero10：完整 LIBERO-10 长任务 suite 全 10 任务，对应 ablation 报告的
 #   HarnessVLA × JitRL 四格配置。
 # - libero90：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较）。
+# - libero_pro：LIBERO-Pro 扰动面板（object/position/semantic/task 四维扰动，
+#   基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。
 JITRL_BENCHMARK_PANEL = os.environ.get("JITPI05_JITRL_PANEL", "libero90").strip().lower()
-if JITRL_BENCHMARK_PANEL not in ("libero10", "libero90"):
+if JITRL_BENCHMARK_PANEL not in ("libero10", "libero90", "libero_pro"):
     raise ValueError(
-        "JITPI05_JITRL_PANEL must be 'libero10' or 'libero90'; "
+        "JITPI05_JITRL_PANEL must be 'libero10', 'libero90' or 'libero_pro'; "
         f"got {JITRL_BENCHMARK_PANEL!r}"
     )
+
+# 低层策略后端：lerobot（默认，上一代 `lerobot/pi05-libero`）| rlinf
+# （RLinf-Pi05-LIBERO-130-fullshot-SFT 远程 OpenPI 子进程）。用于在 libero_pro
+# 面板下对照观察低层模型行为，排查异常时快速回退。
+JITRL_LOW_LEVEL_BACKEND = os.environ.get("JITPI05_LOW_LEVEL_BACKEND", "lerobot").strip().lower()
+if JITRL_LOW_LEVEL_BACKEND not in ("lerobot", "rlinf"):
+    raise ValueError(
+        "JITPI05_LOW_LEVEL_BACKEND must be 'lerobot' or 'rlinf'; "
+        f"got {JITRL_LOW_LEVEL_BACKEND!r}"
+    )
+
+# OpenPI 官方 LIBERO evaluator 每次只执行预测 chunk 的前 5 步，然后重新
+# 观测并推理。仅 RLinf 后端采用该协议；LeRobot 基线保持原来的 10 步。
+RLINF_ACTION_STEPS = 5
+POLICY_ACTION_STEPS = (
+    RLINF_ACTION_STEPS if JITRL_LOW_LEVEL_BACKEND == "rlinf" else SIM_ACTION_STEPS
+)
+# RLinf/OpenPI 官方 LIBERO evaluator 直接把环境 task description 作为 prompt。
+# 默认关闭 HarnessVLA 中间子任务 prompt，避免把 `align/grasp/lift/...` 等未必
+# 出现在 RLinf SFT 训练分布中的字符串传给低层模型。LeRobot 保持原有条件化。
+RLINF_USE_RAW_TASK_PROMPT = True
 
 # 完整 LIBERO-10 长任务 suite 的任务描述（published pi0.5-LIBERO benchmark）。
 _LIBERO10_TASK_DESCRIPTIONS = (
@@ -195,6 +219,16 @@ if JITRL_BENCHMARK_PANEL == "libero10":
             "zero_shot": False,
         }
         for task_id in range(10)
+    )
+elif JITRL_BENCHMARK_PANEL == "libero_pro":
+    # LIBERO-Pro 扰动面板。注册扰动 suite 并生成任务描述；任务描述由环境在
+    # 运行时提供（env.call("task_description")），此处留空占位。每个任务
+    # 携带 "perturbation" 维度标记，便于报告按扰动维度聚合。
+    from jitpi05.libero_pro import libero_pro_task_specs, register_libero_pro_suites
+
+    register_libero_pro_suites()
+    JITRL_TASKS = libero_pro_task_specs(
+        base_suite="libero_10", max_steps=LIBERO10_MAX_STEPS
     )
 else:
     # LIBERO-90 预注册候选池。任务描述由环境在运行时提供

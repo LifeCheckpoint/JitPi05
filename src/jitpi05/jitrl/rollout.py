@@ -50,6 +50,7 @@ from jitpi05.config import (
     JITRL_HIGH_LEVEL_STEPS,
     JITRL_HISTORY_SIZE,
     JITRL_LOGIT_CALIBRATION,
+    JITRL_LOW_LEVEL_BACKEND,
     JITRL_MAX_PLAN_TOKENS,
     JITRL_OUTPUT_DIR,
     JITRL_PLANNER_RETRIES,
@@ -60,6 +61,8 @@ from jitpi05.config import (
     JITRL_TERMINATION_MODE,
     JITRL_TOP_K,
     JITRL_UCB_ALPHA,
+    POLICY_ACTION_STEPS,
+    RLINF_USE_RAW_TASK_PROMPT,
     SIM_ACTION_STEPS,
     SIM_PI05_ID,
 )
@@ -96,10 +99,9 @@ from jitpi05.jitrl.planner import (
     plan_and_score_free,
     score_free_candidates,
 )
-from jitpi05.jitrl.vlm import evaluate_chunk as evaluate_chunk_with_gemini
 from jitpi05.jitrl.vlm import (
+    QwenChunkEvaluator,
     load_cycle_failure_predictor,
-    load_gemini_evaluator,
     predict_cycle_failure,
 )
 from jitpi05.policy import conditioned_task
@@ -119,6 +121,13 @@ FREE_METHODS = (
     "jitrl-free-cycle",
     "static-free-cycle",
 )
+
+
+def _low_level_condition(overall_task: str, subtask: str) -> str:
+    """选择低层 VLA prompt；RLinf 诊断必须遵循官方 raw-task 协议。"""
+    if RLINF_USE_RAW_TASK_PROMPT and JITRL_LOW_LEVEL_BACKEND == "rlinf":
+        return overall_task
+    return conditioned_task(overall_task, subtask)
 # Methods that populate/read the online experience memory. Recovery actions are
 # deliberately excluded from episode_records, so Cycle does not change the JitRL
 # learning boundary.
@@ -405,8 +414,7 @@ def _evaluate_episode_chunks(
         evaluation = None
         for attempt in range(1, JITRL_EVALUATOR_RETRIES + 1):
             try:
-                evaluation = evaluate_chunk_with_gemini(
-                    evaluator,
+                evaluation = evaluator.evaluate(
                     [*before_images, *after_images],
                     episode_result["task"],
                     chunk["state_summary"],
@@ -610,7 +618,7 @@ def _run_episode_cycle(
         action_chunks.append(cpu_chunk)
         progress_confirmed = False
         stop_confirmed = False
-        for local_index, action in enumerate(cpu_chunk[:SIM_ACTION_STEPS]):
+        for local_index, action in enumerate(cpu_chunk[:POLICY_ACTION_STEPS]):
             if _budget_steps() >= max_steps:
                 break
             action_transition = env_postprocessor({"action": action.unsqueeze(0)})
@@ -1690,7 +1698,7 @@ def _run_episode(
                     else update["base_choice_index"]
                 )
                 selected_candidate = candidates[selected_index]
-                active_condition = conditioned_task(
+                active_condition = _low_level_condition(
                     overall_task, selected_candidate["text"]
                 )
                 action_start_step = len(actions)
@@ -1774,7 +1782,7 @@ def _run_episode(
             action_chunks.append(action_chunk.detach().cpu())
             del batch, normalized_chunk
 
-            for action in action_chunk[:SIM_ACTION_STEPS]:
+            for action in action_chunk[:POLICY_ACTION_STEPS]:
                 action_transition = env_postprocessor({"action": action.unsqueeze(0)})
                 env_action = action_transition["action"].detach().cpu()
                 observation, reward, terminated, truncated, info = env.step(
@@ -1949,7 +1957,9 @@ def load_experiment_models(
 
     planner_model, planner_processor = load_jitrl_planner()
     policy, preprocessor, postprocessor = load_policy()
-    evaluator = load_gemini_evaluator() if need_evaluator else None
+    evaluator = (
+        QwenChunkEvaluator(planner_model, planner_processor) if need_evaluator else None
+    )
     cycle_predictor = load_cycle_failure_predictor() if need_cycle_predictor else None
     return {
         "planner_model": planner_model,
@@ -2056,7 +2066,7 @@ def run_jitrl_experiment(
             evaluator = models.get("evaluator")
             cycle_predictor = models.get("cycle_predictor")
             if method in MEMORY_METHODS and evaluator is None:
-                raise RuntimeError(f"{method} method requires a Gemini evaluator")
+                raise RuntimeError(f"{method} method requires a Qwen evaluator")
             if method in CYCLE_METHODS and cycle_predictor is None:
                 raise RuntimeError(f"{method} method requires a Cycle predictor")
         else:
@@ -2068,9 +2078,9 @@ def run_jitrl_experiment(
             if method in MEMORY_METHODS:
                 tqdm.write(
                     f"[load] task={task_name} method={method} seed={seed}: "
-                    f"configuring {JITRL_EVALUATOR_MODEL} evaluator"
+                    "configuring local Qwen evaluator"
                 )
-                evaluator = load_gemini_evaluator()
+                evaluator = QwenChunkEvaluator(planner_model, planner_processor)
             if method in CYCLE_METHODS:
                 tqdm.write(
                     f"[load] task={task_name} method={method} seed={seed}: "
@@ -2127,7 +2137,7 @@ def run_jitrl_experiment(
                 step_progress.close()
             if method in MEMORY_METHODS:
                 if evaluator is None:
-                    raise RuntimeError(f"{method} method lost its Gemini evaluator")
+                    raise RuntimeError(f"{method} method lost its Qwen evaluator")
                 _step_rewards, returns = _evaluate_episode_chunks(
                     evaluator,
                     episode_result,

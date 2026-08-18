@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
+import torch
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
@@ -311,3 +312,147 @@ def evaluate_chunk(
         "raw_output": result.model_dump_json(),
         **record,
     }
+
+
+def _extract_json_object(text: str) -> dict:
+    """从 Qwen 输出中稳健提取 JSON 对象（容忍 markdown fence 与前后缀）。"""
+
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        blocks = stripped.split("```")
+        stripped = blocks[1] if len(blocks) > 1 else blocks[0]
+        if stripped.startswith("json"):
+            stripped = stripped[4:]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"no JSON object found in Qwen output: {text!r}")
+    return json.loads(stripped[start : end + 1])
+
+
+def qwen_evaluator_prompt(
+    task: str,
+    state_summary: str,
+    action_text: str,
+    next_state_summary: str,
+    success: bool,
+    chunk_index: int,
+    chunk_count: int,
+    attempt: int = 1,
+) -> str:
+    """在 Gemini evaluator prompt 基础上追加 Qwen 需要的 JSON 输出格式说明。"""
+
+    base = evaluator_prompt(
+        task,
+        state_summary,
+        action_text,
+        next_state_summary,
+        success,
+        chunk_index,
+        chunk_count,
+        attempt,
+    )
+    return (
+        base
+        + "\nReturn exactly one JSON object and no other text, with these fields: "
+        '{"result": "<one short sentence>", "usefulness": "useful" | "neutral", '
+        '"certainty": "certain" | "somewhat uncertain" | "very uncertain", '
+        '"score": <integer 0-3>}. usefulness must be useful exactly when score is '
+        "positive and neutral exactly when score is zero."
+    )
+
+
+class QwenChunkEvaluator:
+    """本地 Qwen3.5-2B 视觉 chunk 评估器（复用高层规划器的同一模型实例）。
+
+    与 Gemini 评估器等价地返回 ``result/usefulness/certainty/score``，仅 backend
+    与 model 字段不同。注意：评估与规划共享同一模型，存在自评偏差（见 README
+    credit assignment 说明）。
+    """
+
+    def __init__(self, model, processor, *, model_id: str | None = None) -> None:
+        self.model = model
+        self.processor = processor
+        self.model_id = model_id or getattr(model, "name_or_path", "Qwen3.5-2B")
+
+    @torch.inference_mode()
+    def evaluate(
+        self,
+        images: Sequence[Image.Image],
+        task: str,
+        state_summary: str,
+        action_text: str,
+        next_state_summary: str,
+        success: bool,
+        chunk_index: int,
+        chunk_count: int,
+        attempt: int = 1,
+    ) -> dict:
+        """评估一个语义动作转移，返回与 Gemini 版一致的 dict。"""
+
+        prompt = qwen_evaluator_prompt(
+            task,
+            state_summary,
+            action_text,
+            next_state_summary,
+            success,
+            chunk_index,
+            chunk_count,
+            attempt,
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    *({"type": "image", "image": image} for image in images),
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        generated = self.model.generate(
+            **inputs,
+            max_new_tokens=JITRL_MAX_EVALUATOR_TOKENS,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+        )
+        generated_ids = generated[0, inputs["input_ids"].shape[1] :]
+        raw_output = self.processor.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+
+        parsed = _extract_json_object(raw_output)
+        try:
+            score = int(parsed["score"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Qwen evaluator missing/invalid score: {raw_output!r}") from error
+        if not 0 <= score <= 3:
+            raise ValueError(f"Qwen evaluator score out of range: {score}")
+        usefulness = "useful" if score > 0 else "neutral"
+        certainty = str(parsed.get("certainty", "certain"))
+        result = str(parsed.get("result", "")).strip()
+        if not result:
+            result = usefulness
+
+        return {
+            "backend": "qwen_local",
+            "model": self.model_id,
+            "prompt": prompt,
+            "raw_output": raw_output,
+            "result": result,
+            "usefulness": usefulness,
+            "certainty": certainty,
+            "score": score,
+        }

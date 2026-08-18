@@ -78,9 +78,11 @@ JitRL memory 只包含同一 task、先前已结束 episode 的高层记录。�
 
 `static` 基线运行完全相同的 Qwen 工作集绑定、原始 logits、temperature、uniform 和 π₀.₅ 流程，但 advantage 恒为零且不读写 memory。因此两种方法的差别只在测试时 memory advantage modulation。
 
-### Gemini evaluator、记忆生命周期与随机配对
+### 本地 Qwen evaluator、记忆生命周期与随机配对
 
-JitRL episode 结束后，Gemini 3.6 Flash 按高层 chunk 读取动作前后的外部/腕部图像、Qwen 状态摘要、已执行语义动作、下一状态摘要和最终环境成功标记。`score∈[0,3]`；仅视觉上明确且与任务相关的进展可得正分，错误对象、错误目标、回退、重复、无效果或不确定动作均为 0。局部 reward 为 `score/3`，环境成功时最后一个 chunk 增加 `+1`，再按 `gamma=0.95` 计算 reward-to-go。Static 不调用 evaluator。
+JitRL episode 结束后，**本地 Qwen3.5-2B**（复用高层规划器的同一模型实例，`QwenChunkEvaluator`）按高层 chunk 读取动作前后的外部/腕部图像、Qwen 状态摘要、已执行语义动作、下一状态摘要和最终环境成功标记。`score∈[0,3]`；仅视觉上明确且与任务相关的进展可得正分，错误对象、错误目标、回退、重复、无效果或不确定动作均为 0。局部 reward 为 `score/3`，环境成功时最后一个 chunk 增加 `+1`，再按 `gamma=0.95` 计算 reward-to-go。Static 不调用 evaluator。
+
+> **自评偏差说明**：评估器与高层策略共享同一 Qwen3.5-2B 模型，credit assignment 不再由独立模型（Gemini 3.6 Flash）提供，存在自评乐观偏差（冒烟观测 `mean_evaluator_score=0.9`，显著高于 Gemini 的 `0.1`）。这是为节省 API 成本、规避 4B 级显存溢出的取舍；报告应明确声明评估器与策略同源的局限。
 
 Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避免同 episode 信息泄漏。每个 task/method/seed run 从独立空 memory 开始。候选 uniform 与 π₀.₅ flow noise 使用不含 method 的稳定坐标 seed；轨迹分叉后视觉状态自然可能不同。
 
@@ -92,6 +94,7 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 
 - `libero10`：完整 LIBERO-10 长任务 suite 全 10 任务（published pi0.5-LIBERO benchmark，max_steps 520），对应 HarnessVLA × JitRL 消融报告的四格配置。
 - `libero90`：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较，max_steps 400）。
+- `libero_pro`：LIBERO-Pro 扰动面板（object / position(swap) / semantic(lan) / task 四维扰动，基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。低层策略切换为 RLinf-Pi05-LIBERO-130-fullshot-SFT（见下方「RLinf π0.5 低层策略」）。
 
 默认规模为 `tasks × methods × 10 episodes × 1 seed`；四方法完整面板（`jitrl-free`、`static-free`、`jitrl`、`static`）为 `10 tasks × 4 methods × 10 episodes = 400 rollouts`。结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
 
@@ -103,6 +106,14 @@ MUJOCO_GL=egl JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
   --task libero_10_task0 \
   --task libero_10_task1 \
   --method jitrl --method static --seed 17 --episodes 3
+```
+
+LIBERO-Pro 面板冒烟（单扰动任务、static 方法、1 episode，验证环境 + Qwen 规划 + RLinf π0.5 低层链路）：
+
+```bash
+MUJOCO_GL=egl JITPI05_JITRL_PANEL=libero_pro uv run jitpi05-eval-jitrl \
+  --task libero_10_object_task0 --method static --seed 17 --episodes 1 \
+  --output-dir artifacts/jitrl_libero_pro_smoke
 ```
 
 完整 LIBERO-10 四方法面板（`jitrl-free`、`static-free`、`jitrl`、`static`，每方法 100 episodes）。建议用独立 `--output-dir`，避免与默认 `jitrl_cycle` 目录中的 CycleVLA 数据混淆：
@@ -122,6 +133,17 @@ JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
 每条 run 写入 `videos/`、`episodes.json`、`memory.json`、`memory_snapshots/`、`tensors/`、`run_summary.json`、`metrics.json` 和 `progress.json`。高层 trace 保存 Qwen binding prompt/原始 JSON、九类工作集、Qwen 原始有效实例、部署后实例、终止模式、原始/更新 logits 和概率、`V/Q/A`、UCB、选择变化、熵、KL，以及 Gemini evaluator 记录。指标额外报告 Qwen `stop` 被部署掩码的比例、最终 `stop` 选择率、`qwen_stop` 终止率和最大步数终止率；no-stop 诊断中后两项里的 `stop` 指标应严格为零。
 
 统计包括 overall/final-10 success rate、成功步数、工作集有效率、邻居动作覆盖、非零 advantage、选择变化、UCB、基础/更新熵、更新 KL、evaluator 分布、logit shift、邻居数和 memory size。默认只有一个 seed，且同一 JitRL run 内 episode 顺序相关；结果只能描述当前任务面板。
+
+### RLinf π0.5 低层策略与 LIBERO-Pro 集成
+
+`libero_pro` 面板使用 [`RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT`](https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT) 作为低层策略（OpenPI π0.5 架构，`action_horizon=10`、`action_dim=7` 环境维度 / 32 模型内部维度），替代 `lerobot/pi05-libero`。该 checkpoint 是 OpenPI（PyTorch 实现）格式，与当前项目（LeRobot PyTorch、numpy 2、transformers 5.5）依赖硬冲突，因此以**独立 openpi 子进程**运行：
+
+- 服务端 [`scripts/rlinf_pi05_server.py`](scripts/rlinf_pi05_server.py) 在 `third_party/openpi/.venv`（Python 3.11 + torch 2.7.1 + transformers 4.53.2 + patch）中加载 checkpoint，通过 stdin/stdout JSON 行协议提供推理。
+- 客户端 [`src/jitpi05/rlinf_client.py`](src/jitpi05/rlinf_client.py) 在当前项目（Python 3.12）中管理子进程生命周期，向 rollout 暴露与本地 `PI05Policy` 等价的 `predict_action_chunk`/`reset`/`config` 接口。
+- 输入对齐在服务端完成：双相机 180° 旋转；客户端从 LeRobot 嵌套 `robot_state` 构造 8 维 state（eef_pos + axisangle + gripper_qpos）。
+- flow-matching 噪声通过 `policy.infer(obs, noise=...)` 显式注入；服务端把 7 维环境噪声 pad 到 32 维模型内部维度，保证四方法共享同一噪声的实验边界。
+
+LIBERO-Pro（arXiv:2510.03827）通过整体替换 libero 包集成：`third_party/libero-pro/libero` 软链接到 `.venv` 的 libero 包（原包备份为 `libero_orig_backup`），并把 [`zhouxueyang/LIBERO-Pro`](https://huggingface.co/datasets/zhouxueyang/LIBERO-Pro) 的扰动 bddl/init 软链接进 libero 包的 `bddl_files/`、`init_files/`。`~/.libero/config.yaml` 指向新包路径。扰动 suite 由 LIBERO-Pro 的替换版 benchmark 注册（`libero_10_object/swap/lan/task` 等）；[`src/jitpi05/libero_pro.py`](src/jitpi05/libero_pro.py) 保留幂等的动态注册作为兜底。object 扰动引入的 `bigger_alphabet_soup`、`red_coffee_mug` 等新物体随 LIBERO-Pro 的 `envs/objects/` 与 `assets/` 一并提供。
 
 ### 论文对齐边界
 

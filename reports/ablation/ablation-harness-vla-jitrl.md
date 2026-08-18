@@ -66,3 +66,37 @@
 - **单 seed（17）**：`sample_std=0`、seed-level bootstrap 塌缩为观测值，不能做跨 seed 推断；task 级 CI 仅描述性。
 - **episode 顺序相关**：同一 JitRL run 内在线记忆使 episode 不独立，不能当独立重复样本。
 - 本面板测的是"固定词表约束"这一简化骨架（无 HarnessVLA 的 Task Specific Memory / Global Memory / 解析原语层，无 JitRL 论文的增广候选集），结论应表述为：在本面板、单一冻结 π₀.₅ 低层、环境终止 + 固定动作词表/自由候选条件下成立。
+
+## 6. LIBERO-Pro object 扰动对照（新增）
+
+> Benchmark：LIBERO-Pro `libero_10_object`（object 扰动：物体外观/尺度改变）10 任务 × 4 方法 × 10 episodes × 1 seed，共 400 rollouts/后端。
+> 数据来源：`artifacts/jitrl_libero_pro_object/`（RLinf 后端）与 `artifacts/jitrl_libero_pro_object_lerobot/`（LeRobot 后端）。
+> 说明：本阶段 credit assignment 已由 Gemini 3.6 Flash 切换为本地 Qwen3.5-2B 自评（复用高层规划器模型），存在自评乐观偏差。
+
+### 6.1 结果对照（四方法宏平均成功率）
+
+| 低层后端 | jitrl-free | static-free | jitrl | static |
+|---|---|---|---|---|
+| **RLinf-Pi05-LIBERO-130-fullshot-SFT** | 0.000 | 0.000 | 0.000 | 0.000 |
+| **lerobot/pi05-libero（上一代）** | 0.690 | 0.730 | 0.670 | 0.650 |
+
+### 6.2 每任务明细（LeRobot 后端成功率）
+
+| 任务 | jitrl-free | static-free | jitrl | static |
+|---|---|---|---|---|
+| task0 | 0.00 | 0.00 | 0.00 | 0.00 |
+| task1 | 1.00 | 1.00 | 1.00 | 0.90 |
+| task2 | 1.00 | 1.00 | 1.00 | 1.00 |
+| task3 | 1.00 | 0.90 | 0.80 | 0.80 |
+| task4 | 1.00 | 1.00 | 1.00 | 1.00 |
+| task5 | 0.80 | 1.00 | 1.00 | 1.00 |
+| task6 | 0.90 | 0.90 | 0.80 | 0.70 |
+| task7 | 0.00 | 0.10 | 0.00 | 0.00 |
+| task8 | 1.00 | 1.00 | 1.00 | 1.00 |
+| task9 | 0.20 | 0.40 | 0.10 | 0.10 |
+
+### 6.3 结论
+
+1. **RLinf 后端全灭、LeRobot 后端正常（65–73%）**：同一 LIBERO-Pro object 扰动环境下，上一代 `lerobot/pi05-libero` 大部分任务 80–100% 成功，而 RLinf fullshot-SFT 400 rollouts 无一成功，与观察到的"机械臂拿一下就胡乱扭动"一致。这**排除 LIBERO-Pro 集成问题**（环境、bddl、扰动物体注册均正确），问题定位于 RLinf 后端——待用 RLinf 在非扰动 `libero_10` 的单 episode 决定性测试区分"adapter bug"与"RLinf 模型对 object 扰动的 OOD 泛化崩溃"。
+2. **JitRL 记忆调制在两个后端下均无可观测正向增益**：LeRobot 后端下 `jitrl vs static` = +2pt、`jitrl-free vs static-free` = −4pt；配对成功步数差 task1 为 −20.3（JitRL 反而多用步）、其余接近 0。与第 4 节 LIBERO-10 面板的"±1pt 不显著"结论一致。
+3. **评估器切换影响**：本地 Qwen 自评的 `mean_evaluator_score≈1.2–1.3`、正分率≈0.95，显著高于此前 Gemini 的 0.1（自评乐观偏差），报告结论需在"同源自评"限定下解读。

@@ -18,6 +18,8 @@ from transformers import AutoTokenizer
 
 from jitpi05.config import (
     BIAS_VALUE,
+    JITRL_BENCHMARK_PANEL,
+    JITRL_LOW_LEVEL_BACKEND,
     PI05_TOKENIZER_ID,
     QWEN_ID,
     SEED,
@@ -134,6 +136,8 @@ def collect_plans() -> dict:
 
 
 def load_policy():
+    if JITRL_LOW_LEVEL_BACKEND == "rlinf":
+        return _load_rlinf_policy()
     print(f"Loading low-level policy: {SIM_PI05_ID}")
     config = PreTrainedConfig.from_pretrained(SIM_PI05_ID)
     config.device = "cuda"
@@ -152,6 +156,21 @@ def load_policy():
         },
     )
     return policy, preprocessor, postprocessor
+
+
+def _load_rlinf_policy():
+    """加载 RLinf π0.5 远程低层策略（独立 openpi 子进程）。"""
+    from jitpi05.rlinf_client import (
+        IdentityProcessor,
+        RlinfPi05Client,
+        RlinfPi05PolicyAdapter,
+    )
+
+    print("Loading low-level policy: RLinf-Pi05-LIBERO-130-fullshot-SFT (remote)")
+    client = RlinfPi05Client()
+    policy = RlinfPi05PolicyAdapter(client)
+    identity = IdentityProcessor()
+    return policy, identity, identity
 
 
 def reset_rollout_state(policy, preprocessor, postprocessor, seed: int) -> None:
