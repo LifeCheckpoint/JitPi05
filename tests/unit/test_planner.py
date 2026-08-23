@@ -111,6 +111,37 @@ def test_fixed_semantic_workspace_is_complete_and_rendered() -> None:
     assert "9. stop()" in action_schema_text()
 
 
+def test_rlinf_low_level_condition_uses_selected_semantic_subtask_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jitpi05.jitrl.rollout as rollout
+
+    monkeypatch.setattr(rollout, "JITRL_LOW_LEVEL_BACKEND", "rlinf")
+    monkeypatch.setattr(rollout, "RLINF_USE_RAW_TASK_PROMPT", False)
+
+    condition = rollout._low_level_condition(
+        "put the mug in the basket", "grasp the mug"
+    )
+
+    assert condition == (
+        "Overall task: put the mug in the basket. Current subtask: grasp the mug."
+    )
+
+
+def test_rlinf_raw_task_prompt_is_explicit_compatibility_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jitpi05.jitrl.rollout as rollout
+
+    monkeypatch.setattr(rollout, "JITRL_LOW_LEVEL_BACKEND", "rlinf")
+    monkeypatch.setattr(rollout, "RLINF_USE_RAW_TASK_PROMPT", True)
+
+    assert (
+        rollout._low_level_condition("put the mug in the basket", "grasp the mug")
+        == "put the mug in the basket"
+    )
+
+
 def test_workspace_rejects_dynamic_or_missing_action_types() -> None:
     invalid = workspace_bindings()[:-1]
     invalid.append({"type": "push", "enabled": True, "target": "the mug"})

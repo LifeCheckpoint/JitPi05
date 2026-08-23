@@ -67,36 +67,123 @@
 - **episode 顺序相关**：同一 JitRL run 内在线记忆使 episode 不独立，不能当独立重复样本。
 - 本面板测的是"固定词表约束"这一简化骨架（无 HarnessVLA 的 Task Specific Memory / Global Memory / 解析原语层，无 JitRL 论文的增广候选集），结论应表述为：在本面板、单一冻结 π₀.₅ 低层、环境终止 + 固定动作词表/自由候选条件下成立。
 
-## 6. LIBERO-Pro object 扰动对照（新增）
+## 6. LIBERO-Pro object 扰动对照（修复后结果）
 
-> Benchmark：LIBERO-Pro `libero_10_object`（object 扰动：物体外观/尺度改变）10 任务 × 4 方法 × 10 episodes × 1 seed，共 400 rollouts/后端。
-> 数据来源：`artifacts/jitrl_libero_pro_object/`（RLinf 后端）与 `artifacts/jitrl_libero_pro_object_lerobot/`（LeRobot 后端）。
-> 说明：本阶段 credit assignment 已由 Gemini 3.6 Flash 切换为本地 Qwen3.5-2B 自评（复用高层规划器模型），存在自评乐观偏差。
+> Benchmark：LIBERO-Pro `libero_10_object`（物体外观/尺度扰动），10 任务 × 4 方法 × 10 episodes × 1 seed，共 400 rollouts。
+> 修复后数据由两个目录合并得到：Task 0–6 来自 [`artifacts/jitrl_libero_pro_object_rlinf_state_fix`](../../artifacts/jitrl_libero_pro_object_rlinf_state_fix)，Task 7–9 来自 [`artifacts/jitrl_libero_pro_object_rlinf_subtask_seed17_tasks7_9`](../../artifacts/jitrl_libero_pro_object_rlinf_subtask_seed17_tasks7_9)。两部分的配置完全一致。
+> 旧版 raw-task 结果只作为故障定位历史，不与修复后结果合并。当前 RLinf 实验默认将 `Overall task + Current subtask` 传给低层；`JITPI05_RLINF_USE_RAW_TASK_PROMPT=true` 仅保留为官方 raw-task 兼容诊断模式。
 
-### 6.1 结果对照（四方法宏平均成功率）
+### 6.1 与旧结果和 LeRobot 结果的关系
 
-| 低层后端 | jitrl-free | static-free | jitrl | static |
-|---|---|---|---|---|
-| **RLinf-Pi05-LIBERO-130-fullshot-SFT** | 0.000 | 0.000 | 0.000 | 0.000 |
-| **lerobot/pi05-libero（上一代）** | 0.690 | 0.730 | 0.670 | 0.650 |
+| 低层后端/协议 | jitrl-free | static-free | jitrl | static | 解释 |
+|---|---:|---:|---:|---:|---|
+| RLinf，旧 raw-task | 0% | 0% | 0% | 0% | 高层选择未进入低层，消融失效 |
+| RLinf，修复后 subtask | **40%** | **42%** | **43%** | **45%** | 有效 400-rollout 面板 |
+| LeRobot，上一代结果 | 69% | 73% | 67% | 65% | 不同 checkpoint/adapter/protocol，仅作参考 |
 
-### 6.2 每任务明细（LeRobot 后端成功率）
+因此，旧 RLinf 的 0% 不能解释为 RLinf 模型在 object 扰动上完全失效：subtask 修复后成功率升至 40–45%。但它仍显著低于 LeRobot 的 65–73%，剩余差距需要由 RLinf checkpoint、输入/动作协议和 object OOD 泛化共同解释。
 
-| 任务 | jitrl-free | static-free | jitrl | static |
-|---|---|---|---|---|
-| task0 | 0.00 | 0.00 | 0.00 | 0.00 |
-| task1 | 1.00 | 1.00 | 1.00 | 0.90 |
-| task2 | 1.00 | 1.00 | 1.00 | 1.00 |
-| task3 | 1.00 | 0.90 | 0.80 | 0.80 |
-| task4 | 1.00 | 1.00 | 1.00 | 1.00 |
-| task5 | 0.80 | 1.00 | 1.00 | 1.00 |
-| task6 | 0.90 | 0.90 | 0.80 | 0.70 |
-| task7 | 0.00 | 0.10 | 0.00 | 0.00 |
-| task8 | 1.00 | 1.00 | 1.00 | 1.00 |
-| task9 | 0.20 | 0.40 | 0.10 | 0.10 |
+### 6.2 修复后完整面板总体结果
 
-### 6.3 结论
+| 配置 | method | 成功率 | 全 episode 平均步数 | 成功 episode 平均步数 | 800 步上限比例 |
+|---|---|---:|---:|---:|---:|
+| 自由候选 + JitRL | `jitrl-free` | 40/100 = **40%** | 585.7 | 307.6 | 60% |
+| 自由候选 + Static | `static-free` | 42/100 = **42%** | 572.6 | 284.4 | 58% |
+| 固定工作集 + JitRL | `jitrl` | 43/100 = **43%** | 580.4 | 305.9 | 57% |
+| 固定工作集 + Static | `static` | 45/100 = **45%** | 564.8 | 293.7 | 55% |
 
-1. **RLinf 后端全灭、LeRobot 后端正常（65–73%）**：同一 LIBERO-Pro object 扰动环境下，上一代 `lerobot/pi05-libero` 大部分任务 80–100% 成功，而 RLinf fullshot-SFT 400 rollouts 无一成功，与观察到的"机械臂拿一下就胡乱扭动"一致。这**排除 LIBERO-Pro 集成问题**（环境、bddl、扰动物体注册均正确），问题定位于 RLinf 后端——待用 RLinf 在非扰动 `libero_10` 的单 episode 决定性测试区分"adapter bug"与"RLinf 模型对 object 扰动的 OOD 泛化崩溃"。
-2. **JitRL 记忆调制在两个后端下均无可观测正向增益**：LeRobot 后端下 `jitrl vs static` = +2pt、`jitrl-free vs static-free` = −4pt；配对成功步数差 task1 为 −20.3（JitRL 反而多用步）、其余接近 0。与第 4 节 LIBERO-10 面板的"±1pt 不显著"结论一致。
-3. **评估器切换影响**：本地 Qwen 自评的 `mean_evaluator_score≈1.2–1.3`、正分率≈0.95，显著高于此前 Gemini 的 0.1（自评乐观偏差），报告结论需在"同源自评"限定下解读。
+逐任务成功数为：
+
+| 任务 | `jitrl-free` | `static-free` | `jitrl` | `static` |
+|---|---:|---:|---:|---:|
+| task0 | 0/10 | 0/10 | 0/10 | 0/10 |
+| task1 | 9/10 | 9/10 | 10/10 | 10/10 |
+| task2 | 7/10 | 6/10 | 9/10 | 9/10 |
+| task3 | 3/10 | 3/10 | 5/10 | 4/10 |
+| task4 | 4/10 | 4/10 | 1/10 | 2/10 |
+| task5 | 6/10 | 9/10 | 5/10 | 7/10 |
+| task6 | 10/10 | 9/10 | 10/10 | 10/10 |
+| task7 | 0/10 | 0/10 | 1/10 | 1/10 |
+| task8 | 1/10 | 2/10 | 2/10 | 2/10 |
+| task9 | 0/10 | 0/10 | 0/10 | 0/10 |
+
+### 6.3 修复有效性与机制指标
+
+修复后的所有 400 rollouts 共包含 11,599 个高层 chunks；每个 method 的每个 chunk 都满足：
+
+```text
+Overall task: <overall task>.
+Current subtask: <selected semantic action>.
+```
+
+`condition` 与 selected action 精确匹配率为 100%。每个任务的四方法 `actions.pt` 和 `action_chunks.pt` hash 均为 4/4 不同，说明高层更新已经真实传递到 RLinf 低层并导致轨迹分叉。
+
+完整面板的平均机制指标：
+
+| method | choice change | mean logit shift | mean update KL | nonzero advantage | mean neighbors |
+|---|---:|---:|---:|---:|---:|
+| `jitrl-free` | 9.34% | 0.1913 | 0.0157 | 90.00% | 9.03 |
+| `jitrl` | 9.36% | 0.1922 | 0.0135 | 89.99% | 9.02 |
+| Static 两种 | 0% | 0 | 0 | 0% | 0 |
+
+这排除了“JitRL 没有更新”的解释：memory、advantage、logit update 都在执行，问题是更新方向没有转化为稳定的任务级收益。
+
+### 6.4 JitRL 独立效应
+
+| 比较 | 成功率差 | 全 episode 平均步数差 | 配对成功胜负 | 精确双侧 p |
+|---|---:|---:|---:|---:|
+| `jitrl - static` | −2pt | +15.6 步 | 5 胜 / 7 负 | 0.774 |
+| `jitrl-free - static-free` | −2pt | +13.1 步 | 4 胜 / 6 负 | 0.754 |
+
+步数差的 paired bootstrap 95% 区间分别为 `[-19.2, 51.95]` 和 `[-16.79, 43.72]`，均跨 0。正确结论是“未观察到可测增益”，而不是“JitRL 已被证明有害”。
+
+按 episode index 聚合 10 个任务：
+
+```text
+jitrl:       [4, 5, 3, 4, 6, 5, 4, 5, 3, 4]  first5=22  last5=21
+static:      [4, 3, 4, 4, 7, 5, 4, 5, 4, 5]  first5=22  last5=23
+jitrl-free:  [4, 5, 4, 4, 5, 4, 3, 3, 5, 3]  first5=22  last5=18
+static-free: [4, 6, 3, 4, 4, 3, 4, 5, 6, 3]  first5=21  last5=21
+```
+
+没有观察到 memory 增长带来的后半程学习曲线。
+
+### 6.5 为什么 JitRL 作用不显著
+
+#### （1）低层策略与 object OOD 是共同瓶颈（强证据）
+
+Task 0 四方法均 0/10，Task 9 四方法均 0/10，Task 7 free 两种方法均 0/10，Task 8 仅 1–2/10。此时大部分失败来自低层视觉/接触控制，JitRL 只改变约 9%–10% 的高层选择，无法挽救共同失败。
+
+报告中的 LIBERO-10 高成功率使用 LeRobot checkpoint；当前使用 RLinf fullshot-SFT checkpoint。两者不是同一个模型的简单实现替换，训练数据、prompt、state/action normalization、相机处理和 action horizon 都可能不同。
+
+#### （2）固定工作集的候选/对象绑定质量不足（强证据）
+
+trace 中出现过 `Current subtask: align the gripper with empty` 以及在 book/caddy 任务中绑定 `mug` 的情况。JitRL 只能重排当前候选，不能把错误对象替换成正确对象；因此错误 binding 会直接限制 JitRL 上限。
+
+以高层动作是否提及任务实体作为粗粒度代理，fixed workspace 的目标实体提及率约 42%–44%，free candidates 约 98%；这不是严格准确率，但足以显示 fixed binding 是当前主要风险。
+
+#### （3）Positive-only、同源 evaluator 可能污染 memory（强推断）
+
+当前 reward 版本允许失败 episode 获得局部正分；Task 9 四方法最终成功率均为 0%，但 JitRL evaluator 均分仍约 1.15，Task 7 free JitRL 失败率 100% 时均分仍约 0.91。planner/evaluator 又共享 Qwen3.5-2B，存在同源自评乐观偏差。
+
+可能的错误链为：
+
+```text
+局部视觉变化 → 正向 evaluator score → 正 return → 错误经验写入 memory → JitRL 强化错误动作
+```
+
+#### （4）更新幅度保守，且更新方向不可靠（中等证据）
+
+`mean update KL` 仅约 0.013–0.016，choice change 约 9%–10%。这说明 JitRL 的更新确实存在但较保守；在低层困难和 binding 错误状态下，可能不足以切换关键错误动作。直接增大 `beta` 又可能放大错误 evaluator credit，因此不能把调大 beta 当作首要修复。
+
+#### （5）状态表示和动作语义对机器人几何状态不充分（中等推断）
+
+当前使用文本 state summary + Jaccard 检索；视觉遮挡、夹爪接触、相对位姿和物体是否已放稳等关键变量不一定能被短文本稳定表示。平均 neighbor 数约 9 只说明检索数量足够，不说明邻居的几何语义正确。
+
+#### （6）面板处于 ceiling/floor 两种不利 regime（强实验设计判断）
+
+普通 LIBERO-10 LeRobot 成功率 92%–97%，接近 ceiling，JitRL 可改善的空间很小；RLinf object 成功率 40%–45%，接近低层噪声/能力 floor，JitRL 的高层效应又被共同失败淹没。两种设置都不适合清晰测量小幅 test-time policy improvement。
+
+#### （7）单 seed、每 task 10 episode 的统计功效不足（确定限制）
+
+当前只有 seed 17，且同一 JitRL run 内 episode 顺序相关。−2pt 的点差配对检验 p≈0.75–0.77，不能支持显著负效应，也不能排除小幅正效应。

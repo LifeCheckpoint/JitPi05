@@ -124,7 +124,13 @@ FREE_METHODS = (
 
 
 def _low_level_condition(overall_task: str, subtask: str) -> str:
-    """选择低层 VLA prompt；RLinf 诊断必须遵循官方 raw-task 协议。"""
+    """Build the low-level VLA condition from the selected semantic subtask.
+
+    The default path deliberately keeps the high-level-to-low-level interface
+    intact for both LeRobot and RLinf: a changed JitRL selection must change
+    the prompt received by the low-level policy.  Raw-task prompting remains
+    available only as an explicit RLinf compatibility diagnostic.
+    """
     if RLINF_USE_RAW_TASK_PROMPT and JITRL_LOW_LEVEL_BACKEND == "rlinf":
         return overall_task
     return conditioned_task(overall_task, subtask)

@@ -189,10 +189,14 @@ RLINF_ACTION_STEPS = 5
 POLICY_ACTION_STEPS = (
     RLINF_ACTION_STEPS if JITRL_LOW_LEVEL_BACKEND == "rlinf" else SIM_ACTION_STEPS
 )
-# RLinf/OpenPI 官方 LIBERO evaluator 直接把环境 task description 作为 prompt。
-# 默认关闭 HarnessVLA 中间子任务 prompt，避免把 `align/grasp/lift/...` 等未必
-# 出现在 RLinf SFT 训练分布中的字符串传给低层模型。LeRobot 保持原有条件化。
-RLINF_USE_RAW_TASK_PROMPT = True
+# RLinf 的正式 JitRL 消融必须让高层选出的 semantic subtask 进入低层语言条件，
+# 否则 memory advantage 的策略变化无法传导到环境动作。默认使用与 LeRobot 相同的
+# ``Overall task + Current subtask`` 条件化格式。若只想复现 OpenPI 官方的 raw-task
+# evaluator 协议，可显式设 ``JITPI05_RLINF_USE_RAW_TASK_PROMPT=true``；该兼容诊断
+# 模式不应用于 JitRL 与 Static 的高低层消融比较。
+RLINF_USE_RAW_TASK_PROMPT = os.environ.get(
+    "JITPI05_RLINF_USE_RAW_TASK_PROMPT", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # 完整 LIBERO-10 长任务 suite 的任务描述（published pi0.5-LIBERO benchmark）。
 _LIBERO10_TASK_DESCRIPTIONS = (

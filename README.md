@@ -140,7 +140,7 @@ JITPI05_JITRL_PANEL=libero10 uv run jitpi05-eval-jitrl \
 
 - 服务端 [`scripts/rlinf_pi05_server.py`](scripts/rlinf_pi05_server.py) 在 `third_party/openpi/.venv`（Python 3.11 + torch 2.7.1 + transformers 4.53.2 + patch）中加载 checkpoint，通过 stdin/stdout JSON 行协议提供推理。
 - 客户端 [`src/jitpi05/rlinf_client.py`](src/jitpi05/rlinf_client.py) 在当前项目（Python 3.12）中管理子进程生命周期，向 rollout 暴露与本地 `PI05Policy` 等价的 `predict_action_chunk`/`reset`/`config` 接口。
-- 输入对齐在服务端完成：双相机 180° 旋转；客户端从 LeRobot 嵌套 `robot_state` 构造 8 维 state（eef_pos + axisangle + gripper_qpos）。
+- 输入对齐在服务端完成：双相机 180° 旋转；客户端从 LeRobot 嵌套 `robot_state` 构造 8 维 state（eef_pos + axisangle + gripper_qpos）。默认低层 prompt 为 `Overall task: … Current subtask: …`，所以 Qwen/JitRL 选出的 semantic subtask 会实际传给 RLinf π₀.₅；仅在显式设置 `JITPI05_RLINF_USE_RAW_TASK_PROMPT=true` 时退回 OpenPI 官方 raw-task 兼容诊断模式，该模式不适合 JitRL 对照实验。
 - flow-matching 噪声通过 `policy.infer(obs, noise=...)` 显式注入；服务端把 7 维环境噪声 pad 到 32 维模型内部维度，保证四方法共享同一噪声的实验边界。
 
 LIBERO-Pro（arXiv:2510.03827）通过整体替换 libero 包集成：`third_party/libero-pro/libero` 软链接到 `.venv` 的 libero 包（原包备份为 `libero_orig_backup`），并把 [`zhouxueyang/LIBERO-Pro`](https://huggingface.co/datasets/zhouxueyang/LIBERO-Pro) 的扰动 bddl/init 软链接进 libero 包的 `bddl_files/`、`init_files/`。`~/.libero/config.yaml` 指向新包路径。扰动 suite 由 LIBERO-Pro 的替换版 benchmark 注册（`libero_10_object/swap/lan/task` 等）；[`src/jitpi05/libero_pro.py`](src/jitpi05/libero_pro.py) 保留幂等的动态注册作为兜底。object 扰动引入的 `bigger_alphabet_soup`、`red_coffee_mug` 等新物体随 LIBERO-Pro 的 `envs/objects/` 与 `assets/` 一并提供。
