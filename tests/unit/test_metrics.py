@@ -101,6 +101,10 @@ def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
                 "cycle_proxy_stop_finish_count": 1,
                 "cycle_wall_time_seconds": 0.5,
                 "cycle_rewind_steps": 20,
+                "strict_budget_success": True,
+                "dynamic_budget_success": True,
+                "cycle_extra_budget_granted_steps": 400,
+                "cycle_extra_budget_used_steps": 40,
                 "recovery_events": [
                     {
                         "event": "backtrack",
@@ -124,6 +128,10 @@ def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
                 "cycle_vetoes": 1,
                 "cycle_retries": 0,
                 "cycle_wall_time_seconds": 0.25,
+                "strict_budget_success": False,
+                "dynamic_budget_success": True,
+                "cycle_extra_budget_granted_steps": 800,
+                "cycle_extra_budget_used_steps": 600,
                 "mbr_hypothesis_count": 0,
                 "mbr_events": [],
                 "chunks": [],
@@ -155,3 +163,37 @@ def test_cycle_metrics_report_backtrack_and_mbr_audits() -> None:
     assert metrics["mean_mbr_selected_risk"] == 1.25
     assert metrics["mean_mbr_pairwise_distance"] == 2.5
     assert metrics["mean_cycle_wall_time_seconds"] == 0.375
+    # `success_rate` is the final Cycle outcome. The two budget-scoped metrics
+    # make the fair 800-step result and recovery-only result explicit.
+    assert metrics["strict_budget_success_rate"] == 0.5
+    assert metrics["dynamic_budget_success_rate"] == 1.0
+    assert metrics["mean_cycle_extra_budget_granted_steps"] == 600.0
+    assert metrics["mean_cycle_extra_budget_used_steps"] == 320.0
+
+
+def test_non_cycle_metrics_keep_strict_budget_comparable_and_dynamic_undefined() -> None:
+    metrics = compute_run_metrics(
+        [
+            {
+                "success": True,
+                "termination_mode": "environment_only_no_stop_v1",
+                "termination_reason": "environment_success",
+                "steps": 120,
+                "chunks": [],
+            },
+            {
+                "success": False,
+                "termination_mode": "environment_only_no_stop_v1",
+                "termination_reason": "max_steps",
+                "steps": 800,
+                "chunks": [],
+            },
+        ],
+        [],
+        task_spec={"name": "non-cycle-task"},
+        method="static-free",
+        seed=17,
+    )
+
+    assert metrics["strict_budget_success_rate"] == 0.5
+    assert metrics["dynamic_budget_success_rate"] is None

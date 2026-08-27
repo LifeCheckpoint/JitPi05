@@ -2,10 +2,13 @@ import pytest
 
 from jitpi05.config import (
     CYCLE_BUDGET_MODE,
+    CYCLE_BACKTRACK_EXTRA_BUDGET,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
     CYCLE_MAX_RETRIES,
+    CYCLE_MAX_DYNAMIC_STEPS,
+    CYCLE_MAX_EXTRA_BUDGET,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_PROGRESS_THRESHOLD,
     CYCLE_RETRY_BUDGET_PER_BACKTRACK,
@@ -46,6 +49,9 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
         == CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
     )
     assert CYCLE_RETRY_TOTAL_BUDGET > 0
+    assert CYCLE_BACKTRACK_EXTRA_BUDGET > 0
+    assert CYCLE_MAX_EXTRA_BUDGET >= CYCLE_BACKTRACK_EXTRA_BUDGET
+    assert CYCLE_MAX_DYNAMIC_STEPS == 800 + CYCLE_MAX_EXTRA_BUDGET
 
 
 def test_official_budget_helper_keeps_both_rollout_paths_equal() -> None:

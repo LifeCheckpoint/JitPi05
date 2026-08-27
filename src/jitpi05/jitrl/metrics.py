@@ -61,6 +61,10 @@ SCALAR_METRICS = (
     "cycle_rewind_step_rate",
     "max_cycle_rewind_waypoint_qpos_delta",
     "mean_cycle_wall_time_seconds",
+    "strict_budget_success_rate",
+    "dynamic_budget_success_rate",
+    "mean_cycle_extra_budget_granted_steps",
+    "mean_cycle_extra_budget_used_steps",
 )
 # Success rate remains an auxiliary health metric. The primary JitRL effect is
 # positive when successful episodes use fewer steps than the Static baseline.
@@ -68,6 +72,9 @@ PRIMARY_EFFECT_METRIC = "success_step_reduction"
 PAIRED_METRICS = (
     PRIMARY_EFFECT_METRIC,
     "success_rate",
+    # All methods have this field under the common 800-step protocol. It is
+    # the fair success comparison once Cycle recovery may use extra steps.
+    "strict_budget_success_rate",
     "final_10_success_rate",
 )
 # Free-candidate methods do not use the fixed nine-action workspace.
@@ -97,6 +104,9 @@ _PAIRED_SPECS = (
 WARNINGS = (
     "Success rate is retained as an auxiliary health metric; the primary "
     "JitRL effect metric is successful-episode step reduction versus Static.",
+    "Cycle runs separately report strict_budget_success_rate under the common "
+    "800-step cap and dynamic_budget_success_rate after recovery-only extra "
+    "steps. Only the strict metric is used for cross-method paired success comparisons.",
     "Per task/method, the default design has only 1 seed-level run; sample "
     "standard deviation is 0 and the seed-level bootstrap interval collapses "
     "to the observed value, so neither supports across-seed inference.",
@@ -209,6 +219,25 @@ def compute_run_metrics(
     ]
     cycle_wall_times = [
         float(episode.get("cycle_wall_time_seconds", 0.0))
+        for episode in cycle_episodes
+    ]
+    # Strict success is the common, fair comparison outcome. Non-Cycle
+    # rollouts run exclusively under the unified 800-step cap, so their normal
+    # success field is exactly their strict-budget result.
+    strict_budget_successes = sum(
+        bool(episode.get("strict_budget_success", episode.get("success", False)))
+        for episode in episodes
+    )
+    dynamic_budget_successes = sum(
+        bool(episode.get("dynamic_budget_success", episode.get("success", False)))
+        for episode in cycle_episodes
+    )
+    cycle_extra_budget_granted = [
+        int(episode.get("cycle_extra_budget_granted_steps", 0))
+        for episode in cycle_episodes
+    ]
+    cycle_extra_budget_used = [
+        int(episode.get("cycle_extra_budget_used_steps", 0))
         for episode in cycle_episodes
     ]
     backtracked_episodes = [
@@ -374,6 +403,20 @@ def compute_run_metrics(
         ),
         "mean_cycle_wall_time_seconds": (
             float(np.mean(cycle_wall_times)) if cycle_wall_times else None
+        ),
+        "strict_budget_success_rate": _rate(strict_budget_successes, episode_count),
+        # This is intentionally undefined for non-Cycle methods rather than
+        # reported as 0%; only Cycle can receive recovery-only extra steps.
+        "dynamic_budget_success_rate": (
+            _rate(dynamic_budget_successes, len(cycle_episodes))
+            if cycle_episodes
+            else None
+        ),
+        "mean_cycle_extra_budget_granted_steps": (
+            float(np.mean(cycle_extra_budget_granted)) if cycle_episodes else None
+        ),
+        "mean_cycle_extra_budget_used_steps": (
+            float(np.mean(cycle_extra_budget_used)) if cycle_episodes else None
         ),
         # These are within-run rescue/harm proxies, not counterfactual causal
         # claims: a true rescue/harm comparison requires the paired baseline run.

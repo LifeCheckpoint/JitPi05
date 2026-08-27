@@ -94,7 +94,7 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 
 - `libero10`：完整 LIBERO-10 长任务 suite 全 10 任务（published pi0.5-LIBERO benchmark，max_steps 520），对应 HarnessVLA × JitRL 消融报告的四格配置。
 - `libero90`：LIBERO-90 预注册候选池（难度筛选 + CycleVLA 正式比较，max_steps 400）。
-- `libero_pro`：LIBERO-Pro 扰动面板（object / position(swap) / semantic(lan) / task 四维扰动，基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。低层策略切换为 RLinf-Pi05-LIBERO-130-fullshot-SFT（见下方「RLinf π0.5 低层策略」）。
+- `libero_pro`：LIBERO-Pro 扰动面板（object / position(swap) / semantic(lan) / task 四维扰动，基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。低层策略切换为 RLinf-Pi05-LIBERO-130-fullshot-SFT（见下方「RLinf π0.5 低层策略」）。Cycle 方法额外记录严格 `success@800` 与动态恢复预算下的最终成功，避免把 Cycle 额外步数误当作公平主比较结果。
 
 默认规模为 `tasks × methods × 10 episodes × 1 seed`；四方法完整面板（`jitrl-free`、`static-free`、`jitrl`、`static`）为 `10 tasks × 4 methods × 10 episodes = 400 rollouts`。结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
 

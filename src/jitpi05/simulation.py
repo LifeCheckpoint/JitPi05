@@ -69,6 +69,43 @@ def make_single_env(
     return envs, env, env_preprocessor, env_postprocessor
 
 
+def disable_robosuite_horizon_done(vector_env: Any) -> None:
+    """让底层 robosuite 环境永不自行按固定 ``horizon`` 终止。
+
+    LIBERO 包装层（LiberoEnv）在下层 robosuite ``bddl_base_domain.step`` 里会用
+    ``_check_success()`` 覆盖 robosuite 返回的 ``done``，因此上层永远看不到
+    robosuite 基于 ``horizon`` 的终止信号，也不会触发 ``reset()``。此时 robosuite
+    内部的 ``self.done`` 残留在 ``True``，下一次 ``env.step`` 就会抛
+    ``ValueError("executing action in terminated episode")`` —— 只要外层
+    ``episode_length``（动态预算可能到 1600）超过 robosuite 硬编码的
+    ``horizon``（1000）就会复现。
+
+    解法：把 ``ignore_done`` 置为 ``True``，让 robosuite 不再自行按 horizon
+    终止；终止完全交给上层 ``max_steps`` 步数预算，任务成功仍由
+    ``_check_success()`` 独立提供（LiberoEnv.step 中 ``terminated = done or
+    is_success``，其中 ``done`` 已被覆盖为 ``_check_success()``）。
+
+    该属性在 robosuite 环境对象生命周期内保持不变（``reset()`` 不会重设
+    ``ignore_done``），因此对同一 episode 只需在首次 ``reset`` 后设置一次。
+    """
+
+    try:
+        children = getattr(vector_env, "envs", None)
+        if not children:
+            return
+        libero_env = children[0]
+        control = getattr(libero_env, "_env", None)
+        if control is None or not hasattr(control, "env"):
+            return
+        robosuite_env = getattr(control, "env", None)
+        if robosuite_env is None or not hasattr(robosuite_env, "ignore_done"):
+            return
+        robosuite_env.ignore_done = True
+    except Exception:
+        # 环境内省失败不应阻断 rollout；保持 best-effort。
+        return
+
+
 def policy_frame(observation: dict, task: str, env_preprocessor) -> dict:
     """沿用官方 eval 顺序：numpy observation -> LeRobot 格式 -> LIBERO processor。"""
     frame = preprocess_observation(observation)

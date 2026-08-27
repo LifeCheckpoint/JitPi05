@@ -20,10 +20,14 @@ from tqdm.auto import tqdm
 from jitpi05.config import (
     ALL_METHODS,
     CYCLE_BUDGET_MODE,
+    CYCLE_BACKTRACK_EXTRA_BUDGET,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
+    CYCLE_DYNAMIC_BUDGET_ENABLED,
     CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
     CYCLE_MAX_RETRIES,
+    CYCLE_MAX_DYNAMIC_STEPS,
+    CYCLE_MAX_EXTRA_BUDGET,
     CYCLE_MBR_ACTION_STEPS,
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
@@ -106,6 +110,7 @@ from jitpi05.jitrl.vlm import (
 )
 from jitpi05.policy import conditioned_task
 from jitpi05.simulation import (
+    disable_robosuite_horizon_done,
     load_policy,
     make_single_env,
     planning_images,
@@ -498,11 +503,16 @@ def _run_episode_cycle(
     """
 
     cycle_wall_start = time.perf_counter()
-    budget_max_steps = evaluation_budget_max_steps(task_spec)
+    base_budget_max_steps = evaluation_budget_max_steps(task_spec)
+    environment_max_steps = (
+        min(CYCLE_MAX_DYNAMIC_STEPS, base_budget_max_steps + CYCLE_MAX_EXTRA_BUDGET)
+        if CYCLE_DYNAMIC_BUDGET_ENABLED
+        else base_budget_max_steps
+    )
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
         task_spec,
         episode_index,
-        budget_max_steps=budget_max_steps,
+        budget_max_steps=environment_max_steps,
     )
     episode_seed = int(seed) + episode_index
     video_path = run_dir / "videos" / f"episode_{episode_index}.mp4"
@@ -559,6 +569,10 @@ def _run_episode_cycle(
     cycle_proxy_stop_finish_count = 0
     mbr_events: list[dict] = []
     cycle_rewind_steps = 0
+    cycle_extra_budget_granted_steps = 0
+    cycle_extra_budget_used_steps = 0
+    strict_success_step: int | None = None
+    success_step: int | None = None
     low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
     gate = CycleGate(threshold=CYCLE_PROXY_PROGRESS_THRESHOLD)
     last_held_relative: tuple[float, float, float] | None = None
@@ -601,6 +615,15 @@ def _run_episode_cycle(
     def _budget_steps() -> int:
         return len(actions) + cycle_rewind_steps
 
+    def _effective_budget() -> int:
+        return min(
+            CYCLE_MAX_DYNAMIC_STEPS,
+            base_budget_max_steps + cycle_extra_budget_granted_steps,
+        )
+
+    def _dynamic_extra_used_steps() -> int:
+        return max(0, _budget_steps() - base_budget_max_steps)
+
     def _execute_action_chunk(
         policy_output,
         *,
@@ -609,6 +632,8 @@ def _run_episode_cycle(
     ) -> dict:
         nonlocal observation, episode_done, success, termination_reason, last_info, phase
         nonlocal cycle_signal_mode
+        nonlocal cycle_extra_budget_used_steps
+        nonlocal strict_success_step, success_step
         chunk_index = len(action_chunks)
         action_start_step = len(actions)
         adapted = (
@@ -636,6 +661,7 @@ def _run_episode_cycle(
             rewards.append(float(reward[0]))
             robot_history.append(capture_robot_configuration(env))
             frames.append(env.render()[0])
+            cycle_extra_budget_used_steps = _dynamic_extra_used_steps()
             last_info = info if isinstance(info, dict) else {}
             if adapted.has_policy_signals:
                 progress_confirmed = (
@@ -651,6 +677,10 @@ def _run_episode_cycle(
             episode_done = bool(terminated[0] or truncated[0])
             success = success or success_from_info(last_info)
             if success:
+                if success_step is None:
+                    success_step = _budget_steps()
+                    if success_step <= base_budget_max_steps:
+                        strict_success_step = success_step
                 termination_reason = "environment_success"
             elif episode_done:
                 termination_reason = "environment_done"
@@ -900,11 +930,18 @@ def _run_episode_cycle(
     try:
         reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
         observation, _ = env.reset(seed=[episode_seed])
+        # 动态预算允许 episode_length 超过 robosuite 硬编码 horizon（1000），而
+        # LIBERO 包装层用 _check_success() 覆盖了 robosuite 的 done，导致上层看不到
+        # robosuite 的 horizon 终止且不触发 reset。这里关闭 robosuite 自有的 horizon
+        # done，终止完全交给上层动态预算，成功仍由 _check_success() 独立提供。
+        disable_robosuite_horizon_done(env)
         robot_history.append(capture_robot_configuration(env))
         overall_task = list(env.call("task_description"))[0]
         cycle_program = build_cycle_subtask_program(overall_task)
         cycle_program_text = format_cycle_subtask_program(cycle_program)
-        max_steps = int(env.call("_max_episode_steps")[0])
+        # The environment is created with the maximum possible dynamic budget,
+        # while the mutable ``max_steps`` starts at the strict comparison budget.
+        max_steps = base_budget_max_steps
         frames.append(env.render()[0])
 
         while _budget_steps() < max_steps and not success and not episode_done:
@@ -1237,14 +1274,27 @@ def _run_episode_cycle(
                     )
                     _finalize_evaluator_images()
                     target_history_index = anchor_history_indices[target_anchor.anchor_id]
+                    if CYCLE_DYNAMIC_BUDGET_ENABLED:
+                        remaining_extra = max(
+                            0,
+                            CYCLE_MAX_EXTRA_BUDGET
+                            - cycle_extra_budget_granted_steps,
+                        )
+                        granted = min(
+                            CYCLE_BACKTRACK_EXTRA_BUDGET,
+                            remaining_extra,
+                        )
+                        cycle_extra_budget_granted_steps += granted
+                        max_steps = _effective_budget()
                     rewind_budget = max(0, max_steps - _budget_steps())
 
                     def _record_rewind_waypoint(
                         _history_index: int,
                         _restore_report,
                     ) -> None:
-                        nonlocal cycle_rewind_steps
+                        nonlocal cycle_rewind_steps, cycle_extra_budget_used_steps
                         cycle_rewind_steps += 1
+                        cycle_extra_budget_used_steps = _dynamic_extra_used_steps()
                         frames.append(env.render()[0])
                         if step_progress is not None:
                             step_progress.update(1)
@@ -1471,6 +1521,17 @@ def _run_episode_cycle(
         "steps": _budget_steps(),
         "policy_action_steps": len(actions),
         "cycle_rewind_steps": cycle_rewind_steps,
+        "strict_budget_max_steps": int(base_budget_max_steps),
+        "strict_budget_success": bool(
+            success and success_step is not None and success_step <= base_budget_max_steps
+        ),
+        "strict_budget_success_step": strict_success_step,
+        "dynamic_budget_enabled": bool(CYCLE_DYNAMIC_BUDGET_ENABLED),
+        "dynamic_budget_max_steps": int(_effective_budget()),
+        "dynamic_budget_success": bool(success),
+        "dynamic_budget_success_step": success_step,
+        "cycle_extra_budget_granted_steps": int(cycle_extra_budget_granted_steps),
+        "cycle_extra_budget_used_steps": int(cycle_extra_budget_used_steps),
         "sum_reward": float(sum(rewards)),
         "max_reward": float(max(rewards, default=0.0)),
         "chunk_count": len(chunks),
@@ -1483,7 +1544,7 @@ def _run_episode_cycle(
         "cycle_trigger_mode": cycle_trigger_mode,
         "cycle_program": list(cycle_program_text),
         "cycle_budget_mode": CYCLE_BUDGET_MODE,
-        "cycle_budget_max_steps": int(budget_max_steps),
+        "cycle_budget_max_steps": int(_effective_budget()),
         "cycle_retry_counts": dict(retry_counts),
         "cycle_rewind_mode": "reverse_robot_state_replay",
         "cycle_config_version": CYCLE_CONFIG_VERSION,
