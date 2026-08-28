@@ -706,3 +706,96 @@ def test_free_proposal_generation_prefills_json_and_parses_candidates() -> None:
         "stop",
     ]
     assert proposal["candidates"][-1]["terminates_rollout"] is True
+
+
+def test_free_proposal_generation_degrades_to_empty_candidates_on_invalid_json(
+    monkeypatch,
+) -> None:
+    """Qwen 输出未闭合 JSON 时资源受限，应降级返回空候选单而不是崩掉整个实验。"""
+    from jitpi05.jitrl import planner as planner_module
+    from jitpi05.jitrl.planner import generate_free_candidates, JITRL_TERMINATION_MODE
+
+    capture = {}
+
+    class Inputs(dict):
+        def to(self, device):
+            return self
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            return Inputs(
+                input_ids=torch.tensor([[1, 2]]),
+                attention_mask=torch.tensor([[1, 1]]),
+            )
+
+        @staticmethod
+        def decode(token_ids, **kwargs):
+            # 模拟 Qwen 到达 512 token 上限、字符串未闭合的退化输出
+            capture["token_count"] = int(token_ids.shape[0])
+            # 与 assistant_prefill 的 "{" 拼接后得到未闭合 JSON：{"state_summary":"robot=...
+            return '"state_summary":"robot=arm=placed; object=yellow moka pot; target=stove;'
+
+    class Model:
+        device = torch.device("cpu")
+
+        @staticmethod
+        def generate(**kwargs):
+            capture["generate_kwargs"] = kwargs
+            # 生成恰好等于 max_new_tokens 的 token 数，命中 generation_reached_limit
+            # input_ids 为 2 个 token，故需返回 1 + 2 + max_new_tokens 使得
+            # generated_ids = generated[0, 2:] 长度恰等于 max_new_tokens
+            total = kwargs["max_new_tokens"]
+            return torch.ones((1, 2 + total), dtype=torch.long) * 42
+
+    proposal = generate_free_candidates(
+        Model(),
+        Processor(),
+        [],
+        "put both moka pots on the stove",
+        max_new_tokens=8,
+    )
+    # 不复用外部 JITRL_FREE_CANDIDATES mock，仅在返回上断言降级状态
+    assert proposal["degraded"] is True
+    assert proposal["candidates"] == []
+    assert proposal["qwen_candidates"] == []
+    assert proposal["termination_mode"] == JITRL_TERMINATION_MODE
+    assert proposal["stop_only"] is False
+    assert "generation_reached_limit=True" in proposal["degraded_reason"]
+    assert proposal["binding_generation_reached_limit"] is True
+    assert proposal["binding_generated_tokens"] == 8
+
+
+def test_degraded_empty_candidates_flow_into_stop_only_masked(monkeypatch) -> None:
+    """降级返回的空候选单在 plan_and_score_free 中应自然成为 stop_only_masked。"""
+    from jitpi05.jitrl import planner as planner_module
+
+    degraded_proposal = {
+        "binding_prompt": "p",
+        "binding_raw_output": "bad",
+        "binding_assistant_prefill": "{",
+        "binding_generated_tokens": 8,
+        "binding_generation_reached_limit": True,
+        "state_summary": "",
+        "workspace": [],
+        "termination_mode": "environment_only_no_stop_v1",
+        "binding": {},
+        "candidates": [],
+        "qwen_candidates": [],
+        "stop_only": False,
+        "degraded": True,
+        "degraded_reason": "bad json; generation_reached_limit=True",
+    }
+    monkeypatch.setattr(
+        planner_module, "generate_free_candidates", lambda *args, **kwargs: degraded_proposal
+    )
+    result = planner_module.plan_and_score_free(None, None, [], "task", max_new_tokens=8)
+    assert result["stop_only_masked"] is True
+    assert result["candidates"] == []
+    assert result["qwen_candidates"] == []

@@ -708,12 +708,34 @@ def generate_free_candidates(
     try:
         parsed = parse_free_planning_json(raw_output, candidate_count)
     except Exception as error:
-        raise ValueError(
+        # 兜底：Qwen 输出未闭合 JSON / 生成到达 max_new_tokens 上限时，不再 raise
+        # 中断整个实验，而是降级返回一个候选人为空的 proposal。空候选单会被
+        # plan_and_score_free 识别为 stop_only_masked=True，rollout 端随即用上一个
+        # 动作重复继续（repeated_previous_action），从而避免崩溃、保留轨迹与审计。
+        degraded_reason = (
             f"{error}; generated_tokens={generated_tokens}; "
             f"max_new_tokens={max_new_tokens}; "
-            f"generation_reached_limit={generation_reached_limit}; "
-            f"Qwen output={raw_output!r}"
-        ) from error
+            f"generation_reached_limit={generation_reached_limit}"
+        )
+        degraded = {
+            "state_summary": "",
+            "workspace": [],
+            "qwen_candidates": [],
+            "candidates": [],
+            "termination_mode": JITRL_TERMINATION_MODE,
+            "binding": {},
+            "stop_only": False,
+            "degraded": True,
+            "degraded_reason": degraded_reason,
+        }
+        return {
+            "binding_prompt": prompt,
+            "binding_raw_output": raw_output,
+            "binding_assistant_prefill": assistant_prefill,
+            "binding_generated_tokens": generated_tokens,
+            "binding_generation_reached_limit": generation_reached_limit,
+            **degraded,
+        }
     return {
         "binding_prompt": prompt,
         "binding_raw_output": raw_output,
