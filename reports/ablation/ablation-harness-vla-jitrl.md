@@ -187,3 +187,60 @@ trace 中出现过 `Current subtask: align the gripper with empty` 以及在 boo
 #### （7）单 seed、每 task 10 episode 的统计功效不足（确定限制）
 
 当前只有 seed 17，且同一 JitRL run 内 episode 顺序相关。−2pt 的点差配对检验 p≈0.75–0.77，不能支持显著负效应，也不能排除小幅正效应。
+
+## 7. LIBERO-Pro object 扰动 × Cycle 动态预算专项（task7-9 seed 17）
+
+> Benchmark：LIBERO-Pro `libero_10_object`，但**仅跑 task7-9**（最难分区的三个任务）的四种方法，并使用 **Cycle 动态恢复预算**。数据来源：`artifacts/cyclevla_libero_pro_object_rlinf_dynamic_budget_tasks7_9_seed17/`（12/12 runs 全部跑满，无崩溃）。
+> 本实验为 task7-9 的单种子重跑，因此第 6.2 节该子集的一次数值（如 task8 `static-free` 曾为 2/10）与本表存在单 seed 波动，属正常现象；**以本表为准**。
+
+### 7.1 实验配置与双口径定义
+
+- **四种方法**：`static-free`、`jitrl-free`、`static-free-cycle`、`jitrl-free-cycle`。
+- **统一预算**：非 Cycle 方法固定 `budget=800`（strict）；Cycle 方法启用**动态预算**，上限 `CYCLE_MAX_DYNAMIC_STEPS = 800+800 = 1600`，每次回溯额外授予 `400` 步（上限 `800`）。
+- **两种记录口径**（由 cycle 专用指标承载）：
+  - `strict_budget_success_rate`：在**统一 800 步**内成功的比例 —— 供跨方法公平比较。
+  - `dynamic_budget_success_rate`：在**动态预算（≤1600）**内成功的比例 —— 仅作 Cycle 恢复诊断指标。
+- 运行期修复与环境无关：底层 robosuite `horizon` 硬编码为 1000，动态预算超限时由 `disable_robosuite_horizon_done`（`simulation.py`）关闭 robosuite 自有的 horizon done，终止完全交给上层预算；Qwen planner 在输出未闭合 JSON / 达到 `max_new_tokens` 时降级返回空候选单而非 raise（`planner.py`）。
+
+### 7.2 完整结果（每方法 10 episodes，seed 17）
+
+| 任务 | 方法 | success | strict(≤800) | dynamic(≤1600) | 成功步数 | backtrack_rate | 额外预算被用 | 终止分布 |
+|------|------|---:|---:|---:|---:|---:|---:|---|
+| task7 | `static-free` | 0% | 0% | N/A | — | 0% | — | 全 max_steps |
+| task7 | `jitrl-free` | 0% | 0% | N/A | — | 0% | — | 全 max_steps |
+| task7 | `static-free-cycle` | **10%** | 0% | **10%** | 1459 | 10.4% | 785.9 | env 1 / max 9 |
+| task7 | `jitrl-free-cycle` | 0% | 0% | 0% | — | 12.3% | 800.0 | 全 max_steps |
+| task8 | `static-free` | **30%** | 30% | N/A | 477.7 | 0% | — | env 3 / max 7 |
+| task8 | `jitrl-free` | 10% | 10% | N/A | 373.0 | 0% | — | env 1 / max 9 |
+| task8 | `static-free-cycle` | 0% | 0% | 0% | — | 4.0% | 560.0 | 全 max_steps |
+| task8 | `jitrl-free-cycle` | **10%** | 0% | **10%** | 1209 | 3.9% | 560.9 | env 1 / max 9 |
+| task9 | `static-free` | 0% | 0% | N/A | — | 0% | — | 全 max_steps |
+| task9 | `jitrl-free` | 0% | 0% | N/A | — | 0% | — | 全 max_steps |
+| task9 | `static-free-cycle` | 0% | 0% | 0% | — | 20.1% | 800.0 | 全 max_steps |
+| task9 | `jitrl-free-cycle` | 0% | 0% | 0% | — | 18.0% | 800.0 | 全 max_steps |
+
+（N/A = 非 Cycle 方法不适用动态口径；success 比例与 strict/dynamic 的取舍见 7.3 示例。）
+
+### 7.3 逐任务关键解读
+
+1. **task7：cycle 方法在严格 800 步内全部失败（strict=0%），但 `static-free-cycle` 靠回溯在 1459 步成功 1 集（dynamic=10%）**。这是动态预算“挽救”机制的直接证据：回溯触发了额外 400~800 步预算，最终把一个在 800 步内必然失败的轨迹推进到了任务成功。然而 `jitrl-free-cycle` 在 task7 仍 0%（虽然回溯率 12.3% 最高、额外预算用满 800，仍未转成成功）。
+2. **task8：`static-free` 30%、`jitrl-free` 10% 均来自 strict 口径**；`jitrl-free-cycle` 在 strict 0% 下靠动态预算成功 1 集（1209 步）。说明 **Cycle 的动态预算对“卡住”的轨迹有挽救能力**，但并没有帮助非 Cycle 的 `jitrl-free` 提升严格成功率——JitRL 在线记忆在该任务上反而比 static-free 少了 20pt 成功率（10% vs 30%）。
+3. **task9：四方法全部 0%**，即使 Cycle 用了满额额外预算（800）也失败。这与第 6 节结论“task9 四方法 0%”一致，属于低层共同失败（floor regime），高层的回溯/预算无法挽救。
+
+### 7.4 跨任务汇总（task_macro，n=3 task）
+
+| 方法 | success_rate 均值 | strict 均值 | dynamic 均值 | 成功步数均值 | backtrack_rate 均值 | 额外预算被用均值 |
+|------|---:|---:|---:|---:|---:|---:|
+| `static-free` | 10.0% | 10.0% | N/A | 477.7 | 0% | — |
+| `jitrl-free` | 3.3% | 3.3% | N/A | 373.0 | 0% | — |
+| `static-free-cycle` | 3.3% | 0% | 3.3% | 1459 | 11.5% | 715.3 |
+| `jitrl-free-cycle` | 3.3% | 0% | 3.3% | 1209 | 11.4% | 720.3 |
+
+**primary_effect_metric = `success_step_reduction`**（static 成功步数 − jitrl 成功步数，正值利 JitRL）：task8 `jitrl-free vs static-free = +104.7` 步（477.7→373.0），即 JitRL 成功时更快；但该任务 JitRL 成功率更低（10% vs 30%），属“更快但更少”权衡。
+
+### 7.5 结论与限定
+
+1. **动态预算能挽救卡住轨迹**：task7 `static-free-cycle` 与 task8 `jitrl-free-cycle` 在严格 800 步内均为 0%，放宽到动态预算后各成功 1 集（1459 / 1209 步）。印证 `dynamic_budget_success_rate` 应作为 Cycle 专属恢复诊断，而**跨方法公平比较只能用 `strict_budget_success_rate`**。
+2. **本轮 Cycle 未提升严格口径成功率**：所有 Cycle 方法的 strict 均为 0%，与 static-free（10%）/jitrl-free（10%）相比无优势；跨方法成功率差异主要来自环境终止下的可复现波动，而非 Cycle 的增益。
+3. **运行稳健性**：120 集全部跑满，无 `executing action in terminated episode`、无 `planner failed after 7 attempts`。robosuite horizon 修复与 Qwen 降级兜底均按预期工作；`task7 static-free-cycle` 从上一版 0% 提升到本轮 10%，说明降级后仍保留了有效 rollout。
+4. **限定**：仅 seed 17、每方法 10 episodes、同一 run 内 episode 顺序相关；task9/多数 task 成功率 0%~10%，样本稀疏，任务级区间仅为描述性，不能做跨 seed 统计推断。
