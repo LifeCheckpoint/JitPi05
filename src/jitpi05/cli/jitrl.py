@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from jitpi05.config import (
     CYCLE_EVALUATION,
+    DIRECT_METHODS,
     JITRL_CLI_METHODS,
     JITRL_EPISODES,
     JITRL_METHODS,
@@ -140,13 +141,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             method in ("jitrl", "jitrl-free", "jitrl-free-cycle")
             for method in methods
         )
+        need_planner = any(method not in DIRECT_METHODS for method in methods)
         need_cycle_predictor = any(method.endswith("-cycle") for method in methods)
         tqdm.write(
             "[experiment] loading shared models once "
-            f"(need_evaluator={need_evaluator}, "
+            f"(need_planner={need_planner}, need_evaluator={need_evaluator}, "
             f"need_cycle_predictor={need_cycle_predictor})"
         )
         models = load_experiment_models(
+            need_planner=need_planner,
             need_evaluator=need_evaluator,
             need_cycle_predictor=need_cycle_predictor,
         )

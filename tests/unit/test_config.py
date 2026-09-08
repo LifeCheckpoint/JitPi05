@@ -28,3 +28,12 @@ def test_jitrl_free_methods_and_configuration() -> None:
     assert JITRL_FREE_CANDIDATES == 5
     assert 0.0 < JITRL_FREE_ACTION_SIM_THRESHOLD <= 1.0
     assert JITRL_FREE_PLAN_TOKENS > 0
+
+
+def test_direct_methods_are_raw_task_ablation_methods() -> None:
+    from jitpi05.config import ALL_METHODS, CYCLE_METHODS, DIRECT_METHODS
+
+    assert DIRECT_METHODS == ("direct", "direct-cycle")
+    assert set(DIRECT_METHODS).issubset(ALL_METHODS)
+    assert "direct" not in CYCLE_METHODS
+    assert "direct-cycle" in CYCLE_METHODS

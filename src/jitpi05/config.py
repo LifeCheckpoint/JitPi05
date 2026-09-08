@@ -46,6 +46,10 @@ SIM_ACTION_STEPS = 10  # 每个底层 chunk 执行的动作步数
 # =========================================================================
 # 历史默认两方法；四方法二因素比较（Cycle × JitRL）通过 CLI --method 显式开启。
 JITRL_METHODS = ("jitrl-free", "static-free")
+# 无高层规划器的 raw-task 对照：冻结低层 VLA 在整个 episode 中始终接收
+# LIBERO 原始任务描述。direct-cycle 只把确定性程序用于 Cycle 内部恢复状态，
+# 不把程序节点文本作为低层语言条件。
+DIRECT_METHODS = ("direct", "direct-cycle")
 # 固定工作集（HarnessVLA 固定原语）方法：jitrl（在线记忆调制）/ static（无调制）。
 JITRL_FIXED_METHODS = ("jitrl", "static")
 CYCLE_JITRL_METHODS = (
@@ -55,11 +59,17 @@ CYCLE_JITRL_METHODS = (
     "jitrl-free-cycle",
 )
 # Cycle 包装方法 = 后缀为 "-cycle" 的方法。
-CYCLE_METHODS = tuple(method for method in CYCLE_JITRL_METHODS if method.endswith("-cycle"))
+CYCLE_METHODS = tuple(
+    method
+    for method in (*CYCLE_JITRL_METHODS, *DIRECT_METHODS)
+    if method.endswith("-cycle")
+)
 # 全部方法 = 自由候选 + 固定工作集 + Cycle 包装方法。
 # rollout.run_jitrl_experiment 使用本常量校验 method，因此必须包含固定工作集方法。
 ALL_METHODS = tuple(
-    dict.fromkeys((*JITRL_METHODS, *JITRL_FIXED_METHODS, *CYCLE_METHODS))
+    dict.fromkeys(
+        (*JITRL_METHODS, *JITRL_FIXED_METHODS, *DIRECT_METHODS, *CYCLE_METHODS)
+    )
 )
 # CLI --method 可选全集与 ALL_METHODS 保持一致（含自由候选、固定工作集与 Cycle 方法）。
 JITRL_CLI_METHODS = ALL_METHODS

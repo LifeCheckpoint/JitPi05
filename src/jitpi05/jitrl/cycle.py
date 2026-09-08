@@ -25,6 +25,8 @@ class MBRSelection:
     risks: tuple[float, ...]
     features: torch.Tensor
     pairwise_distances: torch.Tensor
+    scores: tuple[float, ...] = ()
+    selection_mode: str = "rep"
 
     @property
     def selected_risk(self) -> float:
@@ -75,6 +77,83 @@ def cumulative_trajectory_features(
     return deltas.cumsum(dim=1).reshape(chunks.shape[0], horizon * delta_dims)
 
 
+def _rotvec_to_quaternion(rotvec: torch.Tensor) -> torch.Tensor:
+    """Convert an axis-angle vector batch to ``[w, x, y, z]`` quaternions."""
+
+    angle = torch.linalg.vector_norm(rotvec, dim=-1, keepdim=True)
+    half = angle * 0.5
+    scale = torch.where(angle > 1e-8, torch.sin(half) / angle, 0.5 - angle.square() / 48.0)
+    return torch.cat((torch.cos(half), rotvec * scale), dim=-1)
+
+
+def _quaternion_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    lw, lx, ly, lz = left.unbind(dim=-1)
+    rw, rx, ry, rz = right.unbind(dim=-1)
+    return torch.stack(
+        (
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ),
+        dim=-1,
+    )
+
+
+def _quaternion_to_rotvec(quaternion: torch.Tensor) -> torch.Tensor:
+    """Convert normalized ``[w, x, y, z]`` quaternions to axis-angle vectors."""
+
+    normalized = quaternion / torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True).clamp_min(1e-8)
+    scalar = normalized[..., :1].clamp(-1.0, 1.0)
+    vector = normalized[..., 1:]
+    angle = 2.0 * torch.atan2(torch.linalg.vector_norm(vector, dim=-1, keepdim=True), scalar)
+    scale = torch.where(
+        torch.linalg.vector_norm(vector, dim=-1, keepdim=True) > 1e-8,
+        angle / torch.linalg.vector_norm(vector, dim=-1, keepdim=True),
+        torch.ones_like(angle),
+    )
+    return vector * scale
+
+
+def cumulative_pose_trajectory_features(
+    action_chunks: torch.Tensor | Sequence[Any],
+    *,
+    action_steps: int | None = None,
+) -> torch.Tensor:
+    """Build official-style cumulative EEF features: position + composed rotation."""
+
+    chunks = _as_action_tensor(action_chunks)
+    if isinstance(action_steps, bool) or (
+        action_steps is not None and action_steps <= 0
+    ):
+        raise ValueError("action_steps must be a positive integer or None")
+    horizon = chunks.shape[1] if action_steps is None else min(action_steps, chunks.shape[1])
+    deltas = chunks[:, :horizon, :6]
+    positions = deltas[..., :3].cumsum(dim=1)
+    increments = _rotvec_to_quaternion(deltas[..., 3:6])
+    rotations = []
+    current = torch.zeros(chunks.shape[0], 4, dtype=chunks.dtype, device=chunks.device)
+    current[:, 0] = 1.0
+    for step in range(horizon):
+        current = _quaternion_multiply(current, increments[:, step])
+        rotations.append(_quaternion_to_rotvec(current))
+    rotation_trajectory = torch.stack(rotations, dim=1)
+    return torch.cat((positions, rotation_trajectory), dim=-1).reshape(chunks.shape[0], horizon * 6)
+
+
+def robust_normalize(values: torch.Tensor) -> torch.Tensor:
+    """Match CycleVLA's robust percentile/IQR normalization."""
+
+    values = torch.as_tensor(values, dtype=torch.float32)
+    if values.numel() < 2:
+        return torch.zeros_like(values)
+    low, high = torch.quantile(values, torch.tensor([0.1, 0.9]))
+    clipped = values.clamp(float(low), float(high))
+    median = clipped.median()
+    q1, q3 = torch.quantile(clipped, torch.tensor([0.25, 0.75]))
+    return (values - median) / (q3 - q1 + 1e-8)
+
+
 def pairwise_l2_distances(features: torch.Tensor) -> torch.Tensor:
     """Return the symmetric candidate-by-candidate Euclidean distance matrix."""
 
@@ -91,22 +170,61 @@ def select_mbr_medoid(
     *,
     action_steps: int | None = None,
     delta_dims: int = 6,
+    failed_trajectories: Sequence[Any] = (),
+    selection_mode: Literal["rep", "away"] = "rep",
 ) -> MBRSelection:
-    """Select the minimum-risk action hypothesis and expose its audit matrix."""
+    """Select an MBR hypothesis using CycleVLA's density/repulsion ranking."""
 
-    features = cumulative_trajectory_features(
+    features = cumulative_pose_trajectory_features(
         action_chunks,
         action_steps=action_steps,
-        delta_dims=delta_dims,
     )
     distances = pairwise_l2_distances(features)
+    count = features.shape[0]
+    if selection_mode not in {"rep", "away"}:
+        raise ValueError("selection_mode must be 'rep' or 'away'")
+    if count == 1:
+        return MBRSelection(
+            selected_index=0,
+            risks=(0.0,),
+            features=features,
+            pairwise_distances=distances,
+            scores=(0.0,),
+            selection_mode=selection_mode,
+        )
+    neighborhood = min(max(2, int(count**0.5)), max(1, count - 1))
+    rnn_radius = torch.kthvalue(distances, neighborhood + 1, dim=1).values
+    center_index = int(torch.argmin(rnn_radius).item())
+    pocket = torch.argsort(distances[center_index])[:neighborhood]
+    intra = distances[pocket][:, pocket]
+    medoid_index = int(pocket[torch.argmin(intra.mean(dim=1))].item())
+    distance_to_medoid = distances[medoid_index]
+    valid_failed = []
+    for trajectory in failed_trajectories:
+        value = torch.as_tensor(trajectory, dtype=torch.float32)
+        if value.ndim == 1 and value.shape[0] == features.shape[1] and torch.isfinite(value).all():
+            valid_failed.append(value)
+    if valid_failed:
+        failed_distance = torch.stack(
+            [torch.cdist(features[index : index + 1], torch.stack(valid_failed)).min() for index in range(count)]
+        ).flatten()
+    else:
+        failed_distance = torch.full_like(rnn_radius, float(rnn_radius.median()))
+    repulsion = torch.sigmoid(robust_normalize(failed_distance))
+    scores = (
+        robust_normalize(distance_to_medoid) + 0.5 * repulsion
+        if selection_mode == "away"
+        else -robust_normalize(rnn_radius) + 0.5 * repulsion
+    )
+    selected_index = int(torch.argmax(scores).item())
     risks_tensor = distances.mean(dim=1)
-    selected_index = int(torch.argmin(risks_tensor).item())
     return MBRSelection(
         selected_index=selected_index,
         risks=tuple(float(value) for value in risks_tensor.tolist()),
         features=features,
         pairwise_distances=distances,
+        scores=tuple(float(value) for value in scores.tolist()),
+        selection_mode=selection_mode,
     )
 
 
@@ -115,6 +233,8 @@ def select_mbr_chunk(
     *,
     action_steps: int | None = None,
     delta_dims: int = 6,
+    failed_trajectories: Sequence[Any] = (),
+    selection_mode: Literal["rep", "away"] = "rep",
 ) -> tuple[torch.Tensor, MBRSelection]:
     """Return the selected original chunk without averaging or modifying it."""
 
@@ -123,6 +243,8 @@ def select_mbr_chunk(
         chunks,
         action_steps=action_steps,
         delta_dims=delta_dims,
+        failed_trajectories=failed_trajectories,
+        selection_mode=selection_mode,
     )
     return chunks[selection.selected_index], selection
 

@@ -19,15 +19,15 @@ from tqdm.auto import tqdm
 
 from jitpi05.config import (
     ALL_METHODS,
-    CYCLE_BUDGET_MODE,
     CYCLE_BACKTRACK_EXTRA_BUDGET,
+    CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
     CYCLE_DYNAMIC_BUDGET_ENABLED,
     CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
-    CYCLE_MAX_RETRIES,
     CYCLE_MAX_DYNAMIC_STEPS,
     CYCLE_MAX_EXTRA_BUDGET,
+    CYCLE_MAX_RETRIES,
     CYCLE_MBR_ACTION_STEPS,
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
@@ -74,10 +74,12 @@ from jitpi05.jitrl.cycle import (
     CycleGate,
     CyclePhase,
     CycleSignalConfirmation,
+    CycleSubtask,
     PhysicalEvidence,
     SemanticAnchor,
     adapt_cycle_policy_output,
     build_cycle_subtask_program,
+    cumulative_pose_trajectory_features,
     format_cycle_condition,
     format_cycle_subtask_program,
     match_cycle_subtask,
@@ -126,6 +128,7 @@ FREE_METHODS = (
     "jitrl-free-cycle",
     "static-free-cycle",
 )
+DIRECT_METHODS = ("direct", "direct-cycle")
 
 
 def _low_level_condition(overall_task: str, subtask: str) -> str:
@@ -139,6 +142,14 @@ def _low_level_condition(overall_task: str, subtask: str) -> str:
     if RLINF_USE_RAW_TASK_PROMPT and JITRL_LOW_LEVEL_BACKEND == "rlinf":
         return overall_task
     return conditioned_task(overall_task, subtask)
+
+
+def _direct_condition(overall_task: str) -> str:
+    """Keep the original task as the sole language condition for direct methods."""
+
+    return str(overall_task).strip()
+
+
 # Methods that populate/read the online experience memory. Recovery actions are
 # deliberately excluded from episode_records, so Cycle does not change the JitRL
 # learning boundary.
@@ -261,11 +272,39 @@ def _episode_tensors(
     policy,
 ) -> dict[str, torch.Tensor]:
     action_dim = int(policy.config.output_features["action"].shape[0])
-    stacked_chunks = (
-        torch.stack(list(action_chunks))
-        if action_chunks
-        else torch.empty((0, policy.config.chunk_size, action_dim), dtype=torch.float32)
-    )
+    if action_chunks:
+        configured_horizon = int(policy.config.chunk_size)
+        normalized_chunks = []
+        for chunk in action_chunks:
+            values = torch.as_tensor(chunk, dtype=torch.float32)
+            if values.ndim != 2 or values.shape[1] != action_dim:
+                raise ValueError(
+                    "action chunks must have shape [horizon, action_dim]; "
+                    f"got {tuple(values.shape)}"
+                )
+            if values.shape[0] > configured_horizon:
+                raise ValueError(
+                    "action chunk exceeds the configured policy horizon: "
+                    f"{values.shape[0]} > {configured_horizon}"
+                )
+            if values.shape[0] < configured_horizon:
+                values = torch.cat(
+                    (
+                        values,
+                        torch.zeros(
+                            configured_horizon - values.shape[0],
+                            action_dim,
+                            dtype=values.dtype,
+                        ),
+                    ),
+                    dim=0,
+                )
+            normalized_chunks.append(values)
+        stacked_chunks = torch.stack(normalized_chunks)
+    else:
+        stacked_chunks = torch.empty(
+            (0, policy.config.chunk_size, action_dim), dtype=torch.float32
+        )
     stacked_actions = (
         torch.stack(list(actions))
         if actions
@@ -541,9 +580,17 @@ def _run_episode_cycle(
     # 回溯后 MBR 选定的 rollout 坐标基址：恢复期间后续 chunk 沿用同一 MBR seed
     # 系列滚动生成（重 rollout 整个子任务），而不是每个 chunk 用全局递增坐标。
     mbr_rollout_coordinate: int | None = None
+    mbr_candidate_cache: dict[str, list] = {}
+    mbr_candidate_order: dict[str, list[int]] = {}
+    mbr_candidate_cursor: dict[str, int] = {}
+    failed_trajectory_features: dict[str, list[torch.Tensor]] = {}
+    anchor_action_chunks: dict[str, list[torch.Tensor]] = {}
+    pending_mbr_actions: torch.Tensor | None = None
     phase = CyclePhase.IN_PROGRESS
     cycle_program = ()
     cycle_program_text: tuple[str, ...] = ()
+    raw_task_continuation = False
+    continuation_anchor: SemanticAnchor | None = None
     cycle_signal_mode = "unknown"
     cycle_trigger_mode = "not_triggered"
     progress_confirmation = CycleSignalConfirmation(
@@ -647,6 +694,7 @@ def _run_episode_cycle(
             cycle_signal_mode = "mixed"
         cpu_chunk = adapted.robot_action_chunk.detach().cpu().clone()
         action_chunks.append(cpu_chunk)
+        anchor_action_chunks.setdefault(anchor_id, []).append(cpu_chunk)
         progress_confirmed = False
         stop_confirmed = False
         for local_index, action in enumerate(cpu_chunk[:POLICY_ACTION_STEPS]):
@@ -719,41 +767,75 @@ def _run_episode_cycle(
         restored_frame: dict,
         condition: str | None = None,
     ) -> dict:
-        nonlocal mbr_rollout_coordinate
+        nonlocal mbr_rollout_coordinate, pending_mbr_actions
         exec_condition = anchor.condition if condition is None else condition
-        candidates = []
+        cache_key = anchor.program_id
+        mbr_coordinate = anchor.high_level_step_index * CYCLE_MBR_HYPOTHESES
         candidate_seeds: list[int] = []
-        mbr_retry_index = max(0, cycle_retry_count - 1)
-        mbr_coordinate = (
-            anchor.high_level_step_index * CYCLE_MAX_RETRIES * CYCLE_MBR_HYPOTHESES
-            + mbr_retry_index * CYCLE_MBR_HYPOTHESES
-        )
-        for candidate_index in range(CYCLE_MBR_HYPOTHESES):
-            coordinate = mbr_coordinate + candidate_index
-            candidate_seeds.append(
-                coordinate_seed("mbr_flow_noise", seed, episode_index, coordinate)
+        if cache_key not in mbr_candidate_cache:
+            candidates = []
+            for candidate_index in range(CYCLE_MBR_HYPOTHESES):
+                coordinate = mbr_coordinate + candidate_index
+                candidate_seeds.append(
+                    coordinate_seed("mbr_flow_noise", seed, episode_index, coordinate)
+                )
+                noise = coordinate_flow_noise(
+                    policy,
+                    seed,
+                    episode_index,
+                    coordinate,
+                    device="cuda",
+                    kind="mbr_flow_noise",
+                )
+                candidates.append(_predict_action_chunk(restored_frame, exec_condition, noise))
+            mbr_candidate_cache[cache_key] = candidates
+            robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
+            _, selection = select_mbr_chunk(
+                robot_chunks,
+                action_steps=CYCLE_MBR_ACTION_STEPS,
+                delta_dims=CYCLE_MBR_DELTA_DIMS,
+                failed_trajectories=failed_trajectory_features.get(cache_key, ()),
             )
-            noise = coordinate_flow_noise(
-                policy,
-                seed,
-                episode_index,
-                coordinate,
-                device="cuda",
-                kind="mbr_flow_noise",
+            mbr_candidate_order[cache_key] = sorted(
+                range(len(candidates)),
+                key=lambda index: selection.scores[index],
+                reverse=True,
             )
-            candidates.append(_predict_action_chunk(restored_frame, exec_condition, noise))
-        robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
-        _, selection = select_mbr_chunk(
-            robot_chunks,
-            action_steps=CYCLE_MBR_ACTION_STEPS,
-            delta_dims=CYCLE_MBR_DELTA_DIMS,
-        )
+            mbr_candidate_cursor[cache_key] = mbr_candidate_order[cache_key].index(
+                selection.selected_index
+            )
+        else:
+            candidates = mbr_candidate_cache[cache_key]
+            mbr_candidate_cursor[cache_key] = min(
+                mbr_candidate_cursor.get(cache_key, 0) + 1,
+                len(candidates) - 1,
+            )
+            robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
+            selection = select_mbr_chunk(
+                robot_chunks,
+                action_steps=CYCLE_MBR_ACTION_STEPS,
+                delta_dims=CYCLE_MBR_DELTA_DIMS,
+                failed_trajectories=failed_trajectory_features.get(cache_key, ()),
+            )[1]
+            selection = selection.__class__(
+                selected_index=mbr_candidate_order[cache_key][mbr_candidate_cursor[cache_key]],
+                risks=selection.risks,
+                features=selection.features,
+                pairwise_distances=selection.pairwise_distances,
+                scores=selection.scores,
+                selection_mode=selection.selection_mode,
+            )
         selected_output = candidates[selection.selected_index]
+        # Execute the selected candidate first, then drain its remaining
+        # actions without another policy inference. This mirrors the official
+        # action_queue semantics and avoids turning one MBR hypothesis into a
+        # sequence of unrelated re-inferences.
         action_record = _execute_action_chunk(
             selected_output,
             source="mbr_retry",
             anchor_id=anchor.anchor_id,
         )
+        pending_mbr_actions = selected_output.robot_action_chunk[POLICY_ACTION_STEPS:].clone()
         # 官方 MBR 是在回溯后选定代表 seed 然后重新 rollout 整个子任务（多个
         # chunk 连续执行），而不是只修正一个动作块。记录选中 seed 的坐标基址，
         # 主循环恢复期间沿用该基址滚动生成后续 chunk，实现「重 rollout 子任务」。
@@ -767,14 +849,20 @@ def _run_episode_cycle(
             "action_steps": CYCLE_MBR_ACTION_STEPS,
             "delta_dims": CYCLE_MBR_DELTA_DIMS,
             "candidate_flow_noise_seeds": candidate_seeds,
+            "cached_candidate_count": len(candidates),
+            "candidate_cursor": mbr_candidate_cursor[cache_key],
+            "candidate_order": mbr_candidate_order[cache_key],
+            "failed_trajectory_count": len(failed_trajectory_features.get(cache_key, ())),
             "rollout_coordinate": mbr_rollout_coordinate,
             "selected_index": selection.selected_index,
             "selected_risk": selection.selected_risk,
             "mean_pairwise_distance": selection.mean_pairwise_distance,
             "risks": list(selection.risks),
+            "scores": list(selection.scores),
             "features": selection.features.tolist(),
             "pairwise_distances": selection.pairwise_distances.tolist(),
             "executed_chunk": action_record,
+            "remaining_action_count": int(pending_mbr_actions.shape[0]),
         }
         if active_trace is not None:
             active_trace["retry_low_level_chunks"].append(action_record)
@@ -793,6 +881,27 @@ def _run_episode_cycle(
         condition.  Recovery never queries JitRL memory and never appends an
         experience record, keeping this an inference-only intervention.
         """
+
+        if method == "direct-cycle":
+            # The direct-cycle ablation has no high-level planner.  Rewind keeps
+            # the same internal Cycle anchor, while the low-level policy remains
+            # conditioned on the unchanged raw task.
+            return {
+                "planning": None,
+                "planner_attempts": 0,
+                "value_estimate": _trace_value_estimate(_static_value_estimate([])),
+                "update": {},
+                "selected_candidate": {
+                    "text": anchor.action_text,
+                    "semantic_key": anchor.program_id,
+                },
+                "selected_index": None,
+                "condition": _direct_condition(overall_task),
+                "program_node": next(
+                    (node for node in cycle_program if node.subtask_id == anchor.program_id),
+                    cycle_program[min(anchor.program_position, len(cycle_program) - 1)],
+                ),
+            }
 
         replan_images = planning_images(
             policy_frame(observation, overall_task, env_preprocessor)
@@ -953,20 +1062,72 @@ def _run_episode_cycle(
                 active_before_images = [image.copy() for image in images]
                 if step_progress is not None:
                     step_progress.set_postfix_str(
-                        f"low={low_level_chunk_index} high={high_level_step_index} planner=qwen-cycle",
+                        f"low={low_level_chunk_index} high={high_level_step_index} "
+                        f"planner={'disabled' if method == 'direct-cycle' else 'qwen-cycle'}",
                         refresh=True,
                     )
-                planning, planner_attempts = _plan_and_score_with_retry(
-                    planner_model,
-                    planner_processor,
-                    images,
-                    overall_task,
-                    selected_subtasks[-JITRL_HISTORY_SIZE:],
-                    method=method,
-                    seed=seed,
-                    episode_index=episode_index,
-                    high_level_step_index=high_level_step_index,
-                )
+                if method == "direct-cycle":
+                    # Use the deterministic Cycle program only as an internal
+                    # recovery/state anchor. It never becomes the VLA prompt.
+                    program_position = len(anchors)
+                    if program_position < len(cycle_program):
+                        program_node = cycle_program[program_position]
+                    else:
+                        # Once the deterministic program is exhausted, keep
+                        # running the raw-task VLA rather than clamping to the
+                        # final semantic node. This continuation is deliberately
+                        # outside the Cycle subtask program and is created once.
+                        raw_task_continuation = True
+                        if continuation_anchor is None:
+                            program_node = CycleSubtask(
+                                subtask_id="raw-task-continuation",
+                                text="Continue the original task.",
+                                action_type="continuation",
+                                position=len(cycle_program),
+                            )
+                        else:
+                            program_node = CycleSubtask(
+                                subtask_id=continuation_anchor.program_id,
+                                text=continuation_anchor.action_text,
+                                action_type=continuation_anchor.action_type,
+                                position=continuation_anchor.program_position,
+                            )
+                    selected_candidate = {
+                        "text": program_node.text,
+                        "semantic_key": program_node.subtask_id,
+                        "label": "direct-cycle",
+                        "terminates_rollout": False,
+                    }
+                    candidates = [selected_candidate]
+                    planning = {
+                        "binding_prompt": "disabled: direct raw-task ablation",
+                        "binding_raw_output": "",
+                        "binding_assistant_prefill": "",
+                        "binding_generated_tokens": 0,
+                        "binding_generation_reached_limit": False,
+                        "binding": [],
+                        "selection_prompt": "disabled: direct raw-task ablation",
+                        "state_summary": "direct raw-task closed loop",
+                        "workspace": [],
+                        "qwen_candidates": [],
+                        "candidates": candidates,
+                        "termination_mode": "environment_only_raw_task_v1",
+                        "candidate_token_ids": [],
+                        "base_logits": [0.0],
+                    }
+                    planner_attempts = 0
+                else:
+                    planning, planner_attempts = _plan_and_score_with_retry(
+                        planner_model,
+                        planner_processor,
+                        images,
+                        overall_task,
+                        selected_subtasks[-JITRL_HISTORY_SIZE:],
+                        method=method,
+                        seed=seed,
+                        episode_index=episode_index,
+                        high_level_step_index=high_level_step_index,
+                    )
                 if planning.get("stop_only_masked"):
                     if not selected_subtasks:
                         termination_reason = "qwen_stop"
@@ -1032,24 +1193,29 @@ def _run_episode_cycle(
                 )
                 selected_candidate = candidates[selected_index]
                 anchor_id = f"anchor-{high_level_step_index}"
-                program_node = match_cycle_subtask(
-                    selected_candidate,
-                    cycle_program,
-                    preferred_position=high_level_step_index,
-                    used_ids=[anchor.program_id for anchor in anchors if anchor.program_id],
-                )
+                if method != "direct-cycle":
+                    program_node = match_cycle_subtask(
+                        selected_candidate,
+                        cycle_program,
+                        preferred_position=high_level_step_index,
+                        used_ids=[anchor.program_id for anchor in anchors if anchor.program_id],
+                    )
                 # 官方模板 condition：低层 7-D policy 的训练 prompt 分布就是
                 # ``Task: ... The current subtask: ...``，且 subtask 文本取自确定性
                 # 程序节点（与 released decomposed checkpoint 训练分布一致），
                 # 而不是注入 Qwen 自由文本（避免分布漂移导致抓错物体）。
-                active_condition = format_cycle_condition(overall_task, program_node.text)
+                active_condition = (
+                    _direct_condition(overall_task)
+                    if method == "direct-cycle"
+                    else format_cycle_condition(overall_task, program_node.text)
+                )
                 anchor_target_object = (
                     match_target_object(
                         selected_candidate["text"], inspect_scene_objects(env)
                     )
                     or ""
                 )
-                active_anchor = SemanticAnchor(
+                new_anchor = SemanticAnchor(
                     anchor_id=anchor_id,
                     action_text=selected_candidate["text"],
                     condition=active_condition,
@@ -1061,13 +1227,28 @@ def _run_episode_cycle(
                     # 不一致，用 Qwen 分类会让 proxy_subtask_stop / 物理失败信号
                     # / gripper 特判全部用错动作语义（v7 中 transport/release 被
                     # 误标成 place 数十次，是 0/10 的直接原因）。
-                    action_type=program_node.action_type,
+                    action_type=(
+                        program_node.action_type
+                        if method != "direct-cycle" or not raw_task_continuation
+                        else "continuation"
+                    ),
                     program_id=program_node.subtask_id,
-                    program_position=program_node.position,
+                    program_position=(
+                        program_node.position
+                        if method != "direct-cycle" or not raw_task_continuation
+                        else program_node.position
+                    ),
                     target_object=anchor_target_object,
                 )
-                anchors.append(active_anchor)
-                anchor_history_indices[anchor_id] = len(robot_history) - 1
+                if raw_task_continuation:
+                    if continuation_anchor is None:
+                        continuation_anchor = new_anchor
+                    active_anchor = continuation_anchor
+                else:
+                    active_anchor = new_anchor
+                if not raw_task_continuation or continuation_anchor is new_anchor:
+                    anchors.append(active_anchor)
+                    anchor_history_indices[active_anchor.anchor_id] = len(robot_history) - 1
                 episode_records.append(
                     {
                         "state": planning["state_summary"],
@@ -1109,6 +1290,12 @@ def _run_episode_cycle(
                     "action_end_step": len(actions),
                     "low_level_chunks": [],
                     "retry_low_level_chunks": [],
+                    "planner_enabled": method != "direct-cycle",
+                    "low_level_condition_mode": (
+                        "raw_task_constant"
+                        if method == "direct-cycle"
+                        else "cycle_subtask_template"
+                    ),
                 }
                 chunks.append(active_trace)
                 anchor_traces[anchor_id] = active_trace
@@ -1123,20 +1310,35 @@ def _run_episode_cycle(
 
             frame = policy_frame(observation, overall_task, env_preprocessor)
             low_level_chunk_index = len(action_chunks)
-            # 回溯恢复期间沿用 MBR 选定的 seed 基址滚动生成后续 chunk，重新
-            # rollout 整个子任务；非恢复路径保持全局递增坐标（确定性配对）。
-            if active_attempt_is_recovery and mbr_rollout_coordinate is not None:
-                noise_coordinate = mbr_rollout_coordinate + active_attempt_chunks
-                noise_kind = "mbr_rollout_noise"
+            if pending_mbr_actions is not None and pending_mbr_actions.shape[0] > 0:
+                # Drain the remainder of the selected MBR chunk before asking
+                # the policy for another chunk. This is the official queue
+                # behavior: one selected hypothesis is executed open-loop.
+                action_chunk = adapt_cycle_policy_output(pending_mbr_actions)
+                pending_mbr_actions = None
+                action_source = "mbr_retry_queue"
             else:
-                noise_coordinate = low_level_chunk_index
-                noise_kind = "flow_noise"
-            noise = coordinate_flow_noise(
-                policy, seed, episode_index, noise_coordinate, device="cuda", kind=noise_kind
-            )
-            action_chunk = _predict_action_chunk(frame, active_condition, noise)
+                # Non-MBR execution keeps deterministic paired flow noise. The
+                # MBR retry itself has already selected and executed its first
+                # chunk above; no unrelated re-inference is inserted here.
+                if active_attempt_is_recovery and mbr_rollout_coordinate is not None:
+                    noise_coordinate = mbr_rollout_coordinate + active_attempt_chunks
+                    noise_kind = "mbr_rollout_noise"
+                else:
+                    noise_coordinate = low_level_chunk_index
+                    noise_kind = "flow_noise"
+                noise = coordinate_flow_noise(
+                    policy,
+                    seed,
+                    episode_index,
+                    noise_coordinate,
+                    device="cuda",
+                    kind=noise_kind,
+                )
+                action_chunk = _predict_action_chunk(frame, active_condition, noise)
+                action_source = "policy"
             action_record = _execute_action_chunk(
-                action_chunk, source="policy", anchor_id=active_anchor.anchor_id
+                action_chunk, source=action_source, anchor_id=active_anchor.anchor_id
             )
             if active_trace is None or active_anchor is None:
                 raise RuntimeError("Cycle active action trace is missing")
@@ -1155,7 +1357,11 @@ def _run_episode_cycle(
             signal_source = action_record["signal_source"]
             progress_triggered = False
             trigger_mode = None
-            if not active_attempt_checked and phase == CyclePhase.IN_PROGRESS:
+            if (
+                not raw_task_continuation
+                and not active_attempt_checked
+                and phase == CyclePhase.IN_PROGRESS
+            ):
                 if signal_source == "policy_9d":
                     progress_triggered = bool(action_record["progress_confirmed"])
                     trigger_mode = "learned_progress_confirmed"
@@ -1274,6 +1480,39 @@ def _run_episode_cycle(
                     )
                     _finalize_evaluator_images()
                     target_history_index = anchor_history_indices[target_anchor.anchor_id]
+                    # Preserve the failed target-attempt trajectory for the
+                    # official MBR failed-trajectory repulsion term. Features
+                    # are kept in memory only; the JSON trace stores counts.
+                    failed_chunks = anchor_action_chunks.get(
+                        active_anchor.anchor_id, []
+                    )
+                    if failed_chunks:
+                        # A failed attempt can end with a shorter final chunk.
+                        # The official feature is one continuous first-N-step
+                        # trajectory, so concatenate in time and pad/truncate
+                        # to the fixed MBR horizon before feature extraction.
+                        failed_tensor = torch.cat(failed_chunks, dim=0)
+                        failed_tensor = failed_tensor[:CYCLE_MBR_ACTION_STEPS]
+                        if failed_tensor.shape[0] < CYCLE_MBR_ACTION_STEPS:
+                            failed_tensor = torch.cat(
+                                (
+                                    failed_tensor,
+                                    torch.zeros(
+                                        CYCLE_MBR_ACTION_STEPS - failed_tensor.shape[0],
+                                        failed_tensor.shape[1],
+                                        dtype=failed_tensor.dtype,
+                                    ),
+                                ),
+                                dim=0,
+                            )
+                        failed_feature = cumulative_pose_trajectory_features(
+                            failed_tensor.unsqueeze(0),
+                            action_steps=CYCLE_MBR_ACTION_STEPS,
+                        )[0]
+                        failed_trajectory_features.setdefault(
+                            active_anchor.program_id, []
+                        ).append(failed_feature)
+                    anchor_action_chunks[target_anchor.anchor_id] = []
                     if CYCLE_DYNAMIC_BUDGET_ENABLED:
                         remaining_extra = max(
                             0,
@@ -1316,6 +1555,9 @@ def _run_episode_cycle(
                         "to_anchor_id": target_anchor.anchor_id,
                         "to_target_object": target_anchor.target_object,
                         "decision_reason": decision.reason,
+                        "failed_trajectory_feature_count": len(
+                            failed_trajectory_features.get(active_anchor.program_id, ())
+                        ),
                         "target_history_index": target_history_index,
                         "final_history_index": rewind_report.final_history_index,
                         "source_history_steps": rewind_report.source_history_steps,
@@ -1438,6 +1680,12 @@ def _run_episode_cycle(
                         "forced_alignment": replan_forced_alignment,
                         "condition": replanned_condition,
                         "previous_condition": target_anchor.condition,
+                        "planner_enabled": method != "direct-cycle",
+                        "low_level_condition_mode": (
+                            "raw_task_constant"
+                            if method == "direct-cycle"
+                            else "cycle_subtask_template"
+                        ),
                     }
                     restored_frame = policy_frame(observation, overall_task, env_preprocessor)
                     phase = CyclePhase.MBR_RETRY
@@ -1484,7 +1732,8 @@ def _run_episode_cycle(
                 ):
                     _finish_active_subtask()
             elif (
-                signal_source == "missing_7d"
+                not raw_task_continuation
+                and signal_source == "missing_7d"
                 and active_attempt_chunks >= low_level_chunks_per_plan
             ):
                 _finish_active_subtask()
@@ -1540,6 +1789,13 @@ def _run_episode_cycle(
         "video_path": str(video_path),
         "chunks": chunks,
         "cycle_enabled": True,
+        "planner_enabled": method != "direct-cycle",
+        "memory_enabled": False,
+        "low_level_condition_mode": (
+            "raw_task_constant" if method == "direct-cycle" else "cycle_subtask_template"
+        ),
+        "cycle_internal_program": True,
+        "cycle_predictor_enabled": cycle_predictor is not None,
         "cycle_signal_mode": cycle_signal_mode,
         "cycle_trigger_mode": cycle_trigger_mode,
         "cycle_program": list(cycle_program_text),
@@ -1570,6 +1826,169 @@ def _run_episode_cycle(
     return episode_result, episode_records, tensors, evaluator_images
 
 
+def _run_episode_direct(
+    *,
+    task_spec: dict[str, Any],
+    method: str,
+    seed: int,
+    episode_index: int,
+    run_dir: Path,
+    policy,
+    preprocessor,
+    postprocessor,
+    step_progress=None,
+) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
+    """Run a visual closed loop with the original task as the constant prompt.
+
+    This path deliberately has no planner, semantic action, memory, or evaluator
+    inputs.  The policy is still re-inferred after each executed action chunk so
+    the experiment measures closed-loop direct VLA control rather than one-chunk
+    open-loop execution.
+    """
+
+    if method != "direct":
+        raise ValueError(f"direct episode requires method='direct'; got {method!r}")
+    budget_max_steps = evaluation_budget_max_steps(task_spec)
+    envs, env, env_preprocessor, env_postprocessor = make_single_env(
+        task_spec,
+        episode_index,
+        budget_max_steps=budget_max_steps,
+    )
+    episode_seed = int(seed) + episode_index
+    video_path = run_dir / "videos" / f"episode_{episode_index}.mp4"
+    frames: list[np.ndarray] = []
+    action_chunks: list[torch.Tensor] = []
+    actions: list[torch.Tensor] = []
+    rewards: list[float] = []
+    chunks: list[dict] = []
+    overall_task = ""
+    success = False
+    episode_done = False
+    termination_reason: str | None = None
+
+    try:
+        reset_rollout_state(policy, preprocessor, postprocessor, episode_seed)
+        observation, _ = env.reset(seed=[episode_seed])
+        overall_task = list(env.call("task_description"))[0]
+        condition = _direct_condition(overall_task)
+        frames.append(env.render()[0])
+
+        while len(actions) < budget_max_steps and not success and not episode_done:
+            low_level_chunk_index = len(action_chunks)
+            _atomic_write_json(
+                run_dir / "progress.json",
+                {
+                    "task": task_spec["name"],
+                    "method": method,
+                    "seed": int(seed),
+                    "episode_index": episode_index,
+                    "low_level_chunk_index": low_level_chunk_index,
+                    "steps": len(actions),
+                    "max_steps": budget_max_steps,
+                    "planner_enabled": False,
+                    "low_level_condition_mode": "raw_task_constant",
+                },
+            )
+            if step_progress is not None:
+                step_progress.set_postfix_str(
+                    f"low={low_level_chunk_index} planner=disabled prompt=raw-task",
+                    refresh=True,
+                )
+            frame = policy_frame(observation, overall_task, env_preprocessor)
+            conditioned_frame = dict(frame)
+            conditioned_frame["task"] = [condition]
+            batch = preprocessor(conditioned_frame)
+            noise = coordinate_flow_noise(
+                policy,
+                seed,
+                episode_index,
+                low_level_chunk_index,
+                device="cuda",
+            )
+            with torch.inference_mode():
+                normalized_chunk = policy.predict_action_chunk(batch, noise=noise)
+            del noise
+            action_chunk = postprocessor(normalized_chunk).squeeze(0)
+            if action_chunk.shape[0] != policy.config.chunk_size:
+                raise ValueError(
+                    "predict_action_chunk must return the complete configured action chunk"
+                )
+            action_chunks.append(action_chunk.detach().cpu())
+            del batch, normalized_chunk
+            action_start_step = len(actions)
+
+            for action in action_chunk[:POLICY_ACTION_STEPS]:
+                action_transition = env_postprocessor({"action": action.unsqueeze(0)})
+                env_action = action_transition["action"].detach().cpu()
+                observation, reward, terminated, truncated, info = env.step(
+                    env_action.numpy()
+                )
+                actions.append(env_action.squeeze(0).clone())
+                rewards.append(float(reward[0]))
+                frames.append(env.render()[0])
+                if step_progress is not None:
+                    step_progress.update(1)
+                episode_done = bool(terminated[0] or truncated[0])
+                success = success or success_from_info(info)
+                if success:
+                    termination_reason = "environment_success"
+                elif episode_done:
+                    termination_reason = "environment_done"
+                elif len(actions) >= budget_max_steps:
+                    termination_reason = "max_steps"
+                if episode_done or success or len(actions) >= budget_max_steps:
+                    break
+
+            chunks.append(
+                {
+                    "chunk_index": low_level_chunk_index,
+                    "condition": condition,
+                    "action_start_step": action_start_step,
+                    "action_end_step": len(actions),
+                    "planner_enabled": False,
+                    "low_level_condition_mode": "raw_task_constant",
+                    "return": 0.0,
+                }
+            )
+    finally:
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if frames:
+                write_video(video_path, frames, env.metadata.get("render_fps", 80))
+        finally:
+            close_envs(envs)
+
+    if termination_reason is None:
+        termination_reason = "max_steps"
+    tensors = _episode_tensors(action_chunks, actions, rewards, policy)
+    episode_result = {
+        "episode_index": episode_index,
+        "init_state_id": episode_index,
+        "task": overall_task,
+        "success": bool(success),
+        "termination_mode": "environment_only_raw_task_v1",
+        "termination_reason": termination_reason,
+        "steps": len(actions),
+        "sum_reward": float(sum(rewards)),
+        "max_reward": float(max(rewards, default=0.0)),
+        "chunk_count": len(chunks),
+        "high_level_step_count": 0,
+        "low_level_chunk_count": len(action_chunks),
+        "video_path": str(video_path),
+        "chunks": chunks,
+        "planner_enabled": False,
+        "memory_enabled": False,
+        "low_level_condition_mode": "raw_task_constant",
+        "low_level_condition": _direct_condition(overall_task),
+        "cycle_enabled": False,
+        "cycle_internal_program": False,
+        "cycle_predictor_enabled": False,
+        "cycle_budget_mode": CYCLE_BUDGET_MODE,
+        "cycle_budget_max_steps": int(budget_max_steps),
+    }
+    return episode_result, [], tensors, []
+
+
 def _run_episode(
     *,
     task_spec: dict[str, Any],
@@ -1586,6 +2005,18 @@ def _run_episode(
     cycle_predictor=None,
     step_progress=None,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
+    if method == "direct":
+        return _run_episode_direct(
+            task_spec=task_spec,
+            method=method,
+            seed=seed,
+            episode_index=episode_index,
+            run_dir=run_dir,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            step_progress=step_progress,
+        )
     if method in CYCLE_METHODS:
         return _run_episode_cycle(
             task_spec=task_spec,
@@ -2014,7 +2445,7 @@ def summarize_run(
 
 
 def load_experiment_models(
-    *, need_evaluator: bool, need_cycle_predictor: bool = False
+    *, need_planner: bool = True, need_evaluator: bool, need_cycle_predictor: bool = False
 ) -> dict:
     """Load planner, policy and (optionally) evaluator once for reuse across runs.
 
@@ -2022,10 +2453,14 @@ def load_experiment_models(
     repeatedly unload and reload them.
     """
 
-    planner_model, planner_processor = load_jitrl_planner()
+    planner_model, planner_processor = (
+        load_jitrl_planner() if need_planner else (None, None)
+    )
     policy, preprocessor, postprocessor = load_policy()
     evaluator = (
-        QwenChunkEvaluator(planner_model, planner_processor) if need_evaluator else None
+        QwenChunkEvaluator(planner_model, planner_processor)
+        if need_evaluator
+        else None
     )
     cycle_predictor = load_cycle_failure_predictor() if need_cycle_predictor else None
     return {
@@ -2141,7 +2576,8 @@ def run_jitrl_experiment(
                 f"[load] task={task_name} method={method} seed={seed}: "
                 "loading Qwen planner"
             )
-            planner_model, planner_processor = load_jitrl_planner()
+            if method not in DIRECT_METHODS:
+                planner_model, planner_processor = load_jitrl_planner()
             if method in MEMORY_METHODS:
                 tqdm.write(
                     f"[load] task={task_name} method={method} seed={seed}: "

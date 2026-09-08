@@ -6,6 +6,7 @@ from jitpi05.jitrl.cycle import (
     CycleSubtask,
     adapt_cycle_policy_output,
     build_cycle_subtask_program,
+    cumulative_pose_trajectory_features,
     cumulative_trajectory_features,
     format_cycle_condition,
     format_cycle_subtask_program,
@@ -45,6 +46,35 @@ def test_pairwise_l2_distances_are_symmetric_with_zero_diagonal() -> None:
     assert torch.allclose(torch.diag(distances), torch.zeros(3))
     assert distances[0, 1].item() == pytest.approx(5.0)
     assert distances[0, 2].item() == pytest.approx(4.0)
+
+
+def test_pose_features_compose_rotation_deltas() -> None:
+    chunks = torch.zeros(1, 2, 7)
+    chunks[0, 0, 3] = torch.pi / 2
+    chunks[0, 1, 3] = torch.pi / 2
+
+    features = cumulative_pose_trajectory_features(chunks, action_steps=2)
+
+    assert features.shape == (1, 12)
+    assert features[0, 3:6].tolist() == pytest.approx([torch.pi / 2, 0.0, 0.0])
+    assert features[0, 9:12].tolist() == pytest.approx([torch.pi, 0.0, 0.0])
+
+
+def test_mbr_accepts_failed_trajectory_features_and_exposes_scores() -> None:
+    chunks = torch.zeros(3, 2, 7)
+    chunks[1, :, 0] = 1.0
+    chunks[2, :, 0] = 2.0
+    failed = cumulative_pose_trajectory_features(chunks[0:1], action_steps=2)[0]
+
+    result = select_mbr_medoid(
+        chunks,
+        action_steps=2,
+        failed_trajectories=[failed],
+    )
+
+    assert len(result.scores) == 3
+    assert result.selection_mode == "rep"
+    assert all(torch.isfinite(torch.tensor(result.scores)))
 
 
 def test_mbr_selects_medoid_and_returns_original_candidate() -> None:

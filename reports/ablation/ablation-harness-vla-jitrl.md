@@ -244,3 +244,95 @@ trace 中出现过 `Current subtask: align the gripper with empty` 以及在 boo
 2. **本轮 Cycle 未提升严格口径成功率**：所有 Cycle 方法的 strict 均为 0%，与 static-free（10%）/jitrl-free（10%）相比无优势；跨方法成功率差异主要来自环境终止下的可复现波动，而非 Cycle 的增益。
 3. **运行稳健性**：120 集全部跑满，无 `executing action in terminated episode`、无 `planner failed after 7 attempts`。robosuite horizon 修复与 Qwen 降级兜底均按预期工作；`task7 static-free-cycle` 从上一版 0% 提升到本轮 10%，说明降级后仍保留了有效 rollout。
 4. **限定**：仅 seed 17、每方法 10 episodes、同一 run 内 episode 顺序相关；task9/多数 task 成功率 0%~10%，样本稀疏，任务级区间仅为描述性，不能做跨 seed 统计推断。
+
+## 8. Direct-VLA × Cycle-lite 多 seed 结果（新增维度）
+
+> 数据来源：`artifacts/direct_cycle_full_libero90_seed17_23_29/`（8 个 LIBERO-90 候选任务，`direct`/`direct-cycle`，seed 17/23/29，每组合 10 episodes；**部分组合未跑满**，见 8.2 完整性清单）。
+> 注：该目录中的 `summary.json` 为旧版（仅汇总 seed 17 的 16 个 run），本节所有数字直接读取磁盘上的各 run `episodes.json` 重新聚合，不以旧 summary 为准。
+
+### 8.1 实验定义
+
+- `direct`：不加载、不调用高层 Qwen；冻结 π₀.₅（LeRobot `pi05-libero`）在视觉闭环中反复预测动作，整个 episode 的低层语言条件恒为原始 `task_description`（`low_level_condition_mode=raw_task_constant`）。
+- `direct-cycle`：同样完全跳过 Qwen；Cycle 内部使用确定性 subtask 程序组织 checkpoint、物理证据、VLM failure check、rewind 与 MBR retry，但内部程序文本绝不传入低层，低层条件始终为原始总任务。
+- 严格预算：统一 800 步（`CYCLE_UNIFIED_MAX_STEPS`），供跨方法公平比较。
+- 动态预算：`direct-cycle` 触发回溯时最多扩展到 1600 步，仅作恢复诊断。
+- P0 修复已生效：MBR 使用 6D 累计位姿特征（平移 + 旋转组合）、r-NN pocket + robust normalization + failed-trajectory repulsion、候选按 subtask 缓存并递进使用、选中 chunk 剩余动作排空执行、program 耗尽后进入唯一 `raw-task-continuation`。
+
+### 8.2 数据完整性清单
+
+| 任务 | direct | direct-cycle | 完整性 |
+|---|---:|---:|---|
+| `libero_90_task19` | 3×10=30 | 3×10=30 | ✅ |
+| `libero_90_task27` | 30 | 30 | ✅ |
+| `libero_90_task53` | 30 | 30 | ✅ |
+| `libero_90_task59` | 30 | 30 | ✅ |
+| `libero_90_task60` | 30 | 30 | ✅ |
+| `libero_90_task62` | 30 | **24**（seed29 仅 4 集，中断） | ⚠️ 缺 6 |
+| `libero_90_task69` | **10**（仅 seed17） | 10 | ⚠️ 缺 20 |
+| `libero_90_task79` | **10**（仅 seed17） | 10 | ⚠️ 缺 20 |
+| 合计 | **200** | **194** | 缺 46 |
+
+### 8.3 总体结果（按可用数据）
+
+| 口径 | `direct` | `direct-cycle` | 差值 |
+|---|---:|---:|---:|
+| 动态最终成功率 | 87/200 = **43.5%** | 52/194 = **26.8%** | **−16.7pt** |
+| 严格 800 步成功率 | 87/200 = **43.5%** | 35/194 = **18.0%** | **−25.5pt** |
+
+关键事实：`direct-cycle` 的 52 个动态成功中有 17 个依赖超出 800 步的恢复预算（52−35=17）。即其“成功”在很大程度上来自允许更多步数，而非恢复机制真正把失败转为成功。
+
+### 8.4 逐任务 Pooled（所有可用 seed）
+
+| 任务 | `direct` | `direct-cycle`（动态） | `direct-cycle`（严格） |
+|---|---:|---:|---:|
+| `libero_90_task19` | **30/30 = 100%** | 13/30 = 43% | 5/30 = 17% |
+| `libero_90_task27` | 0/30 | 0/30 | 0/30 |
+| `libero_90_task53` | 0/30 | 0/30 | 0/30 |
+| `libero_90_task59` | **21/30 = 70%** | 8/30 = 27% | 1/30 = 3% |
+| `libero_90_task60` | **30/30 = 100%** | 24/30 = 80% | 22/30 = 73% |
+| `libero_90_task62` | 0/30 | 1/24 = 4% | 1/24 = 4% |
+| `libero_90_task69` | 2/10 = 20% | 2/10 = 20% | 2/10 = 20% |
+| `libero_90_task79` | 4/10 = 40% | 4/10 = 40% | 4/10 = 40% |
+
+### 8.5 配对 Harm / Rescue（多 seed）
+
+动态口径：
+
+| 关系 | 数量 |
+|---|---:|
+| 两者都成功 | 48 |
+| **仅 `direct` 成功（Cycle harm）** | **39** |
+| 仅 `direct-cycle` 成功（rescue） | 4 |
+| 两者都失败 | 103 |
+
+严格 800 步口径：
+
+| 关系 | 数量 |
+|---|---:|
+| 两者都成功 | 34 |
+| **仅 `direct` 成功（harm）** | **53** |
+| 仅 `direct-cycle` 成功（rescue） | **1** |
+| 两者都失败 | 106 |
+
+### 8.6 跨 seed 一致性
+
+- **task19（30/30 → 13/30）**：三个 seed 的 `direct` 均为 10/10；`direct-cycle` 分别 6/10、4/10、3/10，三 seed 全部削弱 40–70pt。伴随 59 次 backtrack、472 个 MBR hypotheses 等典型过度恢复行为，是“Cycle 系统性干扰正常执行”的最干净证据。
+- **task59（21/30 → 8/30）**：三 seed 的 `direct` 分别为 7、9、5；`direct-cycle` 分别为 5、1、2，全部削弱；严格预算下仅 seed23 的 1 个成功。
+- **task60（30/30 → 24/30）**：三 seed 全部削弱 10–30pt，且 backtrack 较少——说明即使恢复不频繁，内部程序/检查机制也会改变原本能完成的 raw-task 执行。
+- **task62（0/30 → 1/24）**：唯一 rescue 出现在 seed17 的 1 个 episode；seed23 与 seed29（4 集）均为 0。
+- **task69 / task79**：仅 seed17，两方法结果完全一致（2/10、4/10），Cycle 无回溯、无 MBR，说明这两个任务上 Cycle 未改变行为；样本不足。
+
+### 8.7 结论
+
+在当前 **冻结 7D π₀.₅ + raw-task constant condition + fixed-horizon/物理证据代理的 Cycle-lite 推理包装**下：
+
+> `direct` 达到 43.5% 动态成功率，`direct-cycle` 仅 26.8%（严格 800 步 18.0%）；跨 seed 配对统计中 Cycle 造成 39（动态）/ 53（严格）个 episode 的 harm，仅产生 4（动态）/ 1（严格）个 rescue；效果在 task19、task59、task60 上稳定为负，task27/53 双方均失败，task69/79 无差异。当前 Cycle-lite 推理包装在该条件下未展现成功率收益，且其“动态成功”严重依赖超出统一预算的恢复步数。
+
+该结论与单 seed 面板一致，但因含跨 seed 稳定性证据而更可信。它仍应限定为“当前 7D + raw-task + fixed-horizon Cycle-lite 实现”的边界，**不能**直接外推为“CycleVLA 无效”——论文核心是训练得到的 9D subtask-aware policy（learned stop/progress），当前缺失该训练侧条件是效果差异最可能的根本原因（参见 [`cyclevla-vs-official-reproduction-gap.md`](../issues/cyclevla-vs-official-reproduction-gap.md)）。
+
+### 8.8 限定
+
+- 数据不完整：task62 缺 6 集（seed29 中断），task69/task79 仅 seed17；总可用 200（direct）/ 194（direct-cycle）集，不是完整 3×8×2×10=480 集。
+- 目录内 `summary.json` 为旧版，只汇总 seed 17；如需正式汇总，应补齐缺失组合后重新 `--summarize-only`，或按 8.2–8.5 的可用子集口径手工聚合。
+- 同一 run 内 `direct-cycle` 的 episode 之间通过 Cycle 内部状态/失败轨迹缓存存在顺序相关（MBR 候选与 failed-trajectory 累积），不能当作独立重复样本。
+- 严格预算口径才是跨方法公平比较的主指标；动态预算成功率只描述恢复能力，且当前表现为过度依赖额外步数。

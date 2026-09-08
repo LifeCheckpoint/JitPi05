@@ -7,6 +7,7 @@
 - **LeRobot π₀.₅ LIBERO**：把总任务与 subtask 组成低层语言条件，显式执行 prefix 编码、KV cache、10 步 flow-matching 去噪和反归一化。
 - **四组对照**：原始任务、人工 subtask、Qwen subtask、调制后的 Qwen subtask。
 - **JitRL 第一阶段**：Qwen3.5-2B 基于固定九类语义动作工作集完成状态抽象、参数绑定和基础策略 logits；任务内在线记忆只估计当前 Qwen 动作的 advantage。Gemini 仅在 episode 结束后提供视觉 step reward。
+- **Direct-VLA × Cycle 新对照**：`direct`/`direct-cycle` 完全跳过高层 Qwen；冻结 π₀.₅ 在视觉闭环中始终接收原始总任务，后者额外启用 Cycle 的内部程序、失败检测、回溯和 MBR 重试。
 
 代码采用可安装的 `src/jitpi05` 包结构：
 
@@ -97,6 +98,23 @@ Rollout 期间 memory 只读；episode 完成并评价后才批量写入，避�
 - `libero_pro`：LIBERO-Pro 扰动面板（object / position(swap) / semantic(lan) / task 四维扰动，基于 libero_10 的 10 个长任务），用于泛化 robustness 消融。低层策略切换为 RLinf-Pi05-LIBERO-130-fullshot-SFT（见下方「RLinf π0.5 低层策略」）。Cycle 方法额外记录严格 `success@800` 与动态恢复预算下的最终成功，避免把 Cycle 额外步数误当作公平主比较结果。
 
 默认规模为 `tasks × methods × 10 episodes × 1 seed`；四方法完整面板（`jitrl-free`、`static-free`、`jitrl`、`static`）为 `10 tasks × 4 methods × 10 episodes = 400 rollouts`。结果仍然是当前 JitRL/Static 分层系统的评测，不等同于 direct `lerobot-eval` baseline。
+
+### Direct-VLA × Cycle 对照
+
+新增 `direct` 与 `direct-cycle` 用于隔离 Cycle 恢复机制是否在**没有高层语言规划**时仍然有效：
+
+- `direct`：不加载、不调用 Qwen；每次视觉闭环重规划仍重新调用冻结 π₀.₅，但整个 episode 的语言条件恒为原始 `task_description`。
+- `direct-cycle`：同样不加载、不调用 Qwen；Cycle 内部仍使用确定性 subtask 程序组织 checkpoint、物理证据、VLM failure check、rewind 和 MBR retry，但程序节点文本绝不传给 π₀.₅，低层条件始终是原始总任务。
+
+两者的主比较是 `direct-cycle - direct`。两种方法使用相同 task、init state、seed 和 flow-noise 坐标；严格成功率使用统一预算，动态额外预算只作为恢复诊断指标。“跳过语言模型”特指跳过高层 planner；`direct-cycle` 仍可调用 Cycle failure predictor。
+
+LIBERO-90 单任务冒烟示例：
+
+```bash
+MUJOCO_GL=egl JITPI05_JITRL_PANEL=libero90 uv run jitpi05-eval-jitrl \
+  --task libero_90_task79 --method direct --method direct-cycle \
+  --seed 17 --episodes 1 --output-dir artifacts/direct_cycle_smoke
+```
 
 建议先运行一个小型子集，确认环境、checkpoint 和高层接口正常（LIBERO-10 面板下固定工作集方法 `jitrl`/`static`）：
 

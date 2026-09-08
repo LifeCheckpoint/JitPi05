@@ -12,6 +12,7 @@ dependencies = [
     "accelerate>=1.12,<2",
     "bitsandbytes>=0.49,<0.50",
     "flash-linear-attention[cuda]>=0.5.1,<0.6",
+    "socksio>=1.0.0,<2",
     "lerobot[evaluation,libero,pi]>=0.6,<0.7",
     "numpy>=2.0,<2.3",
     "pillow>=10,<13",
