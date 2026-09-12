@@ -124,7 +124,10 @@ CYCLE_CONFIG_VERSION = "cyclevla_lite_inference_p1_v4_smooth_rewind_unified_800"
 CYCLE_PROGRESS_THRESHOLD = 0.90
 CYCLE_PROXY_PROGRESS_THRESHOLD = 0.75
 CYCLE_STOP_SIGNAL_THRESHOLD = 0.50
-CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 3
+# 官方用 learned progress 信号触发 VLM 检查（子任务 ~90% 进度）；7D stock
+# 策略没有该信号，这里退化为固定 chunk 数代理。open-loop 已对齐官方 5 步，
+# 因此 6 个 chunk = 30 步，与旧 3 chunks × 10 步保持相同的物理检查窗口。
+CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS = 6
 CYCLE_SIGNAL_CONFIRM_CONSECUTIVE = 2
 CYCLE_SIGNAL_CONFIRM_GAP = 2
 CYCLE_MAX_RETRIES = 3
@@ -133,6 +136,9 @@ CYCLE_MAX_RETRIES = 3
 # explicitly selects the same unified 800-step budget for both methods.
 CYCLE_BUDGET_MODE = "unified_800"
 CYCLE_UNIFIED_MAX_STEPS = 800
+# 官方 evaluator 的 episode 预算 = TASK_MAX_STEPS * 1.5 + num_steps_wait。
+# 选择 ``official_1p5x`` 时按该公式计算，与 CycleVLA 论文口径一致。
+CYCLE_OFFICIAL_BUDGET_MULTIPLIER = 1.5
 CYCLE_RETRY_BUDGET_PER_BACKTRACK = 120
 CYCLE_RETRY_TOTAL_BUDGET = CYCLE_MAX_RETRIES * CYCLE_RETRY_BUDGET_PER_BACKTRACK
 # Cycle recovery 诊断预算：接受一次有效回溯时立即增加预算，保证 rewind 本身
@@ -142,9 +148,42 @@ CYCLE_BACKTRACK_EXTRA_BUDGET = 400
 CYCLE_MAX_EXTRA_BUDGET = 800
 CYCLE_MAX_DYNAMIC_STEPS = CYCLE_UNIFIED_MAX_STEPS + CYCLE_MAX_EXTRA_BUDGET
 CYCLE_MBR_HYPOTHESES = 8
-CYCLE_MBR_ACTION_STEPS = 10
+# 官方 MBR 特征长度 = num_open_loop_steps * 6 = 5 * 6 = 30。
+CYCLE_MBR_ACTION_STEPS = 5
 CYCLE_MBR_DELTA_DIMS = 6
+# 官方 ``mbr_use_failed_repulsion`` 默认 False；失败轨迹排斥仅作显式消融。
+CYCLE_MBR_USE_FAILED_REPULSION = False
 CYCLE_PREDICTOR_RETRIES = 3
+# 同状态反事实恢复诊断：仅在已接受的回溯事件上执行；分支动作不写回正式 rollout。
+# 步数上限 0 表示使用「剩余 episode 预算」，对齐官方「回溯后继续到 episode
+# 结束」的语义（官方不存在独立短窗口）。>0 时截断，仅用于快速调试。
+CYCLE_COUNTERFACTUAL_HORIZON_STEPS = 0
+# 每个 episode 最多诊断多少个回溯事件。分支会各自跑完剩余预算，成本近似
+# 「事件数 × 分支数 × 剩余步数」，因此默认 1 已足以获得事件级配对样本。
+CYCLE_COUNTERFACTUAL_MAX_EVENTS_PER_EPISODE = 1
+# 只对每第 N 个 episode 做反事实诊断（1 = 全部）。诊断成本与 episode 数线性
+# 相关，抽样可在保持配对统计的同时按比例节省时间。
+CYCLE_COUNTERFACTUAL_EPISODE_STRIDE = 1
+# 可诊断分支子集。默认全开；速度受限时可裁剪为
+# ("no_op", "full_cycle") 或 ("no_op", "target_only", "full_cycle")。
+# 环境变量 ``JITPI05_COUNTERFACTUAL_BRANCHES`` 以逗号分隔覆盖。
+CYCLE_COUNTERFACTUAL_BRANCHES: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "JITPI05_COUNTERFACTUAL_BRANCHES",
+        "no_op,target_only,rewind_only,mbr_only,full_cycle",
+    ).split(",")
+    if name.strip()
+)
+# 关闭视频渲染可省去每控制步一次 ``env.render()``（CPU 侧开销，推理侧无关）。
+# 环境变量 ``JITPI05_RECORD_VIDEO=false`` 可关闭。
+CYCLE_RECORD_VIDEO = os.environ.get("JITPI05_RECORD_VIDEO", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# 官方 ``num_steps_wait=10``：episode 起始用 dummy action 让物体稳定。
+CYCLE_NUM_STEPS_WAIT = 10
 # Paper-faithful anti-sycophancy default: only low likelihood can backtrack.
 CYCLE_VLM_BACKTRACK_LIKELIHOODS = ("low",)
 # None keeps simulator-side gripper inference disabled until calibrated.
@@ -200,11 +239,10 @@ if JITRL_LOW_LEVEL_BACKEND not in ("lerobot", "rlinf"):
     )
 
 # OpenPI 官方 LIBERO evaluator 每次只执行预测 chunk 的前 5 步，然后重新
-# 观测并推理。仅 RLinf 后端采用该协议；LeRobot 基线保持原来的 10 步。
+# 观测并推理（``num_open_loop_steps=5``，模型 chunk_size 仍为 10）。为与
+# 官方协议对齐，LeRobot 与 RLinf 两个后端统一使用 5 步 open-loop。
 RLINF_ACTION_STEPS = 5
-POLICY_ACTION_STEPS = (
-    RLINF_ACTION_STEPS if JITRL_LOW_LEVEL_BACKEND == "rlinf" else SIM_ACTION_STEPS
-)
+POLICY_ACTION_STEPS = RLINF_ACTION_STEPS
 # RLinf 的正式 JitRL 消融必须让高层选出的 semantic subtask 进入低层语言条件，
 # 否则 memory advantage 的策略变化无法传导到环境动作。默认使用与 LeRobot 相同的
 # ``Overall task + Current subtask`` 条件化格式。若只想复现 OpenPI 官方的 raw-task

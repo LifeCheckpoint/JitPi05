@@ -119,8 +119,16 @@ def cumulative_pose_trajectory_features(
     action_chunks: torch.Tensor | Sequence[Any],
     *,
     action_steps: int | None = None,
+    initial_pose: tuple[Sequence[float], Sequence[float]] | None = None,
 ) -> torch.Tensor:
-    """Build official-style cumulative EEF features: position + composed rotation."""
+    """Build official-style cumulative EEF features: position + composed rotation.
+
+    ``initial_pose`` is the real ``(position_xyz, quaternion_wxyz)`` at the
+    observation that produced the candidates.  Official MBR integrates action
+    deltas onto the actual end-effector pose (``robot0_eef_pos`` /
+    ``robot0_eef_quat``); passing it keeps candidate distances anchored to a
+    physical origin instead of an arbitrary identity frame.
+    """
 
     chunks = _as_action_tensor(action_chunks)
     if isinstance(action_steps, bool) or (
@@ -134,6 +142,19 @@ def cumulative_pose_trajectory_features(
     rotations = []
     current = torch.zeros(chunks.shape[0], 4, dtype=chunks.dtype, device=chunks.device)
     current[:, 0] = 1.0
+    if initial_pose is not None:
+        position, quaternion = initial_pose
+        start_position = torch.as_tensor(
+            list(position)[:3], dtype=chunks.dtype, device=chunks.device
+        ).reshape(1, 3)
+        start_quaternion = torch.as_tensor(
+            list(quaternion)[:4], dtype=chunks.dtype, device=chunks.device
+        ).reshape(1, 4)
+        start_quaternion = start_quaternion / torch.linalg.vector_norm(
+            start_quaternion, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+        positions = positions + start_position
+        current = start_quaternion.expand(chunks.shape[0], 4).clone()
     for step in range(horizon):
         current = _quaternion_multiply(current, increments[:, step])
         rotations.append(_quaternion_to_rotvec(current))
@@ -172,12 +193,14 @@ def select_mbr_medoid(
     delta_dims: int = 6,
     failed_trajectories: Sequence[Any] = (),
     selection_mode: Literal["rep", "away"] = "rep",
+    initial_pose: tuple[Sequence[float], Sequence[float]] | None = None,
 ) -> MBRSelection:
     """Select an MBR hypothesis using CycleVLA's density/repulsion ranking."""
 
     features = cumulative_pose_trajectory_features(
         action_chunks,
         action_steps=action_steps,
+        initial_pose=initial_pose,
     )
     distances = pairwise_l2_distances(features)
     count = features.shape[0]
@@ -235,6 +258,7 @@ def select_mbr_chunk(
     delta_dims: int = 6,
     failed_trajectories: Sequence[Any] = (),
     selection_mode: Literal["rep", "away"] = "rep",
+    initial_pose: tuple[Sequence[float], Sequence[float]] | None = None,
 ) -> tuple[torch.Tensor, MBRSelection]:
     """Return the selected original chunk without averaging or modifying it."""
 
@@ -245,6 +269,7 @@ def select_mbr_chunk(
         delta_dims=delta_dims,
         failed_trajectories=failed_trajectories,
         selection_mode=selection_mode,
+        initial_pose=initial_pose,
     )
     return chunks[selection.selected_index], selection
 

@@ -1,14 +1,14 @@
 import pytest
 
 from jitpi05.config import (
-    CYCLE_BUDGET_MODE,
     CYCLE_BACKTRACK_EXTRA_BUDGET,
+    CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_EVALUATION,
     CYCLE_JITRL_METHODS,
-    CYCLE_MAX_RETRIES,
     CYCLE_MAX_DYNAMIC_STEPS,
     CYCLE_MAX_EXTRA_BUDGET,
+    CYCLE_MAX_RETRIES,
     CYCLE_MBR_HYPOTHESES,
     CYCLE_PROGRESS_THRESHOLD,
     CYCLE_RETRY_BUDGET_PER_BACKTRACK,
@@ -41,7 +41,8 @@ def test_cycle_configuration_keeps_four_way_comparison_opt_in() -> None:
         "jitrl-free-cycle",
     )
     assert CYCLE_PROGRESS_THRESHOLD == pytest.approx(0.90)
-    assert CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS == 3
+    # open-loop 对齐官方 5 步后，6 chunks = 30 步，保持原有物理检查窗口。
+    assert CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS == 6
     assert CYCLE_MBR_HYPOTHESES == 8
     assert 59 in CYCLE_EVALUATION.libero90_candidates
     assert (

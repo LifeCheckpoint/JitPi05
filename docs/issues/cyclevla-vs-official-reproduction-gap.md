@@ -192,3 +192,137 @@
 | 21 | 代理 stop 审计指标 | 无 | `cycle_proxy_stop_finish_count`、`cycle_self_target_request_count/rate`、`cycle_replan_count/rate` | ➕ |
 
 **结论**：推理侧状态机已与官方对齐（子任务模板、双视角 VLM、gripper 特判、retry 超限、物理回退、回溯后重做目标），并新增官方没有的物体级证据与审计；**核心不一致仍是训练侧**（9D subtask-aware policy + learned stop/progress，第 1/2/16 行），以及因此衍生的触发时机（第 6 行）、MBR 精度（第 14 行）与 budget（第 15 行）。其中第 5 行 VLM 回溯门槛比官方保守，可能是效果差异来源之一。
+
+---
+
+## 8. 同状态反事实恢复实验：中间结果（formal_v2，8/12 run）
+
+实验设计：从同一个完整 MuJoCo 快照出发，对比 `no_op`（原 condition 继续）、`target_only`（切目标模板 condition）、
+`full_cycle`（回溯 + 目标 condition + MBR）三条分支，分支 horizon = 剩余 episode 预算（对齐官方 `1.5x` 语义）。
+运行配置已启用全部加速旋钮：`JITPI05_COUNTERFACTUAL_BRANCHES=no_op,target_only,full_cycle`、`JITPI05_RECORD_VIDEO=false`。
+
+### 8.1 配对结果（64 个事件，8 个完成 run）
+
+| branch | paired | rescue | harm | both_success | both_failure | net_rescue |
+|--------|--------|--------|------|--------------|--------------|-----------|
+| `full_cycle`（static-free-cycle） | 42 | 2 | 2 | 1 | 37 | **+0** |
+| `target_only`（static-free-cycle） | 42 | 0 | 3 | 0 | 39 | **-3** |
+| `target_only` / `full_cycle`（direct-cycle） | 22 | 0 | 0 | 0 | 22 | **+0** |
+
+### 8.2 三条硬结论
+
+1. **`full_cycle` 的净恢复收益为 0。** 逐事件联合分布：`both_failed=59`、`both_succeeded=1`、
+   `full_cycle_only=2`、`no_op_only=2`。回溯+MBR 救回 2 个事件、同时毁掉 2 个事件，**完全相互抵消**。
+   这是本实验最关键的结果：它把"MBR 是否有用"从"平均成功率差异"（会被噪声淹没）转化为**paired 判别量**，
+   答案是"有正效应，但被等量的负效应抵消"。
+
+2. **`target_only` 的 -3 是纯 prompt 切换损伤，不是恢复能力不足。** 在 `direct-cycle` 下 anchor condition
+   就是 raw task prompt（[`_direct_condition()`](src/jitpi05/jitrl/rollout.py:162)），因此 `no_op` 与 `target_only`
+   配置**完全等价**；实测 22/22 事件的 `success`/`executed_steps`/`termination_reason` 三项**逐字节相同**。
+   这既是分支隔离正确性的强验证，也说明 `target_only` 的失败不能归因于"没回溯"，
+   而应归因于 condition 文本本身在该任务上更难执行。
+
+3. **触发精度只有 4.7%。** `no_op` 在 64 个被判定为失败的事件中仍有 3 个成功，
+   即 VLM/物理检查的**假阳性率 ≈ 4.7%**。但代价不对称：一次假阳性触发一次完整回溯，
+   平均回放 53 个 waypoint（见 8.3），而这些步数对预算是"免费"的、对物理是真实的。
+
+### 8.3 回溯规模（修正版：早期脚本读错了字段名）
+
+⚠️ **本节数据经过一次修正。** 早先的分析脚本把 `recovery_events` 里的
+`target_anchor_id` / `waypoint_indices` 当作每个事件的字段，但该列表**交错两种事件类型**：
+
+- `backtrack` → `from_anchor_id` / `to_anchor_id` / `replayed_steps` / `waypoint_indices`
+- `mbr_retry` → `anchor_id` / `candidate_cursor` / `selected_index` / `failed_trajectory_count`
+
+因此 `len(recovery_events)` 是**真实回溯数的 2 倍**，且 `target_anchor_id` 全部读到 `None`
+（该字段只在 `counterfactual` 事件里存在）。修正后（[`_backtrack_truth.py`](artifacts/counterfactual_recovery_formal_v2/_backtrack_truth.py)）：
+
+| run | checks | backtracks | mbr_retries | replay_sum | replay_mean | backward | self_retry | invalidations |
+|-----|--------|-----------|-------------|-----------|-------------|----------|-----------|---------------|
+| task62/direct-cycle/seed_17 | 105 | 57 | 57 | 2030 | 35.6 | 4 | 53 | 44 |
+| task62/direct-cycle/seed_23 | 105 | 53 | 53 | 2070 | 39.1 | 6 | 47 | 28 |
+| task62/static-free-cycle/seed_17 | 295 | 97 | 95 | 5150 | 53.1 | 26 | 71 | 150 |
+| task62/static-free-cycle/seed_23 | 285 | 102 | 98 | 5565 | 54.6 | 28 | 74 | 169 |
+| task69/static-free-cycle/seed_17 | 347 | 30 | 30 | 2180 | 72.7 | **29** | **1** | 60 |
+| task69/static-free-cycle/seed_23 | 349 | 29 | 29 | 2110 | 72.8 | **28** | **1** | 57 |
+| task79/static-free-cycle/seed_17 | 53 | 11 | 10 | 1160 | 105.5 | 9 | 2 | 45 |
+
+聚合：`checks=1562`、`backtracks=382`、`mbr_retries=375`、`replay steps=20355`（均值 53.3）、
+`backward=130`、`self_retry=252`、`invalidations=553`、**check→backtrack rate = 0.24**。
+
+**修正后的结论与先前相反：回溯目标确实在推进，不存在全局振荡。**
+`retry_counts` 显示每个 target 达 `CYCLE_MAX_RETRIES=3` 即退休并强制 transit
+（task62 典型 episode：`{'anchor-0': 3, 'anchor-1': 1, 'anchor-3': 3}`），
+且 `check→backtrack = 0.24` 说明 76% 的检查判定为"继续"，不是"每次失败都回溯"。
+
+**但两个任务呈现完全相反的失败模式**，这是真正有价值的发现：
+
+- **task62：`self_retry` 占绝对多数**（53/57、47/53）。回溯**退回同一个 anchor**
+  （`to_anchor_id == from_anchor_id`，如 `anchor-1 → anchor-1`），即"原地重试"。
+  `decision_reason` 为 `explicit physical postcondition failure; rewind to earliest valid anchor`。
+  有效后退仅 4–6 次。这是**低效原地打转**。
+- **task69：`backward` 占绝对多数**（29/30、28/29）。回溯**严格退到更早的 anchor**
+  （如 `anchor-2 → anchor-0`），`invalidated_anchor_ids` 累计 60/57 个失效标记。
+  这是**正确的恢复行为**——但成功率仍只有 1/20。
+
+官方 `backtrace_robot_states` 是 **`restore_robot_only` + 每步 `dummy_action` 物理推进**
+（[`run_libero_eval_openpi_cyclevla.py:640-646`](.reference_cyclevla/experiments/robot/libero/run_libero_eval_openpi_cyclevla.py:640)），
+**只回退机器人关节、不回退场景物体**。我们的
+[`rewind_robot_configuration_history()`](src/jitpi05/jitrl/libero_recovery.py:260) 与该语义一致。
+因此 task69 式"正确后退却仍失败"**不是实现缺陷，而是这一机制的固有上限**：
+物体已被撞飞/抓错位时，只回退机器人而不回退场景，重试会重复触发同样的物理失败。
+而 task62 式"原地重试"指向 `select_recovery_anchor` 的目标选择——当
+`physical_failure and target_anchor is None` 时会回落到 `current_anchor`
+（[`cycle.py:850-862`](src/jitpi05/jitrl/cycle.py:850)），这是 self-retry 的来源。
+
+### 8.4 4 个判别性事件（唯一携带信息的样本）
+
+| run | ep | winner | `failure_anchor` | `target` | `full_cycle` rewind | MBR idx |
+|-----|----|--------|------------------|----------|---------------------|---------|
+| task69/static-free/seed_17 | 15 | `no_op` | anchor-1 | anchor-0 | 70 | 1 |
+| task69/static-free/seed_23 | 15 | `full_cycle` | anchor-1 | anchor-0 | 70 | 6 |
+| task69/static-free/seed_23 | 19 | `no_op` | anchor-1 | anchor-0 | 70 | 6 |
+| task79/static-free/seed_17 | 10 | `full_cycle` | anchor-1 | anchor-1 | 30 | 2 |
+
+注意 ep15 在 seed_17 与 seed_23 上**结论相反**（同一任务、同一 episode、同一 target），
+且 seed_23 的 ep15 与 ep19 在**相同配置**（rewind=70、mbr=6）下也结论相反。
+这直接证明：在当前样本量下，`full_cycle` 的 ±2 净效应**落在噪声区间内**，
+任何基于单 seed 的"MBR 有效/无效"判断都不可靠。
+
+### 8.5 对后续实验的设计含义
+
+1. **判别量必须用 paired net_rescue，不能用平均成功率。** 前者已经显示为 +0，避免了"成功率没涨 → MBR 无效"的错误结论。
+2. **样本量不足：需要 ≥6 个判别性事件才能拒绝噪声假设。** 当前 64 事件仅产生 4 个判别样本。
+   提高判别效率的办法是 `CYCLE_COUNTERFACTUAL_BRANCHES=no_op,full_cycle`（去掉冗余的 `target_only`，
+   direct-cycle 下它与 no_op 等价），并把预算从"每 episode 1 个事件"放宽到 ≥3 个。
+3. **瓶颈是"机器人回退 + 场景不回退"的物理不可逆性，优先级高于 MBR 调参。**
+   task69 给出了最干净的证据：`backward=29/30`（回溯策略完全正确）、`invalidations=60`
+   （锚点确实被作废重规划），但成功率仍为 1/20。这说明**问题不在选择哪个 target，
+   而在回退后场景物体已被推到不可恢复的位置**。官方只回退机器人（`restore_robot_only`），
+   我们忠实复现了这一点，所以这是**机制固有上限**而非实现缺陷。
+4. **task62 的 `self_retry` 是一个独立的、可修复的实现问题（已定位到具体分支）。**
+   逐事件核对 `decision_reason` × 回溯方向的交叉分布
+   （[`_self_retry_cause.py`](artifacts/counterfactual_recovery_formal_v2/_self_retry_cause.py)）：
+
+   | task | self_retry（物理失败回落） | backward（物理失败回落） | backward（VLM 强证据） |
+   |------|---------------------------|-------------------------|----------------------|
+   | task62 | **245** | 29 | 35 |
+   | task69 | 5 | **52** | 5 |
+   | task79 | 2 | 5 | 4 |
+
+   关键观察：**task62 与 task69 走的是完全相同的 reason 字符串**
+   （`explicit physical postcondition failure; rewind to earliest valid anchor`），
+   但结果一个是 self_retry、一个是 backward。所以决定因素**不是 reason，而是
+   "是否存在严格更早的同阶段锚点"**：当没有时，
+   [`resolve_cycle_decision()`](src/jitpi05/jitrl/cycle.py:850) 的
+   `min(same_stage, ...)` 回落到 `current_anchor`，产生"原地重试"——
+   回退到当前锚点等于重复同一动作序列，**物理上不可能改变结果**。
+
+   task62 有 **245/309 = 79%** 的回溯落在这一退化路径上，这是它 0/40 episode 的直接原因。
+   修复方向：移除 `current_anchor` 回落，改为**直接 transit**（或只接受严格更早的同阶段锚点）。
+   task69 已证明正确的 backward 路径可正常工作，因此该修复不会破坏已有的正常恢复行为。
+5. **下一步实验应验证场景回退。** `FullEnvironmentSnapshot` 已具备完整快照恢复能力
+   （[`capture_full_environment_state()`](src/jitpi05/jitrl/counterfactual.py:59)），
+   但 rewind 分支未使用它。新增一个 `scene_rewind` 分支做对照，即可直接检验
+   "场景不可逆"这一假设是否成立——若该分支能显著打破 task69 的 1/20 天花板，
+   则说明官方机制的瓶颈确在此处。

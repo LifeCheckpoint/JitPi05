@@ -9,7 +9,9 @@ def test_jitrl_cli_help(capsys) -> None:
     with pytest.raises(SystemExit) as result:
         build_parser().parse_args(["--help"])
     assert result.value.code == 0
-    assert "--summarize-only" in capsys.readouterr().out
+    help_text = capsys.readouterr().out
+    assert "--summarize-only" in help_text
+    assert "--counterfactual-recovery" in help_text
 
 
 @pytest.mark.integration

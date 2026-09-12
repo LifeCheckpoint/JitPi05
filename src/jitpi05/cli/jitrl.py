@@ -104,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="First init-state id of each run; episode i uses init-state "
         "start + i (default: 0).",
     )
+    parser.add_argument(
+        "--counterfactual-recovery",
+        action="store_true",
+        help="At accepted Cycle backtracks, run isolated no-op/recovery branches "
+        "from one full simulator snapshot and write counterfactual.json.",
+    )
     return parser
 
 
@@ -119,6 +125,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         episodes = args.episodes
         init_state_start = args.init_state_start
     seeds = _deduplicate(args.seed or JITRL_SEEDS)
+    if args.counterfactual_recovery and not all(method.endswith("-cycle") for method in methods):
+        raise ValueError("--counterfactual-recovery requires only Cycle methods")
+    if args.counterfactual_recovery and args.summarize_only:
+        raise ValueError("--counterfactual-recovery cannot be combined with --summarize-only")
     output_dir = Path(args.output_dir)
     total_runs = len(tasks) * len(methods) * len(seeds)
     total_rollouts = total_runs * episodes
@@ -192,6 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 output_dir,
                                 models=models,
                                 init_state_start=init_state_start,
+                                counterfactual_recovery=args.counterfactual_recovery,
                             )
                         metrics = load_and_write_run_metrics(
                             output_dir,
@@ -240,6 +251,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         requested_episodes=episodes,
         output_dir=output_dir,
     )
+    if args.counterfactual_recovery:
+        from jitpi05.jitrl.counterfactual import summarize_counterfactual_events
+
+        counterfactual_events = []
+        for task_spec in tasks:
+            for method in methods:
+                for seed in seeds:
+                    path = output_dir / str(task_spec["name"]) / method / f"seed_{seed}" / "counterfactual.json"
+                    if not path.exists():
+                        continue
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    counterfactual_events.extend(
+                        event
+                        for episode in payload.get("episodes", [])
+                        for event in episode.get("events", [])
+                    )
+        summary["counterfactual_recovery"] = {
+            "enabled": True,
+            "summary": summarize_counterfactual_events(counterfactual_events),
+        }
     summary_path = output_dir / "summary.json"
     write_json_atomic(summary_path, summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False))

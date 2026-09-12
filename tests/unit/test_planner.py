@@ -429,7 +429,8 @@ def test_gemini_is_evaluator_only_and_method_order_is_paired() -> None:
         "https://api.ikuncode.cc"
     )
     assert JITRL_METHODS == ("jitrl-free", "static-free")
-    assert _low_level_chunks_per_high_level_plan() == 4
+    # open-loop 对齐官方 5 步后，40 个高层步 = 8 个低层 chunk。
+    assert _low_level_chunks_per_high_level_plan() == 8
 
 
 def test_task_resolution_and_summary_paths() -> None:

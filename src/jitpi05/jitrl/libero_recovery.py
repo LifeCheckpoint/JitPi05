@@ -488,6 +488,74 @@ def inspect_scene_objects(vector_env: Any) -> tuple[SceneObject, ...]:
     return tuple(seen.values())
 
 
+def gripper_pose_quaternion(
+    vector_env: Any,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    """Return the EEF grip site ``(position, quaternion[wxyz])`` or None.
+
+    Official MBR builds its cumulative trajectory features from the real
+    end-effector pose at the retry observation (``robot0_eef_pos`` and
+    ``quat2axisangle(robot0_eef_quat)``).  This accessor exposes the same
+    quantity from MuJoCo so candidate features share one physical origin.
+    """
+
+    control = _control_env(_single_libero_env(vector_env))
+    sim = control.sim
+    robot = control.robots[0]
+    eef_site_id = getattr(robot, "eef_site_id", None)
+    if eef_site_id is None:
+        model = getattr(sim, "model", None)
+        name2id = getattr(model, "site_name2id", None) if model is not None else None
+        if callable(name2id):
+            try:
+                eef_site_id = name2id("gripper0_grip_site")
+            except Exception:
+                eef_site_id = None
+    if eef_site_id is None:
+        return None
+    try:
+        position = tuple(float(v) for v in np.asarray(sim.data.site_xpos[eef_site_id]))
+        # ``site_xmat`` is a flattened 3x3 rotation matrix (row-major).
+        matrix = np.asarray(sim.data.site_xmat[eef_site_id]).reshape(3, 3)
+    except Exception:
+        return None
+    return position, _rotation_matrix_to_quaternion(matrix)
+
+
+def _rotation_matrix_to_quaternion(
+    matrix: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to a ``[w, x, y, z]`` quaternion."""
+
+    trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
+    if trace > 0.0:
+        scale = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / scale
+        x = (matrix[2, 1] - matrix[1, 2]) * scale
+        y = (matrix[0, 2] - matrix[2, 0]) * scale
+        z = (matrix[1, 0] - matrix[0, 1]) * scale
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        scale = 2.0 * np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])
+        w = (matrix[2, 1] - matrix[1, 2]) / scale
+        x = 0.25 * scale
+        y = (matrix[0, 1] + matrix[1, 0]) / scale
+        z = (matrix[0, 2] + matrix[2, 0]) / scale
+    elif matrix[1, 1] > matrix[2, 2]:
+        scale = 2.0 * np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])
+        w = (matrix[0, 2] - matrix[2, 0]) / scale
+        x = (matrix[0, 1] + matrix[1, 0]) / scale
+        y = 0.25 * scale
+        z = (matrix[1, 2] + matrix[2, 1]) / scale
+    else:
+        scale = 2.0 * np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])
+        w = (matrix[1, 0] - matrix[0, 1]) / scale
+        x = (matrix[0, 2] + matrix[2, 0]) / scale
+        y = (matrix[1, 2] + matrix[2, 1]) / scale
+        z = 0.25 * scale
+    norm = float(np.sqrt(w * w + x * x + y * y + z * z)) or 1.0
+    return (w / norm, x / norm, y / norm, z / norm)
+
+
 def gripper_pose(vector_env: Any) -> tuple[float, float, float] | None:
     """Return the end-effector grip site position, or None when unavailable."""
 

@@ -23,6 +23,10 @@ from jitpi05.config import (
     CYCLE_BUDGET_MODE,
     CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
     CYCLE_CONFIG_VERSION,
+    CYCLE_COUNTERFACTUAL_BRANCHES,
+    CYCLE_COUNTERFACTUAL_EPISODE_STRIDE,
+    CYCLE_COUNTERFACTUAL_HORIZON_STEPS,
+    CYCLE_COUNTERFACTUAL_MAX_EVENTS_PER_EPISODE,
     CYCLE_DYNAMIC_BUDGET_ENABLED,
     CYCLE_GRIPPER_CLOSED_QPOS_THRESHOLD,
     CYCLE_MAX_DYNAMIC_STEPS,
@@ -31,10 +35,14 @@ from jitpi05.config import (
     CYCLE_MBR_ACTION_STEPS,
     CYCLE_MBR_DELTA_DIMS,
     CYCLE_MBR_HYPOTHESES,
+    CYCLE_MBR_USE_FAILED_REPULSION,
     CYCLE_METHODS,
+    CYCLE_NUM_STEPS_WAIT,
+    CYCLE_OFFICIAL_BUDGET_MULTIPLIER,
     CYCLE_PREDICTOR_RETRIES,
     CYCLE_PROGRESS_THRESHOLD,
     CYCLE_PROXY_PROGRESS_THRESHOLD,
+    CYCLE_RECORD_VIDEO,
     CYCLE_SIGNAL_CONFIRM_CONSECUTIVE,
     CYCLE_SIGNAL_CONFIRM_GAP,
     CYCLE_STOP_SIGNAL_THRESHOLD,
@@ -70,6 +78,11 @@ from jitpi05.config import (
     SIM_ACTION_STEPS,
     SIM_PI05_ID,
 )
+from jitpi05.jitrl.counterfactual import (
+    capture_full_environment_state,
+    restore_full_environment_state,
+    summarize_counterfactual_events,
+)
 from jitpi05.jitrl.cycle import (
     CycleGate,
     CyclePhase,
@@ -77,6 +90,7 @@ from jitpi05.jitrl.cycle import (
     CycleSubtask,
     PhysicalEvidence,
     SemanticAnchor,
+    _quaternion_to_rotvec,
     adapt_cycle_policy_output,
     build_cycle_subtask_program,
     cumulative_pose_trajectory_features,
@@ -91,6 +105,7 @@ from jitpi05.jitrl.libero_recovery import (
     build_physical_evidence,
     capture_robot_configuration,
     gripper_pose,
+    gripper_pose_quaternion,
     held_object_name,
     inspect_scene_objects,
     match_target_object,
@@ -148,6 +163,14 @@ def _direct_condition(overall_task: str) -> str:
     """Keep the original task as the sole language condition for direct methods."""
 
     return str(overall_task).strip()
+
+
+def _libero_dummy_action() -> torch.Tensor:
+    """官方 ``get_libero_dummy_action``：静止机械臂 + 张开夹爪（7 维）。"""
+
+    action = torch.zeros(1, 7, dtype=torch.float32)
+    action[0, -1] = -1.0
+    return action
 
 
 # Methods that populate/read the online experience memory. Recovery actions are
@@ -349,11 +372,20 @@ def _trace_neighbors(neighbors: Sequence[dict]) -> list[dict]:
 
 
 def _low_level_chunks_per_high_level_plan() -> int:
+    """一个高层计划覆盖的低层 chunk 数。
+
+    每个 chunk 实际执行的步数已对齐官方 5 步 open-loop
+    （``POLICY_ACTION_STEPS``），因此必须按它而非模型 chunk_size 或
+    ``SIM_ACTION_STEPS`` 换算，否则触发窗口会与物理步数脱节。
+    """
+
     if JITRL_HIGH_LEVEL_STEPS <= 0:
         raise ValueError("JITRL_HIGH_LEVEL_STEPS must be positive")
-    if JITRL_HIGH_LEVEL_STEPS % SIM_ACTION_STEPS != 0:
-        raise ValueError("JITRL_HIGH_LEVEL_STEPS must be divisible by SIM_ACTION_STEPS")
-    return JITRL_HIGH_LEVEL_STEPS // SIM_ACTION_STEPS
+    if JITRL_HIGH_LEVEL_STEPS % POLICY_ACTION_STEPS != 0:
+        raise ValueError(
+            "JITRL_HIGH_LEVEL_STEPS must be divisible by POLICY_ACTION_STEPS"
+        )
+    return JITRL_HIGH_LEVEL_STEPS // POLICY_ACTION_STEPS
 
 
 def evaluation_budget_max_steps(task_spec: dict[str, Any]) -> int:
@@ -367,6 +399,9 @@ def evaluation_budget_max_steps(task_spec: dict[str, Any]) -> int:
         raise ValueError("task_spec max_steps must be positive")
     if CYCLE_BUDGET_MODE == "official":
         return official_max_steps
+    if CYCLE_BUDGET_MODE == "official_1p5x":
+        # 官方 evaluator: while t < max_steps * 1.5 + num_steps_wait。
+        return int(official_max_steps * CYCLE_OFFICIAL_BUDGET_MULTIPLIER) + CYCLE_NUM_STEPS_WAIT
     if CYCLE_BUDGET_MODE == "unified_800":
         if CYCLE_UNIFIED_MAX_STEPS < official_max_steps:
             raise ValueError(
@@ -374,7 +409,7 @@ def evaluation_budget_max_steps(task_spec: dict[str, Any]) -> int:
             )
         return CYCLE_UNIFIED_MAX_STEPS
     raise ValueError(
-        "CYCLE_BUDGET_MODE must be 'official' or 'unified_800'; "
+        "CYCLE_BUDGET_MODE must be 'official', 'official_1p5x' or 'unified_800'; "
         f"got {CYCLE_BUDGET_MODE!r}"
     )
 
@@ -531,6 +566,7 @@ def _run_episode_cycle(
     postprocessor,
     cycle_predictor=None,
     step_progress=None,
+    counterfactual_recovery: bool = False,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
     """Run the zero-shot CycleVLA-lite state machine for one episode.
 
@@ -584,6 +620,10 @@ def _run_episode_cycle(
     mbr_candidate_order: dict[str, list[int]] = {}
     mbr_candidate_cursor: dict[str, int] = {}
     failed_trajectory_features: dict[str, list[torch.Tensor]] = {}
+    # 逐控制步的 EEF 姿态历史，用于按官方语义从真实机器人状态提取失败轨迹。
+    eef_pose_history: list[tuple[tuple[float, float, float], tuple[float, float, float, float]]] = []
+    # 每个 anchor 在 eef_pose_history 中的起始下标，用于取该 attempt 的前 N 步。
+    anchor_eef_start_index: dict[str, int] = {}
     anchor_action_chunks: dict[str, list[torch.Tensor]] = {}
     pending_mbr_actions: torch.Tensor | None = None
     phase = CyclePhase.IN_PROGRESS
@@ -615,6 +655,7 @@ def _run_episode_cycle(
     cycle_veto_count = 0
     cycle_proxy_stop_finish_count = 0
     mbr_events: list[dict] = []
+    counterfactual_events: list[dict] = []
     cycle_rewind_steps = 0
     cycle_extra_budget_granted_steps = 0
     cycle_extra_budget_used_steps = 0
@@ -623,6 +664,9 @@ def _run_episode_cycle(
     low_level_chunks_per_plan = _low_level_chunks_per_high_level_plan()
     gate = CycleGate(threshold=CYCLE_PROXY_PROGRESS_THRESHOLD)
     last_held_relative: tuple[float, float, float] | None = None
+    # 官方 ``num_steps_wait`` 的 dummy 稳定步；计入 episode 预算但不进入
+    # action_chunks，因此不会破坏 chunk/action 的对齐。
+    wait_steps = 0
 
     def _current_images() -> list:
         current_frame = policy_frame(observation, overall_task, env_preprocessor)
@@ -660,7 +704,7 @@ def _run_episode_cycle(
         active_before_images = None
 
     def _budget_steps() -> int:
-        return len(actions) + cycle_rewind_steps
+        return len(actions) + cycle_rewind_steps + wait_steps
 
     def _effective_budget() -> int:
         return min(
@@ -708,7 +752,11 @@ def _run_episode_cycle(
             actions.append(env_action.squeeze(0).clone())
             rewards.append(float(reward[0]))
             robot_history.append(capture_robot_configuration(env))
-            frames.append(env.render()[0])
+            pose = gripper_pose_quaternion(env)
+            if pose is not None:
+                eef_pose_history.append(pose)
+            if CYCLE_RECORD_VIDEO:
+                frames.append(env.render()[0])
             cycle_extra_budget_used_steps = _dynamic_extra_used_steps()
             last_info = info if isinstance(info, dict) else {}
             if adapted.has_policy_signals:
@@ -762,6 +810,171 @@ def _run_episode_cycle(
             )
         return adapt_cycle_policy_output(action_chunk)
 
+    def _run_counterfactual_recovery(
+        *,
+        snapshot,
+        target_anchor: SemanticAnchor,
+        target_history_index: int,
+    ) -> dict:
+        """Run state-isolated diagnostic branches without touching the main rollout."""
+
+        # 官方不存在「独立分支窗口」：回溯后重试继续原 episode 直到
+        # ``max_steps * 1.5 + num_steps_wait``。因此默认 horizon = 剩余 episode
+        # 预算，而不是固定短窗口。``CYCLE_COUNTERFACTUAL_HORIZON_STEPS > 0``
+        # 时按其值截断，仅用于快速调试。
+        remaining_budget = max(0, max_steps - _budget_steps())
+        branch_horizon = (
+            remaining_budget
+            if CYCLE_COUNTERFACTUAL_HORIZON_STEPS <= 0
+            else min(CYCLE_COUNTERFACTUAL_HORIZON_STEPS, remaining_budget)
+        )
+        event = {
+            "event": "counterfactual_recovery",
+            "event_index": len(counterfactual_events),
+            "failure_anchor_id": active_anchor.anchor_id if active_anchor else None,
+            "target_anchor_id": target_anchor.anchor_id,
+            "target_program_id": target_anchor.program_id,
+            "remaining_episode_budget": remaining_budget,
+            "horizon_steps": branch_horizon,
+            "branches": [],
+        }
+        if branch_horizon <= 0:
+            event["skipped"] = "no_remaining_budget"
+            return event
+
+        def run_branch(name: str, *, rewind: bool, target_condition: bool, mbr: bool) -> dict:
+            branch_observation = restore_full_environment_state(env, snapshot)
+            rewound_steps = 0
+            if rewind:
+                report = rewind_robot_configuration_history(
+                    env,
+                    robot_history,
+                    target_history_index,
+                    max_steps=branch_horizon,
+                )
+                rewound_steps = report.replayed_steps
+                # 对齐官方：每次快照恢复后推进一次 dummy 物理步。
+                dummy_transition = env_postprocessor({"action": _libero_dummy_action()})
+                dummy_env_action = dummy_transition["action"].detach().cpu()
+                (
+                    branch_observation,
+                    _dummy_reward,
+                    _dummy_terminated,
+                    _dummy_truncated,
+                    _dummy_info,
+                ) = env.step(dummy_env_action.numpy())
+                branch_observation = refresh_libero_observation(env)
+            condition = target_anchor.condition if target_condition else active_condition
+            # 官方 MBR 特征以分支起点观测的真实 EEF 位姿为准。
+            branch_initial_pose = gripper_pose_quaternion(env)
+            executed_steps = 0
+            policy_chunks = 0
+            success_branch = False
+            termination_reason = "horizon"
+            selected_mbr_index = None
+            mbr_coordinate = target_anchor.high_level_step_index * CYCLE_MBR_HYPOTHESES
+            # The no-op, target-only, and rewind-only branches continue with the
+            # same next regular rollout coordinate. Only an MBR branch changes to
+            # its selected candidate coordinate after its first chunk.
+            branch_noise_coordinate = len(action_chunks)
+            # 官方 ``backtrace_robot_states`` 的回放 ``env.step`` 不递增 episode
+            # 步数 ``t``（回溯对预算免费），因此执行窗口保持完整 horizon。
+            executable_steps = branch_horizon
+            while executed_steps < executable_steps:
+                frame = policy_frame(branch_observation, overall_task, env_preprocessor)
+                if mbr and policy_chunks == 0:
+                    candidates = []
+                    for hypothesis in range(CYCLE_MBR_HYPOTHESES):
+                        noise = coordinate_flow_noise(
+                            policy,
+                            seed,
+                            episode_index,
+                            mbr_coordinate + hypothesis,
+                            device="cuda",
+                            kind="counterfactual_flow_noise",
+                        )
+                        candidates.append(
+                            _predict_action_chunk(frame, condition, noise).robot_action_chunk
+                        )
+                    selected, selection = select_mbr_chunk(
+                        torch.stack(candidates),
+                        action_steps=CYCLE_MBR_ACTION_STEPS,
+                        delta_dims=CYCLE_MBR_DELTA_DIMS,
+                        initial_pose=branch_initial_pose,
+                    )
+                    selected_mbr_index = selection.selected_index
+                    branch_noise_coordinate = mbr_coordinate + selected_mbr_index
+                    action_chunk = adapt_cycle_policy_output(selected)
+                else:
+                    noise = coordinate_flow_noise(
+                        policy,
+                        seed,
+                        episode_index,
+                        branch_noise_coordinate + policy_chunks,
+                        device="cuda",
+                        kind="counterfactual_flow_noise",
+                    )
+                    action_chunk = _predict_action_chunk(frame, condition, noise)
+                for action in action_chunk.robot_action_chunk[:POLICY_ACTION_STEPS]:
+                    if executed_steps >= executable_steps:
+                        break
+                    action_transition = env_postprocessor({"action": action.unsqueeze(0)})
+                    env_action = action_transition["action"].detach().cpu()
+                    branch_observation, _reward, terminated, truncated, info = env.step(
+                        env_action.numpy()
+                    )
+                    executed_steps += 1
+                    branch_info = info if isinstance(info, dict) else {}
+                    success_branch = success_branch or success_from_info(branch_info)
+                    if success_branch:
+                        termination_reason = "environment_success"
+                        break
+                    if bool(terminated[0] or truncated[0]):
+                        termination_reason = "environment_done"
+                        break
+                if success_branch or termination_reason == "environment_done":
+                    break
+                policy_chunks += 1
+            return {
+                "name": name,
+                "success": bool(success_branch),
+                "termination_reason": termination_reason,
+                "executed_steps": executed_steps,
+                "rewind_steps": rewound_steps,
+                "condition_mode": "target_template" if target_condition else "failure_prompt",
+                "mbr_selected_index": selected_mbr_index,
+            }
+
+        # 分支配置：默认全开，可用 CYCLE_COUNTERFACTUAL_BRANCHES 裁剪以加速。
+        branch_specs = {
+            "no_op": (False, False, False),
+            "target_only": (False, True, False),
+            "rewind_only": (True, False, False),
+            "mbr_only": (False, False, True),
+            "full_cycle": (True, True, True),
+        }
+        # ``no_op`` 是配对基线，无论配置如何都必须保留。
+        requested = tuple(
+            name for name in CYCLE_COUNTERFACTUAL_BRANCHES if name in branch_specs
+        )
+        if "no_op" not in requested:
+            requested = ("no_op", *requested)
+        event["branches_requested"] = list(requested)
+        try:
+            for name in requested:
+                rewind, target_condition, mbr = branch_specs[name]
+                event["branches"].append(
+                    run_branch(
+                        name,
+                        rewind=rewind,
+                        target_condition=target_condition,
+                        mbr=mbr,
+                    )
+                )
+        finally:
+            restore_full_environment_state(env, snapshot)
+        return event
+
     def _run_mbr_retry(
         anchor: SemanticAnchor,
         restored_frame: dict,
@@ -772,6 +985,8 @@ def _run_episode_cycle(
         cache_key = anchor.program_id
         mbr_coordinate = anchor.high_level_step_index * CYCLE_MBR_HYPOTHESES
         candidate_seeds: list[int] = []
+        # 官方 MBR 的轨迹特征以回溯后观测的真实 EEF 位姿为起点。
+        mbr_initial_pose = gripper_pose_quaternion(env)
         if cache_key not in mbr_candidate_cache:
             candidates = []
             for candidate_index in range(CYCLE_MBR_HYPOTHESES):
@@ -794,7 +1009,15 @@ def _run_episode_cycle(
                 robot_chunks,
                 action_steps=CYCLE_MBR_ACTION_STEPS,
                 delta_dims=CYCLE_MBR_DELTA_DIMS,
-                failed_trajectories=failed_trajectory_features.get(cache_key, ()),
+                # 官方 ``mbr_use_failed_repulsion`` 默认 False；仅显式开启时
+                # 才注入失败轨迹排斥项。
+                failed_trajectories=(
+                    failed_trajectory_features.get(cache_key, ())
+                    if CYCLE_MBR_USE_FAILED_REPULSION
+                    else ()
+                ),
+                # 官方从回溯后观测的真实 EEF 位姿积分候选轨迹。
+                initial_pose=mbr_initial_pose,
             )
             mbr_candidate_order[cache_key] = sorted(
                 range(len(candidates)),
@@ -806,16 +1029,21 @@ def _run_episode_cycle(
             )
         else:
             candidates = mbr_candidate_cache[cache_key]
-            mbr_candidate_cursor[cache_key] = min(
-                mbr_candidate_cursor.get(cache_key, 0) + 1,
-                len(candidates) - 1,
-            )
+            # 官方语义：后续回溯取排序中的下一个候选，越界后 wrap around。
+            mbr_candidate_cursor[cache_key] = (
+                mbr_candidate_cursor.get(cache_key, 0) + 1
+            ) % len(candidates)
             robot_chunks = torch.stack([candidate.robot_action_chunk for candidate in candidates])
             selection = select_mbr_chunk(
                 robot_chunks,
                 action_steps=CYCLE_MBR_ACTION_STEPS,
                 delta_dims=CYCLE_MBR_DELTA_DIMS,
-                failed_trajectories=failed_trajectory_features.get(cache_key, ()),
+                failed_trajectories=(
+                    failed_trajectory_features.get(cache_key, ())
+                    if CYCLE_MBR_USE_FAILED_REPULSION
+                    else ()
+                ),
+                initial_pose=mbr_initial_pose,
             )[1]
             selection = selection.__class__(
                 selected_index=mbr_candidate_order[cache_key][mbr_candidate_cursor[cache_key]],
@@ -1044,14 +1272,32 @@ def _run_episode_cycle(
         # robosuite 的 horizon 终止且不触发 reset。这里关闭 robosuite 自有的 horizon
         # done，终止完全交给上层动态预算，成功仍由 _check_success() 独立提供。
         disable_robosuite_horizon_done(env)
-        robot_history.append(capture_robot_configuration(env))
-        overall_task = list(env.call("task_description"))[0]
-        cycle_program = build_cycle_subtask_program(overall_task)
-        cycle_program_text = format_cycle_subtask_program(cycle_program)
         # The environment is created with the maximum possible dynamic budget,
         # while the mutable ``max_steps`` starts at the strict comparison budget.
         max_steps = base_budget_max_steps
-        frames.append(env.render()[0])
+        # 官方 ``num_steps_wait=10``：episode 起始执行 dummy action 让物体在重力下
+        # 稳定，避免初始穿透/未落定状态被误判为抓取失败。
+        for _ in range(CYCLE_NUM_STEPS_WAIT):
+            if _budget_steps() >= max_steps:
+                break
+            dummy_transition = env_postprocessor({"action": _libero_dummy_action()})
+            dummy_env_action = dummy_transition["action"].detach().cpu()
+            observation, _dummy_reward, _dummy_terminated, _dummy_truncated, _dummy_info = (
+                env.step(dummy_env_action.numpy())
+            )
+            wait_steps += 1
+            robot_history.append(capture_robot_configuration(env))
+            if CYCLE_RECORD_VIDEO:
+                frames.append(env.render()[0])
+            if step_progress is not None:
+                step_progress.update(1)
+        if not robot_history:
+            robot_history.append(capture_robot_configuration(env))
+        overall_task = list(env.call("task_description"))[0]
+        cycle_program = build_cycle_subtask_program(overall_task)
+        cycle_program_text = format_cycle_subtask_program(cycle_program)
+        if CYCLE_RECORD_VIDEO:
+            frames.append(env.render()[0])
 
         while _budget_steps() < max_steps and not success and not episode_done:
             if active_anchor is None:
@@ -1249,6 +1495,10 @@ def _run_episode_cycle(
                 if not raw_task_continuation or continuation_anchor is new_anchor:
                     anchors.append(active_anchor)
                     anchor_history_indices[active_anchor.anchor_id] = len(robot_history) - 1
+                    # 记录该 anchor 首次执行时的 EEF 姿态起点，供失败轨迹提取。
+                    anchor_eef_start_index.setdefault(
+                        active_anchor.anchor_id, len(eef_pose_history)
+                    )
                 episode_records.append(
                     {
                         "state": planning["state_summary"],
@@ -1322,8 +1572,12 @@ def _run_episode_cycle(
                 # MBR retry itself has already selected and executed its first
                 # chunk above; no unrelated re-inference is inserted here.
                 if active_attempt_is_recovery and mbr_rollout_coordinate is not None:
-                    noise_coordinate = mbr_rollout_coordinate + active_attempt_chunks
-                    noise_kind = "mbr_rollout_noise"
+                    # 官方 action_queue 耗尽后重新向 policy 采样；当前只把 MBR
+                    # 选中的 chunk 作为队列执行一次，后续 chunk 回到常规
+                    # flow-noise 采样（不再沿 MBR 坐标滚动），以对齐官方语义。
+                    mbr_rollout_coordinate = None
+                    noise_coordinate = low_level_chunk_index
+                    noise_kind = "flow_noise"
                 else:
                     noise_coordinate = low_level_chunk_index
                     noise_kind = "flow_noise"
@@ -1480,6 +1734,20 @@ def _run_episode_cycle(
                     )
                     _finalize_evaluator_images()
                     target_history_index = anchor_history_indices[target_anchor.anchor_id]
+                    if (
+                        counterfactual_recovery
+                        and (episode_index % max(1, CYCLE_COUNTERFACTUAL_EPISODE_STRIDE) == 0)
+                        and len(counterfactual_events) < CYCLE_COUNTERFACTUAL_MAX_EVENTS_PER_EPISODE
+                    ):
+                        diagnostic_snapshot = capture_full_environment_state(env)
+                        counterfactual_events.append(
+                            _run_counterfactual_recovery(
+                                snapshot=diagnostic_snapshot,
+                                target_anchor=target_anchor,
+                                target_history_index=target_history_index,
+                            )
+                        )
+                        observation = refresh_libero_observation(env)
                     # Preserve the failed target-attempt trajectory for the
                     # official MBR failed-trajectory repulsion term. Features
                     # are kept in memory only; the JSON trace stores counts.
@@ -1487,28 +1755,62 @@ def _run_episode_cycle(
                         active_anchor.anchor_id, []
                     )
                     if failed_chunks:
-                        # A failed attempt can end with a shorter final chunk.
-                        # The official feature is one continuous first-N-step
-                        # trajectory, so concatenate in time and pad/truncate
-                        # to the fixed MBR horizon before feature extraction.
-                        failed_tensor = torch.cat(failed_chunks, dim=0)
-                        failed_tensor = failed_tensor[:CYCLE_MBR_ACTION_STEPS]
-                        if failed_tensor.shape[0] < CYCLE_MBR_ACTION_STEPS:
-                            failed_tensor = torch.cat(
-                                (
-                                    failed_tensor,
-                                    torch.zeros(
-                                        CYCLE_MBR_ACTION_STEPS - failed_tensor.shape[0],
-                                        failed_tensor.shape[1],
-                                        dtype=failed_tensor.dtype,
-                                    ),
-                                ),
-                                dim=0,
+                        # 官方 ``extract_trajectory_features`` 从真实机器人状态
+                        # 历史提取失败轨迹（start_idx=0, end_idx=num_open_loop_steps）。
+                        # 优先使用逐控制步的 EEF 姿态历史；不可用时回退到动作累积。
+                        attempt_start = anchor_eef_start_index.get(
+                            active_anchor.anchor_id, 0
+                        )
+                        failed_pose_slice = eef_pose_history[
+                            attempt_start : attempt_start + CYCLE_MBR_ACTION_STEPS
+                        ]
+                        failed_feature = None
+                        if len(failed_pose_slice) >= 2:
+                            positions = torch.tensor(
+                                [pose[0] for pose in failed_pose_slice], dtype=torch.float32
                             )
-                        failed_feature = cumulative_pose_trajectory_features(
-                            failed_tensor.unsqueeze(0),
-                            action_steps=CYCLE_MBR_ACTION_STEPS,
-                        )[0]
+                            quaternions = torch.tensor(
+                                [pose[1] for pose in failed_pose_slice], dtype=torch.float32
+                            )
+                            rotation_trajectory = _quaternion_to_rotvec(quaternions)
+                            failed_feature = torch.cat(
+                                (positions, rotation_trajectory), dim=-1
+                            ).reshape(-1)
+                            if failed_feature.shape[0] < CYCLE_MBR_ACTION_STEPS * 6:
+                                failed_feature = torch.cat(
+                                    (
+                                        failed_feature,
+                                        torch.zeros(
+                                            CYCLE_MBR_ACTION_STEPS * 6
+                                            - failed_feature.shape[0],
+                                            dtype=failed_feature.dtype,
+                                        ),
+                                    )
+                                )
+                            failed_feature = failed_feature[: CYCLE_MBR_ACTION_STEPS * 6]
+                        if failed_feature is None:
+                            # A failed attempt can end with a shorter final chunk.
+                            # The official feature is one continuous first-N-step
+                            # trajectory, so concatenate in time and pad/truncate
+                            # to the fixed MBR horizon before feature extraction.
+                            failed_tensor = torch.cat(failed_chunks, dim=0)
+                            failed_tensor = failed_tensor[:CYCLE_MBR_ACTION_STEPS]
+                            if failed_tensor.shape[0] < CYCLE_MBR_ACTION_STEPS:
+                                failed_tensor = torch.cat(
+                                    (
+                                        failed_tensor,
+                                        torch.zeros(
+                                            CYCLE_MBR_ACTION_STEPS - failed_tensor.shape[0],
+                                            failed_tensor.shape[1],
+                                            dtype=failed_tensor.dtype,
+                                        ),
+                                    ),
+                                    dim=0,
+                                )
+                            failed_feature = cumulative_pose_trajectory_features(
+                                failed_tensor.unsqueeze(0),
+                                action_steps=CYCLE_MBR_ACTION_STEPS,
+                            )[0]
                         failed_trajectory_features.setdefault(
                             active_anchor.program_id, []
                         ).append(failed_feature)
@@ -1534,7 +1836,8 @@ def _run_episode_cycle(
                         nonlocal cycle_rewind_steps, cycle_extra_budget_used_steps
                         cycle_rewind_steps += 1
                         cycle_extra_budget_used_steps = _dynamic_extra_used_steps()
-                        frames.append(env.render()[0])
+                        if CYCLE_RECORD_VIDEO:
+                            frames.append(env.render()[0])
                         if step_progress is not None:
                             step_progress.update(1)
 
@@ -1545,6 +1848,18 @@ def _run_episode_cycle(
                         max_steps=rewind_budget,
                         on_waypoint=_record_rewind_waypoint,
                     )
+                    # 官方 ``backtrace_robot_states`` 在恢复每个快照后都执行一次
+                    # dummy ``env.step`` 让 MuJoCo 继续推进物理；当前实现此前只
+                    # restore qpos/qvel，物体停在未落定状态。这里补一次 dummy
+                    # 步进对齐官方语义（物体不回滚，但物理继续演化）。
+                    if rewind_report.completed:
+                        dummy_transition = env_postprocessor(
+                            {"action": _libero_dummy_action()}
+                        )
+                        dummy_env_action = dummy_transition["action"].detach().cpu()
+                        observation, _dummy_reward, _dummy_terminated, _dummy_truncated, _dummy_info = (
+                            env.step(dummy_env_action.numpy())
+                        )
                     observation = refresh_libero_observation(env)
                     recovery_event = {
                         "event": "backtrack",
@@ -1601,6 +1916,10 @@ def _run_episode_cycle(
                     active_attempt_chunks = 0
                     active_attempt_is_recovery = True
                     active_attempt_checked = False
+                    # 回溯后重试视为该 anchor 的一次新 attempt，重新记录 EEF 起点。
+                    anchor_eef_start_index[target_anchor.anchor_id] = len(eef_pose_history)
+                    # 回溯后重试视为该 anchor 的一次新 attempt，重新记录 EEF 起点。
+                    anchor_eef_start_index[target_anchor.anchor_id] = len(eef_pose_history)
                     progress_confirmation.reset()
                     stop_confirmation.reset()
                     if _budget_steps() >= max_steps:
@@ -1807,6 +2126,9 @@ def _run_episode_cycle(
         "cycle_progress_threshold": CYCLE_PROGRESS_THRESHOLD,
         "cycle_proxy_progress_threshold": CYCLE_PROXY_PROGRESS_THRESHOLD,
         "cycle_check_after_low_level_chunks": CYCLE_CHECK_AFTER_LOW_LEVEL_CHUNKS,
+        "counterfactual_recovery_enabled": bool(counterfactual_recovery),
+        "counterfactual_recovery_events": counterfactual_events,
+        "counterfactual_recovery_summary": summarize_counterfactual_events(counterfactual_events),
         "cycle_checks": cycle_check_count,
         "cycle_backtracks": cycle_backtrack_count,
         "cycle_vetoes": cycle_veto_count,
@@ -2004,6 +2326,7 @@ def _run_episode(
     postprocessor,
     cycle_predictor=None,
     step_progress=None,
+    counterfactual_recovery: bool = False,
 ) -> tuple[dict, list[dict], dict[str, torch.Tensor], list[tuple[list, list]]]:
     if method == "direct":
         return _run_episode_direct(
@@ -2032,6 +2355,7 @@ def _run_episode(
             postprocessor=postprocessor,
             cycle_predictor=cycle_predictor,
             step_progress=step_progress,
+            counterfactual_recovery=counterfactual_recovery,
         )
     budget_max_steps = evaluation_budget_max_steps(task_spec)
     envs, env, env_preprocessor, env_postprocessor = make_single_env(
@@ -2500,6 +2824,7 @@ def run_jitrl_experiment(
     output_dir: Path = JITRL_OUTPUT_DIR,
     models: dict | None = None,
     init_state_start: int = 0,
+    counterfactual_recovery: bool = False,
 ) -> dict:
     """Run one task/method/seed pairing from an independent empty memory.
 
@@ -2518,6 +2843,8 @@ def run_jitrl_experiment(
         or init_state_start < 0
     ):
         raise ValueError("init_state_start must be a non-negative integer")
+    if counterfactual_recovery and method not in CYCLE_METHODS:
+        raise ValueError("counterfactual_recovery requires a Cycle method")
     task_name = str(task_spec.get("name", "")).strip()
     if not task_name:
         raise ValueError("task_spec must contain a non-empty name")
@@ -2531,6 +2858,7 @@ def run_jitrl_experiment(
     video_dir = run_dir / "videos"
     tensor_dir = run_dir / "tensors"
     snapshot_dir = run_dir / "memory_snapshots"
+    counterfactual_path = run_dir / "counterfactual.json"
     for directory in (run_dir, video_dir, tensor_dir, snapshot_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -2540,6 +2868,18 @@ def run_jitrl_experiment(
     )
     _atomic_write_json(run_dir / "episodes.json", episode_results)
     _atomic_write_json(run_dir / "memory.json", _memory_snapshot(memory))
+    if counterfactual_recovery:
+        _atomic_write_json(
+            counterfactual_path,
+            {
+                "enabled": True,
+                "task": task_name,
+                "method": method,
+                "seed": int(seed),
+                "episodes": [],
+                "summary": summarize_counterfactual_events(()),
+            },
+        )
 
     planner_model = None
     planner_processor = None
@@ -2635,6 +2975,7 @@ def run_jitrl_experiment(
                     postprocessor=postprocessor,
                     cycle_predictor=cycle_predictor,
                     step_progress=step_progress,
+                    counterfactual_recovery=counterfactual_recovery,
                 )
             finally:
                 step_progress.close()
@@ -2664,6 +3005,30 @@ def run_jitrl_experiment(
             tensor_paths = _save_episode_tensors(tensor_dir, episode_index, tensors)
             episode_result.update(tensor_paths)
             episode_results.append(episode_result)
+            if counterfactual_recovery:
+                counterfactual_by_episode = [
+                    {
+                        "episode_index": row["episode_index"],
+                        "events": row.get("counterfactual_recovery_events", []),
+                    }
+                    for row in episode_results
+                ]
+                counterfactual_events = [
+                    event
+                    for row in counterfactual_by_episode
+                    for event in row["events"]
+                ]
+                _atomic_write_json(
+                    counterfactual_path,
+                    {
+                        "enabled": True,
+                        "task": task_name,
+                        "method": method,
+                        "seed": int(seed),
+                        "episodes": counterfactual_by_episode,
+                        "summary": summarize_counterfactual_events(counterfactual_events),
+                    },
+                )
 
             snapshot = _memory_snapshot(memory)
             _atomic_write_json(run_dir / "episodes.json", episode_results)
